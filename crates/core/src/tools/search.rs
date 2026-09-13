@@ -4,7 +4,8 @@
 //!   1. Tavily (`TAVILY_API_KEY`) — clean JSON, best quality
 //!   2. Brave Search (`BRAVE_SEARCH_API_KEY`) — clean JSON, good quality
 //!   3. SerpAPI (`SERPAPI_API_KEY`) — real Google results as JSON
-//!   4. DuckDuckGo HTML scrape — no key needed, good enough fallback
+//!   4. You.com (`YDC_API_KEY`) — clean JSON, snippets + descriptions
+//!   5. DuckDuckGo HTML scrape — no key needed, good enough fallback
 //!
 //! Two layers of fallback:
 //! - **Config-time** — a missing API key skips that backend at chain-build
@@ -40,6 +41,7 @@ enum Backend {
     Tavily(String),
     Brave(String),
     SerpApi(String),
+    YouCom(String),
     Ddg,
 }
 
@@ -51,6 +53,7 @@ impl Backend {
             Backend::Tavily(_) => "tavily",
             Backend::Brave(_) => "brave",
             Backend::SerpApi(_) => "serpapi",
+            Backend::YouCom(_) => "youcom",
             Backend::Ddg => "duckduckgo",
         }
     }
@@ -63,6 +66,7 @@ impl Backend {
             Backend::Tavily(_) => "Tavily",
             Backend::Brave(_) => "Brave Search",
             Backend::SerpApi(_) => "SerpAPI (Google)",
+            Backend::YouCom(_) => "You.com",
             Backend::Ddg => "DuckDuckGo",
         }
     }
@@ -80,7 +84,7 @@ pub struct WebSearchTool {
 }
 
 impl WebSearchTool {
-    /// `engine`: `"auto"` (detect from env), `"tavily"`, `"brave"`, `"serpapi"`, `"duckduckgo"`/`"ddg"`.
+    /// `engine`: `"auto"` (detect from env), `"tavily"`, `"brave"`, `"serpapi"`, `"youcom"`, `"duckduckgo"`/`"ddg"`.
     pub fn new(engine: &str) -> Self {
         // M6.23 BUG WT1: explicit timeout on the shared client; all
         // three backends (Tavily/Brave/DDG) inherit it.
@@ -101,10 +105,11 @@ impl WebSearchTool {
     /// is the universal floor for any non-`"duckduckgo"`-pinned config.
     ///
     /// Pin behavior:
-    /// - `"auto"` / unset → Tavily (if key) → Brave (if key) → SerpAPI (if key) → DDG
+    /// - `"auto"` / unset → Tavily (if key) → Brave (if key) → SerpAPI (if key) → You.com (if key) → DDG
     /// - `"tavily"` → Tavily (if key) → DDG
     /// - `"brave"` → Brave (if key) → DDG
     /// - `"serpapi"` → SerpAPI (if key) → DDG
+    /// - `"youcom"` → You.com (if key) → DDG
     /// - `"duckduckgo"` / `"ddg"` → DDG only (no fallback; user explicitly
     ///   chose the bottom of the chain)
     fn resolve_candidates(&self) -> Vec<Backend> {
@@ -114,6 +119,7 @@ impl WebSearchTool {
         let try_tavily = matches!(engine, "auto" | "" | "tavily");
         let try_brave = matches!(engine, "auto" | "" | "brave");
         let try_serpapi = matches!(engine, "auto" | "" | "serpapi");
+        let try_youcom = matches!(engine, "auto" | "" | "youcom" | "you.com");
         // DDG is the universal fallback for everything except a DDG pin
         // (where it's already the only candidate, no need to fall back to
         // itself) and... well, only that.
@@ -147,6 +153,15 @@ impl WebSearchTool {
             } else if let Ok(key) = std::env::var("SERPAPI_API_KEY") {
                 if !key.is_empty() {
                     out.push(Backend::SerpApi(key));
+                }
+            }
+        }
+        // You.com is BYOK-only (no gateway route) — same direct-key path
+        // as the keyed backends above; absence simply skips it.
+        if try_youcom {
+            if let Ok(key) = std::env::var("YDC_API_KEY") {
+                if !key.is_empty() {
+                    out.push(Backend::YouCom(key));
                 }
             }
         }
@@ -384,6 +399,71 @@ impl WebSearchTool {
         }
     }
 
+    async fn search_youcom(
+        &self,
+        query: &str,
+        max: usize,
+        key: &str,
+        freshness: Option<&str>,
+    ) -> Result<String> {
+        // You.com Search API: POST /v1/search, X-API-Key header. Endpoint
+        // per the official You.com SDK (ydc-index.io). `freshness` accepts
+        // the same day/week/month/year vocabulary as the other backends.
+        let mut body = json!({
+            "query": query,
+            "count": max,
+        });
+        if let Some(f) = freshness {
+            body["freshness"] = json!(f);
+        }
+        let resp = self
+            .client
+            .post("https://ydc-index.io/v1/search")
+            .header("X-API-Key", key)
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| Error::Tool(format!("youcom: {e}")))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(Error::Tool(format!("youcom HTTP {status}: {text}")));
+        }
+
+        let v: Value = resp
+            .json()
+            .await
+            .map_err(|e| Error::Tool(format!("youcom json: {e}")))?;
+
+        let web = v.pointer("/results/web").and_then(Value::as_array);
+
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(results) = web {
+            for (i, r) in results.iter().take(max).enumerate() {
+                let title = r.get("title").and_then(Value::as_str).unwrap_or("");
+                let url = r.get("url").and_then(Value::as_str).unwrap_or("");
+                let description = r.get("description").and_then(Value::as_str);
+                // `snippets` is an array on You.com results — the first
+                // snippet stands in when the description is empty.
+                let snippet = r
+                    .get("snippets")
+                    .and_then(Value::as_array)
+                    .and_then(|s| s.first())
+                    .and_then(Value::as_str);
+                let desc = description.or(snippet).unwrap_or("");
+                parts.push(format!("{}. {} ({})\n   {}", i + 1, title, url, desc));
+            }
+        }
+
+        if parts.is_empty() {
+            Ok("No results found.".into())
+        } else {
+            Ok(parts.join("\n\n"))
+        }
+    }
+
     async fn search_ddg(&self, query: &str, max: usize) -> Result<String> {
         let resp = self
             .client
@@ -447,7 +527,7 @@ impl Tool for WebSearchTool {
     fn description(&self) -> &'static str {
         "Search the web for information. Auto-selects the best available \
          backend: Tavily (TAVILY_API_KEY), Brave (BRAVE_SEARCH_API_KEY), \
-         SerpAPI/Google (SERPAPI_API_KEY), or DuckDuckGo (no key needed). Returns titles, URLs, and snippets. \
+         SerpAPI/Google (SERPAPI_API_KEY), You.com (YDC_API_KEY), or DuckDuckGo (no key needed). Returns titles, URLs, and snippets. \
          The result begins with a `Source: <engine>` line — when summarizing \
          results to the user, mention which engine answered (e.g. \"via Tavily\" \
          or \"ผ่าน Tavily\"); cite the source so they understand the result quality."
@@ -459,7 +539,7 @@ impl Tool for WebSearchTool {
             "properties": {
                 "query": {"type": "string", "description": "Search query"},
                 "max_results": {"type": "integer", "description": "Max results (default 5)"},
-                "freshness": {"type": "string", "description": "Only recent results: day | week | month | year (Tavily/Brave; ignored elsewhere)"}
+                "freshness": {"type": "string", "description": "Only recent results: day | week | month | year (Tavily/Brave/You.com; ignored elsewhere)"}
             },
             "required": ["query"]
         })
@@ -508,6 +588,10 @@ impl Tool for WebSearchTool {
                         .await
                 }
                 Backend::SerpApi(key) => self.search_serpapi(query, max, key).await,
+                Backend::YouCom(key) => {
+                    self.search_youcom(query, max, key, freshness.as_deref())
+                        .await
+                }
                 Backend::Ddg => self.search_ddg(query, max).await,
             };
             match result {
@@ -561,6 +645,7 @@ mod tests {
         _lock: std::sync::MutexGuard<'static, ()>,
         prev_tavily: Option<String>,
         prev_brave: Option<String>,
+        prev_youcom: Option<String>,
     }
 
     impl Drop for EnvGuard {
@@ -573,15 +658,26 @@ mod tests {
                 Some(v) => std::env::set_var("BRAVE_SEARCH_API_KEY", v),
                 None => std::env::remove_var("BRAVE_SEARCH_API_KEY"),
             }
+            match &self.prev_youcom {
+                Some(v) => std::env::set_var("YDC_API_KEY", v),
+                None => std::env::remove_var("YDC_API_KEY"),
+            }
         }
     }
 
     fn scoped_env() -> EnvGuard {
         let lock = env_lock();
+        // YDC_API_KEY is removed up-front (not just restored) so the
+        // exact-chain assertions below hold even on a dev machine that
+        // happens to export a You.com key; youcom-specific tests set it
+        // explicitly after acquiring the guard.
+        let prev_youcom = std::env::var("YDC_API_KEY").ok();
+        std::env::remove_var("YDC_API_KEY");
         EnvGuard {
             _lock: lock,
             prev_tavily: std::env::var("TAVILY_API_KEY").ok(),
             prev_brave: std::env::var("BRAVE_SEARCH_API_KEY").ok(),
+            prev_youcom,
         }
     }
 
@@ -688,6 +784,50 @@ mod tests {
     }
 
     #[test]
+    fn auto_with_only_youcom_key_places_it_before_ddg() {
+        let _e = scoped_env();
+        std::env::remove_var("TAVILY_API_KEY");
+        std::env::remove_var("BRAVE_SEARCH_API_KEY");
+        std::env::set_var("YDC_API_KEY", "y");
+        let tool = WebSearchTool::new("auto");
+        let chain: Vec<&'static str> = tool.resolve_candidates().iter().map(|b| b.name()).collect();
+        assert_eq!(chain, vec!["youcom", "duckduckgo"]);
+    }
+
+    #[test]
+    fn pinned_youcom_with_key_falls_back_to_ddg() {
+        // Same contract as the other keyed pins: "I want You.com first" —
+        // DDG remains the universal floor if You.com errors at runtime.
+        let _e = scoped_env();
+        std::env::set_var("TAVILY_API_KEY", "t");
+        std::env::set_var("YDC_API_KEY", "y");
+        let tool = WebSearchTool::new("youcom");
+        let chain: Vec<&'static str> = tool.resolve_candidates().iter().map(|b| b.name()).collect();
+        // Tavily NOT in chain (user pinned youcom). DDG follows.
+        assert_eq!(chain, vec!["youcom", "duckduckgo"]);
+    }
+
+    #[test]
+    fn pinned_youcom_without_key_uses_only_ddg() {
+        let _e = scoped_env();
+        std::env::remove_var("YDC_API_KEY");
+        let tool = WebSearchTool::new("youcom");
+        let chain: Vec<&'static str> = tool.resolve_candidates().iter().map(|b| b.name()).collect();
+        assert_eq!(chain, vec!["duckduckgo"]);
+    }
+
+    #[test]
+    fn empty_youcom_key_treated_as_absent() {
+        // Mirrors the Tavily case: an empty YDC_API_KEY must not produce
+        // an authenticated call with an empty key.
+        let _e = scoped_env();
+        std::env::set_var("YDC_API_KEY", "");
+        let tool = WebSearchTool::new("auto");
+        let chain: Vec<&'static str> = tool.resolve_candidates().iter().map(|b| b.name()).collect();
+        assert_eq!(chain, vec!["duckduckgo"]);
+    }
+
+    #[test]
     fn pinned_ddg_uses_only_ddg_no_fallback() {
         // The user explicitly chose the bottom of the chain. There's
         // nothing to fall back to; respect their pin.
@@ -734,12 +874,14 @@ mod tests {
     fn backend_display_names_are_human_readable() {
         assert_eq!(Backend::Tavily(String::new()).display_name(), "Tavily");
         assert_eq!(Backend::Brave(String::new()).display_name(), "Brave Search");
+        assert_eq!(Backend::YouCom(String::new()).display_name(), "You.com");
         assert_eq!(Backend::Ddg.display_name(), "DuckDuckGo");
         // The short `name()` form is what we emit in error chains
         // (e.g. `tavily: HTTP 429`); keep it lowercase + dash-free
         // so it matches existing user-visible error strings.
         assert_eq!(Backend::Tavily(String::new()).name(), "tavily");
         assert_eq!(Backend::Brave(String::new()).name(), "brave");
+        assert_eq!(Backend::YouCom(String::new()).name(), "youcom");
         assert_eq!(Backend::Ddg.name(), "duckduckgo");
     }
 }
