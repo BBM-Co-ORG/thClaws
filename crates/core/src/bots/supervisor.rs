@@ -167,10 +167,11 @@ impl Bot {
         loop {
             let decision = match &*rx.borrow_and_update() {
                 BotState::Ready { addr } => Some(Ok(*addr)),
-                BotState::CrashLooped { reason } => {
-                    Some(Err(format!("bot '{}' is not running: {reason}", self.slug)))
-                }
-                BotState::Stopped => Some(Err(format!("bot '{}' has been stopped", self.slug))),
+                BotState::CrashLooped { reason } => Some(Err(format!(
+                    "agent '{}' is not running: {reason}",
+                    self.slug
+                ))),
+                BotState::Stopped => Some(Err(format!("agent '{}' has been stopped", self.slug))),
                 _ => None,
             };
             match decision {
@@ -181,7 +182,7 @@ impl Bot {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() || tokio::time::timeout(left, rx.changed()).await.is_err() {
                 return Err(Error::Tool(format!(
-                    "bot '{}' was not ready within {}s (state: {:?})",
+                    "agent '{}' was not ready within {}s (state: {:?})",
                     self.slug,
                     timeout.as_secs(),
                     self.state()
@@ -211,6 +212,10 @@ pub struct BotSupervisor {
 }
 
 impl BotSupervisor {
+    pub fn workspace(&self) -> &std::path::Path {
+        &self.workspace
+    }
+
     pub fn new(workspace: impl Into<PathBuf>) -> Result<Arc<Self>> {
         let program = std::env::current_exe()
             .map_err(|e| Error::Tool(format!("cannot resolve this executable: {e}")))?;
@@ -279,7 +284,7 @@ impl BotSupervisor {
         let dir = bot_dir(&self.workspace, &def.slug);
         if !dir.is_dir() {
             return Err(Error::Config(format!(
-                "bot '{}' has no folder at {}",
+                "agent '{}' has no folder at {}",
                 def.slug,
                 dir.display()
             )));
@@ -344,7 +349,7 @@ impl BotSupervisor {
         // listed but never started, which the rail would show as nothing.
         if self.get(slug).is_none() && self.list().len() >= MAX_LIVE_BOTS {
             return Err(Error::Config(format!(
-                "this workspace is already running {MAX_LIVE_BOTS} bots — remove one before \
+                "this workspace is already running {MAX_LIVE_BOTS} agents — remove one before \
                  adding '{slug}'"
             )));
         }
@@ -368,12 +373,12 @@ impl BotSupervisor {
     pub async fn add_blank_bot(self: &Arc<Self>, slug: &str) -> Result<super::install::Installed> {
         if self.get(slug).is_some() {
             return Err(Error::Config(format!(
-                "a bot named '{slug}' already exists in this workspace — pick another name"
+                "an agent named '{slug}' already exists in this workspace — pick another name"
             )));
         }
         if self.list().len() >= MAX_LIVE_BOTS {
             return Err(Error::Config(format!(
-                "this workspace is already running {MAX_LIVE_BOTS} bots — remove one before \
+                "this workspace is already running {MAX_LIVE_BOTS} agents — remove one before \
                  adding '{slug}'"
             )));
         }
@@ -390,7 +395,7 @@ impl BotSupervisor {
     pub async fn restart_bot(&self, slug: &str) -> Result<Arc<Bot>> {
         let Some(bot) = self.get(slug) else {
             return Err(Error::Config(format!(
-                "no bot '{slug}' is running in this workspace"
+                "no agent '{slug}' is running in this workspace"
             )));
         };
         bot.stop();
@@ -409,7 +414,9 @@ impl BotSupervisor {
         // stopped the child and then let `deregister` refuse, which left a
         // running host holding a bot that would never come back.
         if !super::install::can_deregister(&self.workspace, slug)? {
-            return Err(Error::Config(format!("no bot '{slug}' in this workspace")));
+            return Err(Error::Config(format!(
+                "no agent '{slug}' in this workspace"
+            )));
         }
         if let Some(bot) = self.get(slug) {
             bot.stop();
@@ -1087,7 +1094,7 @@ mod tests {
             Ok(()) => panic!("the only bot must not be removable"),
             Err(e) => e.to_string(),
         };
-        assert!(err.contains("only bot"), "{err}");
+        assert!(err.contains("only agent"), "{err}");
         assert_ne!(bot.state(), BotState::Stopped, "it was stopped anyway");
         sup.shutdown();
     }
@@ -1125,7 +1132,7 @@ mod tests {
         );
         match sup.restart_bot("nope").await {
             Ok(_) => panic!("unknown bot must not restart"),
-            Err(e) => assert!(e.to_string().contains("no bot 'nope'")),
+            Err(e) => assert!(e.to_string().contains("no agent 'nope'")),
         }
         sup.shutdown();
     }

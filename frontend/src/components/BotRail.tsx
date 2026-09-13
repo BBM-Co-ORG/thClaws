@@ -80,7 +80,7 @@ export function BotRail({
       <div className="flex-1" />
       <button
         onClick={onOpenHost}
-        title="Workspace — add, remove or restart bots"
+        title="Workspace — add, remove or restart agents"
         aria-label="Workspace settings"
         className="w-9 h-9 rounded-lg text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)] flex items-center justify-center"
       >
@@ -88,8 +88,8 @@ export function BotRail({
       </button>
       <button
         onClick={onOpenHost}
-        title="Add a bot from the catalogue"
-        aria-label="Add a bot"
+        title="Add an agent"
+        aria-label="Add an agent"
         className="w-9 h-9 rounded-lg text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)] flex items-center justify-center"
       >
         <Plus size={16} />

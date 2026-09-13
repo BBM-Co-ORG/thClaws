@@ -1245,6 +1245,22 @@ pub fn uninstall_daemon() -> Result<PathBuf> {
 /// `std::env::current_exe()`. Pass an explicit path in tests so
 /// the scheduler points at a fake binary that doesn't actually
 /// invoke the agent loop.
+/// dev-plan/60 G1: whether this process ticks the in-process scheduler.
+///
+/// The store is user-level (`$HOME/.config/thclaws/schedules.json`) and holds
+/// every workspace's schedules, so exactly one process per HOME should tick
+/// it. Under a workspace host that process is the host. Its agents run with
+/// `HOME=<agent>/.home`, where the store is empty — which is how a workspace
+/// that became multi-agent silently stopped firing its schedules — and a
+/// second ticker over the real store would fire each schedule twice.
+pub fn in_process_scheduler_wanted(
+    print: bool,
+    no_scheduler: bool,
+    supervised_child: bool,
+) -> bool {
+    !print && !no_scheduler && !supervised_child
+}
+
 pub fn spawn_scheduler_task(binary: PathBuf) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut sched = InProcessScheduler::new(binary);
@@ -1573,6 +1589,18 @@ mod tests {
         let mut perms = std::fs::metadata(path).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(path, perms).unwrap();
+    }
+
+    #[test]
+    fn the_scheduler_runs_in_the_host_not_in_its_agents() {
+        // A desktop window, a plain --serve, and a workspace host all tick it.
+        assert!(in_process_scheduler_wanted(false, false, false));
+        // An agent under a host does not: its HOME is its own folder, and the
+        // host already ticks the real store.
+        assert!(!in_process_scheduler_wanted(false, false, true));
+        // -p and --no-scheduler never did.
+        assert!(!in_process_scheduler_wanted(true, false, false));
+        assert!(!in_process_scheduler_wanted(false, true, false));
     }
 
     #[test]

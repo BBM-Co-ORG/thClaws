@@ -42,7 +42,7 @@ use axum::extract::{DefaultBodyLimit, Multipart, Query, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Json, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use axum::Router;
 use futures::{SinkExt, StreamExt};
 use std::collections::HashMap;
@@ -483,7 +483,12 @@ pub async fn run_with_engine(
     // injects THCLAWS_CLOUD_URL / THCLAWS_CLOUD_TOKEN / THCLAWS_WORKSPACE_ID
     // at provision time. Outside cloud (any env var missing), this is
     // a no-op — local CLI / desktop GUI runs don't need it.
-    spawn_cloud_heartbeat(ws_connections);
+    // dev-plan/60 G2: an agent under a workspace host leaves the keepalive to
+    // the host. Each agent sending its own meant the last one to report won —
+    // an idle agent's `busy: false` could land while another was mid-turn.
+    if std::env::var("THCLAWS_SUPERVISED").ok().as_deref() != Some("1") {
+        spawn_cloud_heartbeat(ws_connections);
+    }
 
     // Loopback-only safety check for the API auth-bypass token. The
     // bypass mode (`THCLAWS_API_TOKEN=disable-auth`) makes the OpenAI
@@ -572,8 +577,80 @@ struct SyncStatResp {
     revision: Option<u64>,
 }
 
-async fn sync_stat(State(state): State<ServeState>) -> Response {
-    let root = state.workspace.as_path();
+/// What the `/workspace/sync/*` handlers need: the directory they teleport,
+/// and whether an agent is mid-turn in it. A plain serve answers the second
+/// from its own counter; a host has to ask its agents, because the turns run
+/// in their processes, not its own.
+#[derive(Clone)]
+struct SyncRoot {
+    workspace: Arc<std::path::PathBuf>,
+    host: Option<Arc<crate::bots::supervisor::BotSupervisor>>,
+}
+
+impl SyncRoot {
+    async fn busy(&self) -> bool {
+        match &self.host {
+            Some(sup) => agents_busy(sup).await.0,
+            None => crate::agent_activity::busy_count() > 0,
+        }
+    }
+}
+
+impl axum::extract::FromRef<ServeState> for SyncRoot {
+    fn from_ref(state: &ServeState) -> Self {
+        Self {
+            workspace: state.workspace.clone(),
+            host: None,
+        }
+    }
+}
+
+impl axum::extract::FromRef<Arc<crate::bots::supervisor::BotSupervisor>> for SyncRoot {
+    fn from_ref(sup: &Arc<crate::bots::supervisor::BotSupervisor>) -> Self {
+        Self {
+            workspace: Arc::new(sup.workspace().to_path_buf()),
+            host: Some(sup.clone()),
+        }
+    }
+}
+
+/// Workspace sync (dev-plan/51): /cloud push|pull against the workspace dir.
+/// Mounted by the classic router and by a host, which teleports the whole
+/// workspace — every agent in it — exactly as a plain serve teleports its one.
+/// `THCLAWS_SYNC_REQUIRE_AUTH=1` opts the group into the /v1 bearer.
+fn sync_routes<S>() -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+    SyncRoot: axum::extract::FromRef<S>,
+{
+    Router::new()
+        .route("/workspace/sync/stat", get(sync_stat))
+        .route("/workspace/sync/pull", get(sync_pull))
+        .route(
+            "/workspace/sync/push",
+            post(sync_push).layer(DefaultBodyLimit::max(
+                crate::cloud::wssync::MAX_SYNC_BYTES as usize,
+            )),
+        )
+        // P2 incremental: manifest diff + per-subset transfer/trash.
+        .route("/workspace/sync/manifest", get(sync_manifest))
+        .route(
+            "/workspace/sync/export",
+            post(sync_export).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
+        .route(
+            "/workspace/sync/trash",
+            post(sync_trash).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
+        // Agreed sync revision, recorded after a sync lands (both
+        // directions) so the two ends name the same number.
+        .route("/workspace/sync/revision", post(sync_revision))
+        .route_layer(axum::middleware::from_fn(sync_bearer_gate))
+}
+
+async fn sync_stat(State(sync): State<SyncRoot>) -> Response {
+    let busy = sync.busy().await;
+    let root = sync.workspace.as_path();
     match crate::cloud::wssync::stat_workspace(root) {
         Ok(s) => {
             let binding = crate::cloud::wssync::read_binding(root);
@@ -581,7 +658,7 @@ async fn sync_stat(State(state): State<ServeState>) -> Response {
                 file_count: s.file_count,
                 bytes: s.bytes,
                 empty: crate::cloud::wssync::is_empty(root).unwrap_or(false),
-                busy: crate::agent_activity::busy_count() > 0,
+                busy: busy,
                 engine_version: env!("CARGO_PKG_VERSION"),
                 workspace_id: binding.workspace_id,
                 revision: binding.revision,
@@ -635,11 +712,12 @@ async fn stream_tar_temp(tmp: tempfile::NamedTempFile) -> Response {
         .into_response()
 }
 
-async fn sync_pull(State(state): State<ServeState>, Query(q): Query<PullQuery>) -> Response {
-    if crate::agent_activity::busy_count() > 0 {
+async fn sync_pull(State(sync): State<SyncRoot>, Query(q): Query<PullQuery>) -> Response {
+    let busy = sync.busy().await;
+    if busy {
         return (StatusCode::CONFLICT, "workspace busy (active turn)").into_response();
     }
-    let root = state.workspace.as_path().to_path_buf();
+    let root = sync.workspace.as_path().to_path_buf();
     let include_runtime = q.include_runtime;
     let tmp = tokio::task::spawn_blocking(move || {
         let tmp = tempfile::NamedTempFile::new().map_err(|e| format!("temp: {e}"))?;
@@ -669,11 +747,12 @@ struct PushResp {
 }
 
 async fn sync_push(
-    State(state): State<ServeState>,
+    State(sync): State<SyncRoot>,
     Query(q): Query<PushQuery>,
     body: Body,
 ) -> Response {
-    if crate::agent_activity::busy_count() > 0 {
+    let busy = sync.busy().await;
+    if busy {
         return (StatusCode::CONFLICT, "workspace busy (active turn)").into_response();
     }
     // Stream the upload to a temp file so a large tarball never rides in memory.
@@ -711,7 +790,7 @@ async fn sync_push(
     }
     drop(afile);
 
-    let root = state.workspace.as_path().to_path_buf();
+    let root = sync.workspace.as_path().to_path_buf();
     let delete = q.delete;
     let path = tmp.into_temp_path();
     let res = tokio::task::spawn_blocking(move || {
@@ -721,7 +800,7 @@ async fn sync_push(
     .await;
     match res {
         Ok(Ok(r)) => {
-            let root = state.workspace.as_path();
+            let root = sync.workspace.as_path();
             let mut b = crate::cloud::wssync::read_binding(root);
             if let Some(id) = q.workspace_id {
                 b.workspace_id = Some(id);
@@ -754,8 +833,8 @@ struct RevisionResp {
 /// Record the revision the client just completed. Monotonic on purpose: a
 /// late or replayed call can only raise the counter, never walk it back to a
 /// number a user has already seen quoted.
-async fn sync_revision(State(state): State<ServeState>, Json(req): Json<RevisionReq>) -> Response {
-    let root = state.workspace.as_path();
+async fn sync_revision(State(sync): State<SyncRoot>, Json(req): Json<RevisionReq>) -> Response {
+    let root = sync.workspace.as_path();
     let mut b = crate::cloud::wssync::read_binding(root);
     let revision = req.revision.max(b.revision.unwrap_or(0));
     b.revision = Some(revision);
@@ -777,21 +856,23 @@ fn unix_now_string() -> String {
 
 // P2 incremental endpoints.
 
-async fn sync_manifest(State(state): State<ServeState>) -> Response {
-    if crate::agent_activity::busy_count() > 0 {
+async fn sync_manifest(State(sync): State<SyncRoot>) -> Response {
+    let busy = sync.busy().await;
+    if busy {
         return (StatusCode::CONFLICT, "workspace busy (active turn)").into_response();
     }
-    match crate::cloud::wssync::build_manifest(state.workspace.as_path()) {
+    match crate::cloud::wssync::build_manifest(sync.workspace.as_path()) {
         Ok(m) => Json(m).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
 
-async fn sync_export(State(state): State<ServeState>, Json(paths): Json<Vec<String>>) -> Response {
-    if crate::agent_activity::busy_count() > 0 {
+async fn sync_export(State(sync): State<SyncRoot>, Json(paths): Json<Vec<String>>) -> Response {
+    let busy = sync.busy().await;
+    if busy {
         return (StatusCode::CONFLICT, "workspace busy (active turn)").into_response();
     }
-    let root = state.workspace.as_path().to_path_buf();
+    let root = sync.workspace.as_path().to_path_buf();
     let tmp = tokio::task::spawn_blocking(move || {
         let tmp = tempfile::NamedTempFile::new().map_err(|e| format!("temp: {e}"))?;
         crate::cloud::wssync::tar_paths_to(&root, &paths, tmp.as_file())?;
@@ -805,11 +886,12 @@ async fn sync_export(State(state): State<ServeState>, Json(paths): Json<Vec<Stri
     }
 }
 
-async fn sync_trash(State(state): State<ServeState>, Json(paths): Json<Vec<String>>) -> Response {
-    if crate::agent_activity::busy_count() > 0 {
+async fn sync_trash(State(sync): State<SyncRoot>, Json(paths): Json<Vec<String>>) -> Response {
+    let busy = sync.busy().await;
+    if busy {
         return (StatusCode::CONFLICT, "workspace busy (active turn)").into_response();
     }
-    match crate::cloud::wssync::trash_paths(state.workspace.as_path(), &paths) {
+    match crate::cloud::wssync::trash_paths(sync.workspace.as_path(), &paths) {
         Ok(r) => Json(PushResp {
             written: r.written,
             deleted: r.deleted,
@@ -869,31 +951,7 @@ fn classic_router(state: ServeState) -> Router {
         // export/push holding only THCLAWS_API_TOKEN — no tunnel /
         // ForwardAuth. Unset = classic trusted-network behavior,
         // existing deployments unaffected.
-        .merge(
-            axum::Router::new()
-                .route("/workspace/sync/stat", get(sync_stat))
-                .route("/workspace/sync/pull", get(sync_pull))
-                .route(
-                    "/workspace/sync/push",
-                    post(sync_push).layer(DefaultBodyLimit::max(
-                        crate::cloud::wssync::MAX_SYNC_BYTES as usize,
-                    )),
-                )
-                // P2 incremental: manifest diff + per-subset transfer/trash.
-                .route("/workspace/sync/manifest", get(sync_manifest))
-                .route(
-                    "/workspace/sync/export",
-                    post(sync_export).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
-                )
-                .route(
-                    "/workspace/sync/trash",
-                    post(sync_trash).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
-                )
-                // Agreed sync revision, recorded after a sync lands (both
-                // directions) so the two ends name the same number.
-                .route("/workspace/sync/revision", post(sync_revision))
-                .route_layer(axum::middleware::from_fn(sync_bearer_gate)),
-        )
+        .merge(sync_routes())
         .route_layer(axum::middleware::from_fn_with_state(
             single_user,
             serve_token_gate,
@@ -951,7 +1009,7 @@ pub async fn run_supervisor_on(listener: tokio::net::TcpListener) -> crate::erro
         let dest =
             crate::bots::migrate::mint_new_workspace(&workspace, crate::bots::migrate::MAIN_SLUG)?;
         eprintln!(
-            "\x1b[36m[bots] new workspace — minted a host and one bot at {}\x1b[0m",
+            "\x1b[36m[bots] new workspace — minted a host and one agent at {}\x1b[0m",
             dest.display()
         );
     }
@@ -960,10 +1018,11 @@ pub async fn run_supervisor_on(listener: tokio::net::TcpListener) -> crate::erro
     let _lock = crate::bots::lock_workspace(&workspace, "this host")?;
     let cfg = crate::bots::BotsConfig::load(&workspace)?;
     let sup = crate::bots::supervisor::BotSupervisor::new(&workspace)?;
+    spawn_host_heartbeat(sup.clone());
     let cap = crate::bots::supervisor::MAX_LIVE_BOTS;
     if cfg.bots.len() > cap {
         eprintln!(
-            "\x1b[33m[bots] {} bots listed; starting the first {cap}. An idle policy that tears \
+            "\x1b[33m[bots] {} agents listed; starting the first {cap}. An idle policy that tears \
              children down is what lifts this, not a bigger number.\x1b[0m",
             cfg.bots.len()
         );
@@ -990,7 +1049,7 @@ pub async fn run_supervisor_on(listener: tokio::net::TcpListener) -> crate::erro
     }
     if started == 0 {
         return Err(crate::error::Error::Config(
-            "none of this workspace's bots could be started — see the lines above".into(),
+            "none of this workspace's agents could be started — see the lines above".into(),
         ));
     }
 
@@ -1006,10 +1065,9 @@ pub async fn run_supervisor_on(listener: tokio::net::TcpListener) -> crate::erro
 }
 
 /// The host's surface: the React bundle, the proxied socket, the bot list and
-/// its mutations, and the two file routes forwarded to a bot with that bot's
-/// own bearer. `/workspace/sync/*` is deliberately absent — it operates on a
-/// whole workspace directory, which under a host is the shelf, not any one
-/// bot's tree.
+/// its mutations, the file routes forwarded to a bot with that bot's own
+/// bearer, workspace sync over the whole workspace, and `/v1` carried to an
+/// agent with the caller's bearer.
 fn supervisor_router(sup: Arc<crate::bots::supervisor::BotSupervisor>) -> Router {
     Router::new()
         .route("/", get(serve_index))
@@ -1028,11 +1086,21 @@ fn supervisor_router(sup: Arc<crate::bots::supervisor::BotSupervisor>) -> Router
         // No body-limit layer, matching the classic router's `/upload`: the
         // host must not be a different size of pipe than serving directly.
         .route("/upload", post(supervisor_forward))
+        // dev-plan/60 G5: /cloud push|pull teleports the whole workspace, so
+        // under a host it is the host's to serve — no single agent's tree is
+        // the workspace.
+        .merge(sync_routes())
         // Same opt-in bearer as the classic router. `route_layer` covers the
         // routes registered above it, so `/healthz` below stays open for a
         // parent supervisor's probe.
         .route_layer(axum::middleware::from_fn_with_state(true, serve_token_gate))
         .route("/healthz", get(supervisor_health))
+        // dev-plan/60 G6: the OpenAI-compatible API is an agent's, carried to
+        // one (`?bot=`, else the default). Outside the serve gate like the
+        // classic router's `/v1`: it has its own `THCLAWS_API_TOKEN` policy,
+        // which the agent enforces against the caller's bearer.
+        .route("/v1/{*rest}", any(supervisor_forward_api))
+        .route("/agent/run", post(supervisor_forward_api))
         .with_state(sup)
 }
 
@@ -1053,12 +1121,12 @@ fn pick_bot(
         Some(slug) => sup.get(slug).ok_or_else(|| {
             (
                 StatusCode::NOT_FOUND,
-                format!("no bot '{slug}' is running in this workspace"),
+                format!("no agent '{slug}' is running in this workspace"),
             )
                 .into_response()
         }),
         None => sup.focused().ok_or_else(|| {
-            (StatusCode::SERVICE_UNAVAILABLE, "no bots are running").into_response()
+            (StatusCode::SERVICE_UNAVAILABLE, "no agents are running").into_response()
         }),
     }
 }
@@ -1075,7 +1143,13 @@ async fn supervisor_ws(
         Ok(b) => b,
         Err(resp) => return resp,
     };
-    ws.on_upgrade(move |socket| crate::bots::proxy::relay(socket, bot))
+    // Counted for the keepalive's `activity`, the way a plain serve counts
+    // its own sockets.
+    let counter = host_ws_connections();
+    ws.on_upgrade(move |socket| async move {
+        let _guard = WsGuard::new(counter);
+        crate::bots::proxy::relay(socket, bot).await
+    })
 }
 
 /// `GET /file-asset/<rel>` and `POST /upload` against the focused bot.
@@ -1105,6 +1179,32 @@ fn bot_from_referer(req: &Request) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// `/v1/*` and `/agent/run`, carried to an agent. Unlike the file routes the
+/// caller's `Authorization` goes through untouched: the agent checks it
+/// against the API token, which is not the agent's own serve token.
+async fn supervisor_forward_api(
+    State(sup): State<Arc<crate::bots::supervisor::BotSupervisor>>,
+    Query(q): Query<BotQuery>,
+    req: Request,
+) -> Response {
+    let bot = match pick_bot(&sup, q.bot.as_deref()) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let (addr, _) = match bot.wait_ready(std::time::Duration::from_secs(30)).await {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
+    };
+    match crate::bots::proxy::forward_http_as_caller(&addr, req).await {
+        Ok(resp) => resp,
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            format!("agent '{}': {e}", bot.slug),
+        )
+            .into_response(),
+    }
+}
+
 async fn supervisor_forward(
     State(sup): State<Arc<crate::bots::supervisor::BotSupervisor>>,
     Query(q): Query<BotQuery>,
@@ -1121,7 +1221,11 @@ async fn supervisor_forward(
     };
     match crate::bots::proxy::forward_http(&addr, &token, req).await {
         Ok(resp) => resp,
-        Err(e) => (StatusCode::BAD_GATEWAY, format!("bot '{}': {e}", bot.slug)).into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            format!("agent '{}': {e}", bot.slug),
+        )
+            .into_response(),
     }
 }
 
@@ -1254,17 +1358,152 @@ async fn supervisor_health(
         .count();
     let states: Vec<_> = rows.iter().map(|r| r.state.clone()).collect();
     let ok = host_ok(&states);
+    // dev-plan/60 G3: the same `busy` a plain serve reports, so anything that
+    // reads it — the cloud reaper's probe — sees an agent working through the
+    // host rather than an idle host.
+    let (busy, busy_count) = agents_busy(&sup).await;
     let body = Json(serde_json::json!({
         "ok": ok,
         "role": "host",
         "bots": rows.len(),
         "ready": ready,
+        "busy": busy,
+        "busy_count": busy_count,
     }));
     if ok {
         body.into_response()
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, body).into_response()
     }
+}
+
+/// WebSockets the host is relaying, across every agent.
+fn host_ws_connections() -> Arc<AtomicUsize> {
+    static COUNTER: std::sync::OnceLock<Arc<AtomicUsize>> = std::sync::OnceLock::new();
+    COUNTER
+        .get_or_init(|| Arc::new(AtomicUsize::new(0)))
+        .clone()
+}
+
+/// A host runs no agent of its own; it is busy when any of its agents is.
+///
+/// Asked of every ready agent at once and capped as a whole, because the
+/// answer lands in `/healthz`, whose Kubernetes probe gives up after a second
+/// — one agent slow to answer must not get the whole pod restarted.
+async fn agents_busy(sup: &crate::bots::supervisor::BotSupervisor) -> (bool, usize) {
+    let Ok(client) = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_millis(600))
+        .build()
+    else {
+        return (false, 0);
+    };
+    let asks = sup.list().into_iter().filter_map(|bot| {
+        let crate::bots::supervisor::BotState::Ready { addr } = bot.state() else {
+            return None;
+        };
+        let request = client
+            .get(format!("http://{addr}/healthz"))
+            .bearer_auth(bot.token());
+        Some(async move {
+            let v: serde_json::Value = request.send().await.ok()?.json().await.ok()?;
+            Some((
+                v.get("busy").and_then(|b| b.as_bool()).unwrap_or(false),
+                v.get("busy_count").and_then(|c| c.as_u64()).unwrap_or(0) as usize,
+            ))
+        })
+    });
+    let answers = tokio::time::timeout(Duration::from_millis(700), futures::future::join_all(asks))
+        .await
+        .unwrap_or_default();
+    answers
+        .into_iter()
+        .flatten()
+        .fold((false, 0), |(any, n), (busy, count)| {
+            (any || busy, n + count)
+        })
+}
+
+/// dev-plan/60 G2: a hosted workspace's one keepalive, sent by the host.
+///
+/// Same contract as `spawn_cloud_heartbeat`: a ping every minute while a
+/// browser is connected, an agent is busy, or a schedule is pending
+/// (`activity: false` for the last), and one straight away when busy flips so
+/// the dashboard's "running" pill is prompt. The host cannot be woken by an
+/// agent's turn starting, so it looks every ten seconds.
+fn spawn_host_heartbeat(sup: Arc<crate::bots::supervisor::BotSupervisor>) {
+    let Some((endpoint, token)) = cloud_keepalive_target() else {
+        return;
+    };
+    eprintln!("\x1b[36m[bots] cloud heartbeat → {endpoint} (for the whole workspace)\x1b[0m");
+    tokio::spawn(async move {
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[bots] heartbeat client build failed: {e}");
+                return;
+            }
+        };
+        let mut tick = tokio::time::interval(Duration::from_secs(10));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_busy = false;
+        let mut last_agents: Option<serde_json::Value> = None;
+        let mut last_sent: Option<std::time::Instant> = None;
+        loop {
+            tick.tick().await;
+            let (busy, _) = agents_busy(&sup).await;
+            let connected = host_ws_connections().load(Ordering::SeqCst) > 0;
+            let next_schedule_at = crate::schedule::ScheduleStore::load()
+                .ok()
+                .and_then(|st| st.next_fire_across_all(chrono::Utc::now()))
+                .map(|t| t.to_rfc3339());
+            let activity = connected || busy;
+            // dev-plan/60 G9: the dashboard shows what a workspace holds, even
+            // paused, from the list the host last sent. A changed list is sent
+            // straight away, like a busy flip.
+            let agents = crate::bots::BotsConfig::load(sup.workspace())
+                .ok()
+                .map(|cfg| {
+                    serde_json::Value::Array(
+                        cfg.bots
+                            .iter()
+                            .map(|b| serde_json::json!({ "slug": b.slug, "name": b.name }))
+                            .collect(),
+                    )
+                });
+            let flipped = busy != last_busy || agents != last_agents;
+            let due = last_sent.map_or(true, |t| t.elapsed() >= Duration::from_secs(60));
+            if !flipped && (!due || (!activity && next_schedule_at.is_none())) {
+                continue;
+            }
+            match client
+                .post(&endpoint)
+                .bearer_auth(&token)
+                .json(&serde_json::json!({
+                    "busy": busy,
+                    "activity": activity,
+                    "next_schedule_at": next_schedule_at,
+                    "agents": agents,
+                }))
+                .send()
+                .await
+            {
+                // Remembered only once the cloud has it: a first ping that
+                // fails (the API restarting, say) is retried on the next tick
+                // instead of waiting for the next change.
+                Ok(r) if r.status().is_success() => {
+                    last_busy = busy;
+                    last_agents = agents;
+                }
+                Ok(r) => eprintln!("[bots] heartbeat {endpoint} returned HTTP {}", r.status()),
+                Err(e) => eprintln!("[bots] heartbeat {endpoint} failed: {e}"),
+            }
+            last_sent = Some(std::time::Instant::now());
+        }
+    });
 }
 
 /// dev-plan/59: write the address this process actually bound to the file a
@@ -1564,24 +1803,25 @@ impl Drop for WsGuard {
 ///
 /// Any missing var = local / non-cloud run; the task no-ops and
 /// returns immediately so we don't burn a tokio worker on idle.
-fn spawn_cloud_heartbeat(connections: Arc<AtomicUsize>) {
-    let url = match std::env::var("THCLAWS_CLOUD_URL") {
-        Ok(v) if !v.trim().is_empty() => v,
-        _ => return,
-    };
-    let token = match std::env::var("THCLAWS_CLOUD_TOKEN") {
-        Ok(v) if !v.trim().is_empty() => v,
-        _ => return,
-    };
-    let workspace_id = match std::env::var("THCLAWS_WORKSPACE_ID") {
-        Ok(v) if !v.trim().is_empty() => v,
-        _ => return,
-    };
+/// Where a hosted workspace's keepalive goes, and the token it carries. `None`
+/// outside thclaws.cloud — any of the three env vars missing.
+fn cloud_keepalive_target() -> Option<(String, String)> {
+    let get = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+    let url = get("THCLAWS_CLOUD_URL")?;
+    let token = get("THCLAWS_CLOUD_TOKEN")?;
+    let workspace_id = get("THCLAWS_WORKSPACE_ID")?;
     let endpoint = format!(
         "{}/api/hosted/workspaces/{}/keepalive",
         url.trim_end_matches('/'),
         workspace_id
     );
+    Some((endpoint, token))
+}
+
+fn spawn_cloud_heartbeat(connections: Arc<AtomicUsize>) {
+    let Some((endpoint, token)) = cloud_keepalive_target() else {
+        return;
+    };
     eprintln!(
         "\x1b[36m[serve] cloud heartbeat → {endpoint} (every 60s while WS connected or agent busy)\x1b[0m"
     );
@@ -3136,9 +3376,8 @@ mod tests {
     /// has to be opt-in, because every existing deployment runs without it —
     /// The host's own surface gets the same treatment as the classic one:
     /// `/healthz` open for a parent probe, everything else behind the bearer.
-    /// It serves none of the workspace routes — `/file-asset` and
-    /// `/workspace/sync/*` read and write a bot's tree, and the bot serves
-    /// those itself behind its own token.
+    /// `/file-asset` is forwarded to a bot; `/workspace/sync/*` is the host's
+    /// own, over the whole workspace.
     #[tokio::test]
     async fn supervisor_router_gates_everything_but_healthz() {
         use tower::ServiceExt as _;
@@ -3189,6 +3428,27 @@ mod tests {
             assert_eq!(got, StatusCode::UNAUTHORIZED, "{m} {uri}");
         }
         assert_eq!(status(&app, "/healthz", None).await, StatusCode::OK);
+        // dev-plan/60 G3: a host reports busy like a plain serve does. With no
+        // agent running, that is not busy — and the fields are there to read.
+        let health = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(health.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["role"], "host");
+        assert_eq!(body["busy"], false);
+        assert_eq!(body["busy_count"], 0);
         // Every bot parked is a host that will never serve on its own;
         // merely starting is not that.
         use crate::bots::supervisor::BotState as S;
@@ -3254,10 +3514,40 @@ mod tests {
             StatusCode::NOT_FOUND,
             "the Referer's bot is looked up, and 'nope' is not a bot"
         );
-        // Sync stays absent: it operates on a whole workspace directory, and
-        // under a host that is the shelf, not any one bot's tree.
+        // dev-plan/60 G5: sync is the host's, over the whole workspace, behind
+        // the same bearer as everything else.
         assert_eq!(
-            status(&app, "/workspace/sync/pull", Some("Bearer host-secret")).await,
+            status(&app, "/workspace/sync/stat", None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        let stat = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/workspace/sync/stat")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer host-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stat.status(), StatusCode::OK);
+        let stat: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(stat.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stat["busy"], false, "no agent is running, so none is busy");
+        // dev-plan/60 G6: `/v1` is carried to an agent — with none running that
+        // is "nothing to carry it to", not "no such route" — and it is outside
+        // the serve bearer, whose token a `/v1` caller does not hold.
+        assert_eq!(
+            status(&app, "/v1/models", None).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            status(&app, "/v1/models?bot=nope", None).await,
             StatusCode::NOT_FOUND
         );
 

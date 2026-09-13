@@ -207,7 +207,7 @@ public catalog. A `private` agent is hidden from every path (list, detail,
 enumerable).
 
 **Changing visibility** — open your agent's page on the web
-(`https://thclaws.cloud/a/<slug>`); a toggle appears when you're the
+(`https://thclaws.cloud/templates/<slug>`); a toggle appears when you're the
 owner (or root). An author may flip between `private` and `unlisted`
 freely; **promoting to `public` is superadmin-only** (else 403). There is *no* desktop
 `/cloud` verb for this — it's web-only (it calls

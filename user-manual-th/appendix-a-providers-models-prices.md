@@ -484,7 +484,7 @@ context ที่มี **`?`** คือค่าที่ provider ไม่�
 | `tencent/hy-mt2-1.8b` | 8k | $0.05 | — | $0.22 |
 | `tencent/hy-mt2-30b-a3b` | 8k | $0.09 | — | $0.37 |
 | `tencent/hy-mt2-7b` | 8k | $0.09 | — | $0.37 |
-| `tencent/hy3` | 262k | $0.17 | — | $0.66 |
+| `tencent/hy3` | 262k | $0.10 | — | $0.41 |
 | `tencent/hy3-preview` | 262k | $0.22 | — | $0.75 |
 | `tencent/hy4-preview` | 1.04858M | $1.04 | — | $3.13 |
 | `thedrummer/cydonia-24b-v4.1` | 131k | $0.38 | — | $0.62 |
@@ -518,7 +518,7 @@ context ที่มี **`?`** คือค่าที่ provider ไม่�
 | `z-ai/glm-5.1` | 203k | $1.21 | — | $3.79 |
 | `z-ai/glm-5.2` | 1.04858M | $0.75 | — | $2.50 |
 | `z-ai/glm-5.3` | 1.04858M | $1.37 | — | $4.29 |
-| `z-ai/glm-5.3-flash` | 1.31072M | $0.19 | — | $0.62 |
+| `z-ai/glm-5.3-flash` | 1.31072M | $0.09 | — | $0.31 |
 | `z-ai/glm-5v-turbo` | 203k | $1.50 | — | $5.00 |
 | `~anthropic/claude-fable-latest` | 1M | $12.50 | — | $62.50 |
 | `~anthropic/claude-haiku-latest` | 200k | $1.25 | — | $6.25 |

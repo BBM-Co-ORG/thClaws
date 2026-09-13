@@ -114,10 +114,10 @@ struct Cli {
     serve: bool,
 
     /// dev-plan/59: run `--serve` as the workspace HOST — a supervisor
-    /// that starts one `thclaws --serve` per bot from
+    /// that starts one `thclaws --serve` per agent from
     /// `.thclaws/bots.json`, proxies the browser's socket to it and
     /// restarts it when it dies. The host itself loads no agent, no
-    /// model and no MCP. This build supervises the first bot listed.
+    /// model and no MCP. This build supervises the first agent listed.
     #[arg(long)]
     supervisor: bool,
 
@@ -349,8 +349,8 @@ enum Command {
         #[command(subcommand)]
         cmd: AgentCmd,
     },
-    /// dev-plan/59: the multi-bot workspace layout — inspect it, or move a
-    /// single-agent workspace into it.
+    /// dev-plan/59: workspaces that hold more than one agent — inspect the
+    /// layout, or move a single-agent workspace into it.
     #[cfg(feature = "gui")]
     Bots {
         #[command(subcommand)]
@@ -369,39 +369,40 @@ enum Command {
 #[cfg(feature = "gui")]
 #[derive(Subcommand)]
 enum BotsCmd {
-    /// Print the workspace layout version and the bots in it.
+    /// Print the workspace layout version and the agents in it.
     Status {
         /// Workspace to inspect. Defaults to the current directory.
         #[arg(long)]
         path: Option<String>,
     },
-    /// Install a catalogue agent as a bot in this workspace
+    /// Get an Agent Template into this workspace as an agent
     /// (`.thclaws/bots/<slug>/`) and list it in `.thclaws/bots.json`.
     /// A running host picks it up on its next start.
     Add {
-        /// Catalogue slug, as `/cloud list` shows it.
+        /// Agent Template name, as `/cloud list` shows it.
         slug: String,
         /// Pin a version instead of taking the latest.
         #[arg(long)]
         version: Option<String>,
-        /// Overwrite a folder bound to a different agent.
+        /// Overwrite a folder bound to a different Agent Template.
         #[arg(long)]
         force: bool,
         /// Workspace to install into. Defaults to the current directory.
         #[arg(long)]
         path: Option<String>,
     },
-    /// Stop listing a bot. Its folder — sessions, KMS, browser logins —
+    /// Remove an agent from this workspace. Its folder — sessions, KMS, browser logins —
     /// stays on disk unless `--purge`.
     Remove {
         slug: String,
-        /// Also delete the bot's folder and everything in it.
+        /// Also delete the agent's folder and everything in it.
         #[arg(long)]
         purge: bool,
         #[arg(long)]
         path: Option<String>,
     },
-    /// Move a single-agent (v2) workspace into the multi-bot (v3) layout.
+    /// Move a single-agent (v2) workspace into the v3 layout,
+    /// which can hold more than one agent.
     /// Everything at the workspace root — your files, your git repository
     /// and `.thclaws/` alike — becomes `.thclaws/bots/main/`, and the root
     /// becomes the host that supervises it. Resumable: if it is interrupted,
@@ -414,6 +415,16 @@ enum BotsCmd {
         #[arg(long)]
         yes: bool,
         /// Workspace to migrate. Defaults to the current directory.
+        #[arg(long)]
+        path: Option<String>,
+    },
+    /// Undo `migrate` for a workspace whose one agent is `main`: the agent goes
+    /// back to the root, and the host's `.thclaws/` is kept beside it.
+    Unmigrate {
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+        /// Workspace to convert back. Defaults to the current directory.
         #[arg(long)]
         path: Option<String>,
     },
@@ -955,7 +966,7 @@ async fn main() {
                 use thclaws_core::bots::migrate::AutoOutcome;
                 match thclaws_core::bots::migrate::auto_migrate_if_v2(&cwd) {
                     AutoOutcome::Migrated(report, moves_git) => {
-                        eprintln!("\x1b[36m[thclaws] This workspace was upgraded to the multi-bot layout.\x1b[0m");
+                        eprintln!("\x1b[36m[thclaws] This workspace can now hold more than one agent.\x1b[0m");
                         eprintln!(
                             "\x1b[36m  Your project — files, sessions{} — is now at {}\x1b[0m",
                             if moves_git { ", git repository" } else { "" },
@@ -1008,7 +1019,7 @@ async fn main() {
                 );
             }
             _ => {
-                eprintln!("\x1b[31mThis directory is a workspace host and its default bot is missing; cd into .thclaws/bots/<slug> and run again.\x1b[0m");
+                eprintln!("\x1b[31mThis directory is a workspace host and its default agent is missing; cd into .thclaws/bots/<slug> and run again.\x1b[0m");
                 std::process::exit(1);
             }
         }
@@ -1074,9 +1085,12 @@ async fn main() {
     // desktop both become hosts by detecting the layout.
     // Same shape as `respawn_detached_for_gui_if_needed`: the desktop window
     // is what runs when no CLI-ish mode was asked for.
-    let opens_gui = !use_cli && (!cli.serve || cli.gui);
-    let acting_as_host = cli.supervisor || (workspace_is_v3() && (cli.serve || opens_gui));
-    if !cli.print && !cli.no_scheduler && !acting_as_host {
+    // dev-plan/60 G1: the scheduler belongs to whichever process owns the
+    // real HOME — a desktop window, a plain --serve, or a workspace host. The
+    // host used to skip it and leave it to its agents, whose HOME is their own
+    // folder; nothing then read the user's schedules at all.
+    let supervised_child = std::env::var("THCLAWS_SUPERVISED").ok().as_deref() == Some("1");
+    if schedule::in_process_scheduler_wanted(cli.print, cli.no_scheduler, supervised_child) {
         match std::env::current_exe() {
             Ok(binary) => {
                 schedule::spawn_scheduler_task(binary);
@@ -1142,7 +1156,7 @@ async fn main() {
                 // is a v2 shape. Refuse rather than silently drop the flag.
                 if cli.multi_tenant {
                     eprintln!(
-                        "\x1b[31m--multiuser cannot be combined with a multi-bot workspace\x1b[0m"
+                        "\x1b[31m--multiuser cannot be combined with a workspace that holds more than one agent\x1b[0m"
                     );
                     std::process::exit(1);
                 }
@@ -1535,7 +1549,7 @@ async fn run_bots_subcommand(cmd: BotsCmd) -> i32 {
                 Ok(p) => {
                     println!("workspace  {}", p.workspace.display());
                     match &p.status {
-                        migrate::Status::AlreadyV3 => println!("layout     v3 (multi-bot)"),
+                        migrate::Status::AlreadyV3 => println!("layout     v3 (multiple agents)"),
                         migrate::Status::Migrate => println!(
                             "layout     v2 (single agent) — `thclaws bots migrate` moves it to v3"
                         ),
@@ -1546,10 +1560,10 @@ async fn run_bots_subcommand(cmd: BotsCmd) -> i32 {
                     match thclaws_core::bots::BotsConfig::load(&ws) {
                         Ok(cfg) => {
                             for b in &cfg.bots {
-                                println!("bot        {} ({})", b.slug, b.display_name());
+                                println!("agent      {} ({})", b.slug, b.display_name());
                             }
                         }
-                        Err(_) => println!("bots       none"),
+                        Err(_) => println!("agents     none"),
                     }
                     0
                 }
@@ -1609,7 +1623,7 @@ async fn run_bots_subcommand(cmd: BotsCmd) -> i32 {
                     0
                 }
                 Ok(false) => {
-                    eprintln!("no bot '{slug}' in this workspace");
+                    eprintln!("no agent '{slug}' in this workspace");
                     1
                 }
                 Err(e) => {
@@ -1644,7 +1658,7 @@ async fn run_bots_subcommand(cmd: BotsCmd) -> i32 {
             if let migrate::Status::Resume(phase) = &plan.status {
                 println!("  resuming   an interrupted migration, from '{phase:?}'");
             }
-            println!("\n  moves into the bot ({}):", plan.moves.len());
+            println!("\n  moves into the agent folder ({}):", plan.moves.len());
             for chunk in plan.moves.chunks(4) {
                 println!("    {}", chunk.join("  "));
             }
@@ -1707,6 +1721,50 @@ async fn run_bots_subcommand(cmd: BotsCmd) -> i32 {
                     eprintln!("\n\x1b[31mmigration failed: {e}\x1b[0m");
                     eprintln!("The workspace is mid-migration and safe to resume — run the same");
                     eprintln!("command again once the cause is fixed.");
+                    1
+                }
+            }
+        }
+        BotsCmd::Unmigrate { yes, path } => {
+            let ws = resolve(path);
+            println!("\n\x1b[1mthClaws workspace — back to a single agent (v3 → v2)\x1b[0m\n");
+            println!("  workspace  {}", ws.display());
+            println!(
+                "  moves      {} back to the root",
+                ws.join(".thclaws/bots/main").display()
+            );
+            println!(
+                "  keeps      the host's .thclaws/ at {}",
+                ws.join(migrate::HOST_BACKUP).display()
+            );
+            println!(
+                "\n\x1b[33m  Close any thClaws window or `--serve` on this workspace first.\x1b[0m"
+            );
+            if !yes {
+                print!("\nType `yes` to continue: ");
+                use std::io::Write as _;
+                let _ = std::io::stdout().flush();
+                let mut answer = String::new();
+                if std::io::stdin().read_line(&mut answer).is_err() || answer.trim() != "yes" {
+                    println!("cancelled — nothing was moved.");
+                    return 1;
+                }
+            }
+            match migrate::unmigrate(&ws) {
+                Ok(report) => {
+                    println!("\n\x1b[32m✓ back to a single agent\x1b[0m");
+                    println!("  {} entries moved back to the root", report.moved);
+                    if !report.rewritten_schedules.is_empty() {
+                        println!("  rewrote {} schedule(s)", report.rewritten_schedules.len());
+                    }
+                    println!(
+                        "  the host's old tree is at {} and can be deleted",
+                        report.host_backup.display()
+                    );
+                    0
+                }
+                Err(e) => {
+                    eprintln!("\n\x1b[31m{e}\x1b[0m");
                     1
                 }
             }

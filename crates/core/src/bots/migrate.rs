@@ -36,6 +36,9 @@ pub const MAIN_SLUG: &str = "main";
 
 const STAGING: &str = ".thclaws-v3-migration";
 const MARKER: &str = ".thclaws-v3-migration.marker";
+/// Where `unmigrate` puts the host's `.thclaws/` — its agent list, state and
+/// settings — instead of deleting it.
+pub const HOST_BACKUP: &str = ".thclaws-v3-host";
 
 /// Hosted runners mount the workspace PVC twice — whole at `/workspace`, and
 /// again at the engine's `$HOME` via `subPath: .home`. It is user
@@ -140,7 +143,11 @@ fn movable_entries(workspace: &Path) -> Result<Vec<String>> {
     let mut names = Vec::new();
     for entry in std::fs::read_dir(workspace)? {
         let name = entry?.file_name().to_string_lossy().to_string();
-        if name == STAGING || name == MARKER || KEEP_AT_ROOT.contains(&name.as_str()) {
+        if name == STAGING
+            || name == MARKER
+            || name == HOST_BACKUP
+            || KEEP_AT_ROOT.contains(&name.as_str())
+        {
             continue;
         }
         names.push(name);
@@ -206,13 +213,19 @@ pub fn opens_as_host(dir: &Path) -> bool {
             && looks_like_v2_agent(dir))
 }
 
-/// `THCLAWS_AUTO_MIGRATE=0` turns auto-migration off anywhere; a container
-/// never does it on its own; a supervised child is inside a shelf and never
-/// asks.
+/// `THCLAWS_AUTO_MIGRATE=0` turns auto-migration off anywhere; a supervised
+/// child is inside a shelf and never asks. A container does not do it on its
+/// own, but `THCLAWS_AUTO_MIGRATE=1` set explicitly lets it (dev-plan/60 4.3):
+/// the cloud opts in one workspace at a time.
 pub fn auto_migrate_allowed() -> bool {
-    std::env::var("THCLAWS_AUTO_MIGRATE").ok().as_deref() != Some("0")
-        && std::env::var("THCLAWS_INSIDE_DOCKER").ok().as_deref() != Some("1")
-        && std::env::var("THCLAWS_SUPERVISED").ok().as_deref() != Some("1")
+    let flag = std::env::var("THCLAWS_AUTO_MIGRATE").ok();
+    if flag.as_deref() == Some("0")
+        || std::env::var("THCLAWS_SUPERVISED").ok().as_deref() == Some("1")
+    {
+        return false;
+    }
+    std::env::var("THCLAWS_INSIDE_DOCKER").ok().as_deref() != Some("1")
+        || flag.as_deref() == Some("1")
 }
 
 pub fn plan(workspace: &Path) -> Result<Plan> {
@@ -234,8 +247,8 @@ pub fn plan(workspace: &Path) -> Result<Plan> {
     // workspace it came from.
     if is_inside_shelf(workspace) {
         return Err(Error::Config(format!(
-            "{} is already a bot inside a workspace shelf — migrate the workspace above it, not \
-             the bot",
+            "{} is already an agent inside a workspace — migrate the workspace above it, not \
+             the agent",
             workspace.display()
         )));
     }
@@ -257,7 +270,7 @@ pub fn plan(workspace: &Path) -> Result<Plan> {
         None if version >= HOST_WORKSPACE_VERSION && shelf.is_dir() => Status::AlreadyV3,
         None if version >= HOST_WORKSPACE_VERSION => {
             return Err(Error::Config(format!(
-                "{} declares workspaceVersion {version} but has no {} — its bots are missing, and \
+                "{} declares workspaceVersion {version} but has no {} — its agents are missing, and \
                  migrating again would move the host's own tree into a new one. Restore the shelf \
                  or fix the version by hand.",
                 workspace.display(),
@@ -463,6 +476,171 @@ fn apply_locked(plan: &Plan) -> Result<Report> {
     Ok(report)
 }
 
+#[derive(Debug, Default)]
+pub struct UnmigrateReport {
+    pub moved: usize,
+    /// The host's `.thclaws/`, kept rather than deleted.
+    pub host_backup: PathBuf,
+    pub rewritten_schedules: Vec<String>,
+}
+
+/// Root entries a migrated workspace may hold besides the host's own tree.
+fn host_root_entry_ok(ws: &Path, name: &str) -> bool {
+    match name {
+        ".thclaws" | ".DS_Store" | HOST_BACKUP => true,
+        "AGENTS.md" => std::fs::read_to_string(ws.join(name)).is_ok_and(|s| s == TOMBSTONE),
+        n => KEEP_AT_ROOT.contains(&n),
+    }
+}
+
+/// dev-plan/60 4.3: v3 → v2, for one workspace that misbehaves after the
+/// upgrade. Renames only — the agent at `.thclaws/bots/main/` goes back to the
+/// root, and the host's `.thclaws/` is kept at [`HOST_BACKUP`]. Refused unless
+/// `main` is the only agent: a second agent has nowhere to go in v2.
+///
+/// Resumable: interrupted after the host tree was set aside, a re-run finds
+/// the agent inside the backup and finishes the move.
+pub fn unmigrate(ws: &Path) -> Result<UnmigrateReport> {
+    if crate::workdir::is_multiuser() {
+        return Err(Error::Config(
+            "workspace migration is not defined for a multiuser pod".into(),
+        ));
+    }
+    if is_inside_shelf(ws) {
+        return Err(Error::Config(format!(
+            "{} is an agent inside a workspace — run this on the workspace above it",
+            ws.display()
+        )));
+    }
+    if marker_path(ws).exists() {
+        return Err(Error::Config(format!(
+            "{} is mid-migration — finish it with `thclaws bots migrate` first",
+            ws.display()
+        )));
+    }
+    let backup = ws.join(HOST_BACKUP);
+    let resuming = !ws.join(super::CONFIG_REL).exists()
+        && backup
+            .join(super::CONFIG_REL.trim_start_matches(".thclaws/"))
+            .exists()
+        && backup
+            .join(super::SHELF_REL.trim_start_matches(".thclaws/"))
+            .join(MAIN_SLUG)
+            .is_dir();
+
+    // Held on the host tree being set aside; the lock follows the open file.
+    let _lock = if resuming {
+        None
+    } else {
+        let cfg = BotsConfig::load(ws)?;
+        let slugs: Vec<&str> = cfg.bots.iter().map(|b| b.slug.as_str()).collect();
+        if slugs != [MAIN_SLUG] {
+            return Err(Error::Config(format!(
+                "{} holds the agents {} — only a workspace whose one agent is '{MAIN_SLUG}' can go \
+                 back to a single-agent layout. Remove the others first.",
+                ws.display(),
+                slugs.join(", ")
+            )));
+        }
+        let shelf = ws.join(super::SHELF_REL);
+        let extra: Vec<String> = std::fs::read_dir(&shelf)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n != MAIN_SLUG && n != ".DS_Store")
+            .collect();
+        if !extra.is_empty() {
+            return Err(Error::Config(format!(
+                "{} still has folders for {} — an agent removed from the list keeps its folder. \
+                 Move them out of the way first.",
+                shelf.display(),
+                extra.join(", ")
+            )));
+        }
+        if backup.exists() {
+            return Err(Error::Config(format!(
+                "{} already exists from an earlier reverse migration — move it aside first",
+                backup.display()
+            )));
+        }
+        let stray: Vec<String> = std::fs::read_dir(ws)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| !host_root_entry_ok(ws, n))
+            .collect();
+        if !stray.is_empty() {
+            return Err(Error::Config(format!(
+                "{} has files at its root that belong to neither the host nor the agent: {}. \
+                 Move them into .thclaws/bots/{MAIN_SLUG}/ or aside first.",
+                ws.display(),
+                stray.join(", ")
+            )));
+        }
+        Some(super::lock_workspace(ws, "a reverse migration")?)
+    };
+
+    if !resuming {
+        std::fs::rename(ws.join(".thclaws"), &backup)?;
+        let tombstone = ws.join("AGENTS.md");
+        if tombstone.exists() {
+            std::fs::rename(&tombstone, backup.join("AGENTS.md.tombstone"))?;
+        }
+    }
+    let agent = backup
+        .join(super::SHELF_REL.trim_start_matches(".thclaws/"))
+        .join(MAIN_SLUG);
+    let mut report = UnmigrateReport {
+        host_backup: backup.clone(),
+        ..Default::default()
+    };
+    for entry in std::fs::read_dir(&agent)? {
+        let name = entry?.file_name();
+        let dst = ws.join(&name);
+        if dst.exists() {
+            // `.home` is the only name both trees can hold; the root's is the
+            // one a runner mounts.
+            if KEEP_AT_ROOT.contains(&name.to_string_lossy().as_ref()) {
+                continue;
+            }
+            return Err(Error::Config(format!(
+                "cannot move {} back: {} already exists",
+                agent.join(&name).display(),
+                dst.display()
+            )));
+        }
+        std::fs::rename(agent.join(&name), &dst)?;
+        report.moved += 1;
+    }
+    let _ = std::fs::remove_dir(&agent);
+    report.rewritten_schedules = unrewrite_schedules(ws)?;
+    Ok(report)
+}
+
+/// The reverse of [`rewrite_schedules`]: a schedule stored under
+/// `.thclaws/bots/main/` points back at the same place under the root.
+fn unrewrite_schedules(ws: &Path) -> Result<Vec<String>> {
+    let Some(path) = crate::schedule::ScheduleStore::default_path() else {
+        return Ok(Vec::new());
+    };
+    let mut store = crate::schedule::ScheduleStore::load_from(&path)?;
+    let from = bot_dir(ws, MAIN_SLUG);
+    let mut touched = Vec::new();
+    for s in &mut store.schedules {
+        let Ok(rel) = s.cwd.strip_prefix(&from) else {
+            continue;
+        };
+        s.cwd = if rel.as_os_str().is_empty() {
+            ws.to_path_buf()
+        } else {
+            ws.join(rel)
+        };
+        touched.push(s.id.clone());
+    }
+    if !touched.is_empty() {
+        store.save_to(&path)?;
+    }
+    Ok(touched)
+}
+
 // Phases run in order, so `start <= Phase::Install` reads naturally.
 impl PartialOrd for Phase {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
@@ -503,7 +681,7 @@ fn install_host_files(ws: &Path) -> Result<()> {
             serde_json::json!(HOST_WORKSPACE_VERSION),
         );
         obj.entry("_doc").or_insert(serde_json::json!(
-            "This is the workspace HOST. It runs no agent; it supervises the bots in .thclaws/bots/. The agent that used to live here is .thclaws/bots/main/."
+            "This is the workspace HOST. It runs the agents in .thclaws/bots/. The agent that used to live here is .thclaws/bots/main/."
         ));
         std::fs::write(&settings, serde_json::to_string_pretty(obj)?)?;
     }
@@ -686,7 +864,7 @@ pub fn mint_new_workspace(ws: &Path, slug: &str) -> Result<PathBuf> {
             &settings,
             serde_json::to_string_pretty(&serde_json::json!({
                 "workspaceVersion": HOST_WORKSPACE_VERSION,
-                "_doc": "This is the workspace HOST. It runs no agent; it supervises the bots in .thclaws/bots/.",
+                "_doc": "This is the workspace HOST. It runs the agents in .thclaws/bots/.",
             }))?,
         )?;
     }
@@ -781,6 +959,144 @@ mod tests {
         );
         w(".home/.config/thclaws/settings.json", "{}");
         (root, ws)
+    }
+
+    #[test]
+    fn a_container_migrates_only_when_told_to() {
+        let _g = crate::kms::test_env_lock();
+        let keys = [
+            "THCLAWS_AUTO_MIGRATE",
+            "THCLAWS_INSIDE_DOCKER",
+            "THCLAWS_SUPERVISED",
+        ];
+        let prev: Vec<_> = keys.iter().map(|k| std::env::var(k).ok()).collect();
+        let set = |auto: Option<&str>, docker: bool, supervised: bool| {
+            match auto {
+                Some(v) => std::env::set_var(keys[0], v),
+                None => std::env::remove_var(keys[0]),
+            }
+            if docker {
+                std::env::set_var(keys[1], "1")
+            } else {
+                std::env::remove_var(keys[1])
+            }
+            if supervised {
+                std::env::set_var(keys[2], "1")
+            } else {
+                std::env::remove_var(keys[2])
+            }
+        };
+        set(None, false, false);
+        assert!(auto_migrate_allowed(), "a desktop upgrades on open");
+        set(Some("0"), false, false);
+        assert!(!auto_migrate_allowed(), "0 turns it off anywhere");
+        set(None, true, false);
+        assert!(
+            !auto_migrate_allowed(),
+            "a container does not decide on its own"
+        );
+        set(Some("1"), true, false);
+        assert!(auto_migrate_allowed(), "the cloud opts one workspace in");
+        set(Some("1"), true, true);
+        assert!(
+            !auto_migrate_allowed(),
+            "an agent inside a shelf never migrates"
+        );
+        for (k, v) in keys.iter().zip(prev) {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    #[test]
+    fn unmigrate_puts_the_agent_back_at_the_root() {
+        let (_root, ws) = v2_workspace("round-trip");
+        apply(&plan(&ws).unwrap()).unwrap();
+        assert!(ws.join(".thclaws/bots/main/AGENTS.md").exists());
+
+        let report = unmigrate(&ws).unwrap();
+        assert!(report.moved > 0);
+        assert_eq!(
+            read(&ws.join("AGENTS.md")),
+            "# The agent\n",
+            "the tombstone is gone, the agent's own is back"
+        );
+        // The agent's own settings come back. Renames only, so the identity the
+        // upgrade minted for it stays, which publishing needs anyway.
+        let settings: serde_json::Value =
+            serde_json::from_str(&read(&ws.join(".thclaws/settings.json"))).unwrap();
+        assert_eq!(settings["workspaceVersion"], 2);
+        assert_eq!(settings["agent"]["id"], "round-trip");
+        assert_eq!(read(&ws.join(".git/config")), "[core]\n");
+        assert_eq!(
+            read(&ws.join(".thclaws/state/sessions/sess-1.jsonl")),
+            "{}\n"
+        );
+        assert_eq!(read(&ws.join("output/report.md")), "findings\n");
+        assert!(
+            ws.join(".home/.config/thclaws/settings.json").exists(),
+            ".home never moved"
+        );
+        assert!(!ws.join(super::super::CONFIG_REL).exists());
+        assert!(
+            report.host_backup.join("bots.json").exists(),
+            "the host tree is kept, not deleted"
+        );
+        assert!(looks_like_v2_agent(&ws));
+
+        // And it can be upgraded again, leaving the old backup where it is.
+        let again = plan(&ws).unwrap();
+        assert!(!again.moves.iter().any(|n| n == HOST_BACKUP));
+        apply(&again).unwrap();
+        assert!(ws.join(".thclaws/bots/main/AGENTS.md").exists());
+        assert!(ws.join(HOST_BACKUP).is_dir());
+    }
+
+    #[test]
+    fn unmigrate_resumes_after_the_host_tree_was_set_aside() {
+        let (_root, ws) = v2_workspace("interrupted");
+        apply(&plan(&ws).unwrap()).unwrap();
+        // The first rename happened, then the process died.
+        std::fs::rename(ws.join(".thclaws"), ws.join(HOST_BACKUP)).unwrap();
+        std::fs::rename(
+            ws.join("AGENTS.md"),
+            ws.join(HOST_BACKUP).join("AGENTS.md.tombstone"),
+        )
+        .unwrap();
+        let report = unmigrate(&ws).unwrap();
+        assert!(report.moved > 0);
+        assert_eq!(read(&ws.join("AGENTS.md")), "# The agent\n");
+        assert!(ws.join(".thclaws/state/sessions/sess-1.jsonl").exists());
+    }
+
+    #[test]
+    fn unmigrate_refuses_a_workspace_with_another_agent() {
+        let (_root, ws) = v2_workspace("two-agents");
+        apply(&plan(&ws).unwrap()).unwrap();
+        std::fs::write(
+            ws.join(super::super::CONFIG_REL),
+            r#"{"version":1,"bots":[{"slug":"main"},{"slug":"research"}]}"#,
+        )
+        .unwrap();
+        let err = unmigrate(&ws).unwrap_err().to_string();
+        assert!(err.contains("main, research"), "{err}");
+        assert!(
+            ws.join(".thclaws/bots/main/AGENTS.md").exists(),
+            "nothing moved"
+        );
+        assert!(!ws.join(HOST_BACKUP).exists());
+    }
+
+    #[test]
+    fn unmigrate_refuses_files_it_cannot_place() {
+        let (_root, ws) = v2_workspace("stray");
+        apply(&plan(&ws).unwrap()).unwrap();
+        std::fs::write(ws.join("new-at-root.txt"), "made after the upgrade").unwrap();
+        let err = unmigrate(&ws).unwrap_err().to_string();
+        assert!(err.contains("new-at-root.txt"), "{err}");
+        assert!(ws.join(".thclaws/bots.json").exists(), "nothing moved");
     }
 
     fn read(p: &Path) -> String {
@@ -957,7 +1273,7 @@ mod tests {
         )
         .unwrap();
         let err = plan(&ws3).unwrap_err().to_string();
-        assert!(err.contains("bots are missing"), "{err}");
+        assert!(err.contains("agents are missing"), "{err}");
 
         // Staging with no marker means someone removed the marker by hand.
         let (_r2, ws2) = v2_workspace("proj");

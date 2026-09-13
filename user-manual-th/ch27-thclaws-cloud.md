@@ -198,7 +198,7 @@ catalog สาธารณะ ส่วน agent ที่เป็น `private`
 detail, `/cloud get`, fork ตอบ **404** — ไม่ใช่ 403 เพื่อให้ slug เดาไม่ได้)
 
 **เปลี่ยน visibility ยังไง** — ไปที่หน้า agent ของคุณบนเว็บ
-(`https://thclaws.cloud/a/<slug>`) จะมีปุ่ม toggle ตอนคุณเป็นเจ้าของ
+(`https://thclaws.cloud/templates/<slug>`) จะมีปุ่ม toggle ตอนคุณเป็นเจ้าของ
 (หรือ root) author สลับระหว่าง `private` กับ `unlisted` ได้อิสระ แต่
 **การเลื่อนเป็น `public` ทำได้เฉพาะ superadmin** (ไม่งั้นตอบ 403) *ยังไม่มี*
 คำสั่ง `/cloud` ฝั่ง desktop สำหรับเรื่องนี้ — เป็น web-only (เบื้องหลังเรียก

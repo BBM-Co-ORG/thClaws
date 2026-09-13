@@ -65,7 +65,7 @@ impl BotDef {
 pub fn validate_slug(slug: &str) -> Result<()> {
     let bad = |why: &str| {
         Err(Error::Config(format!(
-            "bot slug '{slug}' is invalid: {why} (allowed: a-z, 0-9, '-', '_', starting with a letter or digit)"
+            "agent name '{slug}' is invalid: {why} (allowed: a-z, 0-9, '-', '_', starting with a letter or digit)"
         )))
     };
     if slug.is_empty() {
@@ -153,7 +153,7 @@ impl BotsConfig {
         }
         if self.bots.is_empty() {
             return Err(Error::Config(format!(
-                "{CONFIG_REL}: no bots listed — every workspace has at least one"
+                "{CONFIG_REL}: no agents listed — every workspace has at least one"
             )));
         }
         let mut seen = std::collections::HashSet::new();
@@ -161,7 +161,7 @@ impl BotsConfig {
             validate_slug(&def.slug)?;
             if !seen.insert(def.slug.as_str()) {
                 return Err(Error::Config(format!(
-                    "{CONFIG_REL}: duplicate bot slug '{}'",
+                    "{CONFIG_REL}: duplicate agent name '{}'",
                     def.slug
                 )));
             }

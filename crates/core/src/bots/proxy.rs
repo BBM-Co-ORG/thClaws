@@ -38,7 +38,7 @@ pub async fn relay(browser: WebSocket, bot: Arc<Bot>) {
     let mut req = match format!("ws://{addr}/ws").into_client_request() {
         Ok(r) => r,
         Err(e) => {
-            close_with(browser, &format!("bad bot url: {e}")).await;
+            close_with(browser, &format!("bad agent url: {e}")).await;
             return;
         }
     };
@@ -50,7 +50,7 @@ pub async fn relay(browser: WebSocket, bot: Arc<Bot>) {
                 .insert(axum::http::header::AUTHORIZATION, v);
         }
         Err(_) => {
-            close_with(browser, "bot token is not a valid header value").await;
+            close_with(browser, "agent token is not a valid header value").await;
             return;
         }
     }
@@ -58,7 +58,7 @@ pub async fn relay(browser: WebSocket, bot: Arc<Bot>) {
     let child = match tokio_tungstenite::connect_async(req).await {
         Ok((sock, _)) => sock,
         Err(e) => {
-            close_with(browser, &format!("cannot reach bot '{}': {e}", bot.slug)).await;
+            close_with(browser, &format!("cannot reach agent '{}': {e}", bot.slug)).await;
             return;
         }
     };
@@ -233,7 +233,7 @@ mod tests {
         match msg {
             TgMessage::Close(Some(f)) => {
                 assert_eq!(u16::from(f.code), CLOSE_INTERNAL);
-                assert!(f.reason.contains("cannot reach bot"), "{}", f.reason);
+                assert!(f.reason.contains("cannot reach agent"), "{}", f.reason);
             }
             other => panic!("expected a close frame, got {other:?}"),
         }
@@ -273,6 +273,25 @@ pub async fn forward_http(
     token: &str,
     req: axum::extract::Request,
 ) -> std::result::Result<axum::response::Response, String> {
+    forward(addr, Some(token), req).await
+}
+
+/// Forward with the CALLER's `Authorization` rather than the agent's own
+/// token. `/v1/*` is checked against `THCLAWS_API_TOKEN`, which every agent
+/// inherits from the host, so the caller's bearer is the one that proves
+/// anything there.
+pub async fn forward_http_as_caller(
+    addr: &std::net::SocketAddr,
+    req: axum::extract::Request,
+) -> std::result::Result<axum::response::Response, String> {
+    forward(addr, None, req).await
+}
+
+async fn forward(
+    addr: &std::net::SocketAddr,
+    token: Option<&str>,
+    req: axum::extract::Request,
+) -> std::result::Result<axum::response::Response, String> {
     let (parts, body) = req.into_parts();
     let path = parts
         .uri
@@ -281,22 +300,23 @@ pub async fn forward_http(
         .unwrap_or("/");
     let url = format!("http://{addr}{path}");
 
-    // The body is buffered rather than streamed: these are file reads and
-    // small multipart uploads, and axum's own body limit already bounds it.
+    // The request body is buffered: the agent's own route limits bound it,
+    // and a retry-free loopback hop gains nothing from streaming it.
     let bytes = axum::body::to_bytes(body, usize::MAX)
         .await
         .map_err(|e| format!("read request body: {e}"))?;
 
-    let mut out = forward_client()
-        .request(parts.method.clone(), &url)
-        .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"));
+    let mut out = forward_client().request(parts.method.clone(), &url);
+    if let Some(token) = token {
+        out = out.header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"));
+    }
     for (name, value) in parts.headers.iter() {
         // `host` names the host, not the child; `authorization` is ours to
-        // set; `content-length` is recomputed from the buffered body.
-        if matches!(
-            name.as_str(),
-            "host" | "authorization" | "content-length" | "connection"
-        ) {
+        // set unless the caller's is the one being carried; `content-length`
+        // is recomputed from the buffered body.
+        if matches!(name.as_str(), "host" | "content-length" | "connection")
+            || (token.is_some() && name == axum::http::header::AUTHORIZATION)
+        {
             continue;
         }
         out = out.header(name, value);
@@ -309,10 +329,10 @@ pub async fn forward_http(
 
     let status = res.status();
     let headers = res.headers().clone();
-    let body = res
-        .bytes()
-        .await
-        .map_err(|e| format!("read bot response: {e}"))?;
+    // Streamed, not buffered: `/v1/chat/completions` with `stream: true` is
+    // server-sent events, and a buffered relay would hold every token until
+    // the turn ended.
+    let body = axum::body::Body::from_stream(res.bytes_stream());
     let mut builder = axum::response::Response::builder().status(status);
     for (name, value) in headers.iter() {
         if matches!(name.as_str(), "connection" | "transfer-encoding") {
@@ -321,7 +341,7 @@ pub async fn forward_http(
         builder = builder.header(name, value);
     }
     builder
-        .body(axum::body::Body::from(body))
+        .body(body)
         .map_err(|e| format!("build response: {e}"))
 }
 

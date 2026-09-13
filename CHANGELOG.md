@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.127.0] — 2026-09-13
+
+**Workspaces with more than one agent, finished.** Schedules, `/cloud push` and `/cloud pull`, and the OpenAI-compatible API all work again in a workspace that holds several agents, and a workspace that was upgraded can be taken back.
+
+### Added
+- **`thclaws bots unmigrate` takes a workspace back to a single agent.** It undoes the upgrade for a workspace whose one agent is `main`. The agent's files move back to the root, and the host's own `.thclaws/` is kept beside them rather than deleted.
+- **Containers can opt in to the upgrade.** `THCLAWS_AUTO_MIGRATE=1` set explicitly lets a container move a single-agent workspace into the multi-agent layout on open. Without it, containers still never upgrade on their own.
+
+### Changed
+- **Workspace agents are called agents, not bots.** What runs in a workspace is an agent; what is published on thClaws.cloud is an Agent Template. Command names and folder names are unchanged.
+
+### Fixed
+- **Schedules stopped firing in a workspace with more than one agent.** The workspace host skipped the scheduler and left it to its agents, whose home folder is their own, where the schedule list is empty — so none of your schedules ran while such a workspace was open. The host runs the scheduler again; agents under a host don't.
+- **`/cloud push`, `/cloud pull` and the OpenAI-compatible API failed against a workspace with more than one agent.** The workspace host answered them with "not found". It now serves sync over the whole workspace, and carries `/v1` requests to an agent, streaming the response.
+- **A workspace with several agents could send its cloud keepalive more than once, or never report being busy.** Each agent sent its own keepalive. The host now sends the only one, reports busy while any agent is mid-turn, lists its agents, and retries a keepalive that failed.
+
 ## [0.126.0] — 2026-09-13
 
 **Many bots in one workspace.** A workspace used to be one agent. It is now a shelf of them: keep a coding agent, a research agent and a writing agent side by side in the same project, and switch between them from a rail on the left.

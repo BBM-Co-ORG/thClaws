@@ -40,7 +40,7 @@ pub async fn install(
     super::validate_slug(slug)?;
     if !workspace.join(CONFIG_REL).exists() {
         return Err(Error::Config(format!(
-            "{} is not a multi-bot workspace — `thclaws bots migrate` converts one, or start a \
+            "{} is not a workspace that holds agents — `thclaws bots migrate` converts one, or start a \
              host in an empty directory.",
             workspace.display()
         )));
@@ -94,7 +94,7 @@ pub fn create_blank(workspace: &Path, slug: &str) -> Result<Installed> {
     super::validate_slug(slug)?;
     if !workspace.join(CONFIG_REL).exists() {
         return Err(Error::Config(format!(
-            "{} is not a multi-bot workspace — `thclaws bots migrate` converts one, or start a \
+            "{} is not a workspace that holds agents — `thclaws bots migrate` converts one, or start a \
              host in an empty directory.",
             workspace.display()
         )));
@@ -107,7 +107,7 @@ pub fn create_blank(workspace: &Path, slug: &str) -> Result<Installed> {
             .any(|b| b.slug == slug)
     {
         return Err(Error::Config(format!(
-            "a bot named '{slug}' already exists in this workspace — pick another name"
+            "an agent named '{slug}' already exists in this workspace — pick another name"
         )));
     }
     std::fs::create_dir_all(&dir)?;
@@ -119,10 +119,7 @@ pub fn create_blank(workspace: &Path, slug: &str) -> Result<Installed> {
     let newly_registered = register(workspace, slug)?;
     Ok(Installed {
         slug: slug.to_string(),
-        lines: vec![format!(
-            "Created an empty bot at {} — it starts like a new folder, with no agent.",
-            dir.display()
-        )],
+        lines: vec![format!("Created a blank agent at {}.", dir.display())],
         dir,
         newly_registered,
     })
@@ -223,7 +220,7 @@ pub fn can_deregister(workspace: &Path, slug: &str) -> Result<bool> {
     }
     if cfg.bots.len() == 1 {
         return Err(Error::Config(format!(
-            "'{slug}' is the only bot in this workspace, and a workspace always has at least one \
+            "'{slug}' is the only agent in this workspace, and a workspace always has at least one \
              — install another before removing it."
         )));
     }
@@ -310,7 +307,7 @@ mod tests {
         let err = create_blank(plain.path(), "scratch")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("not a multi-bot workspace"), "{err}");
+        assert!(err.contains("not a workspace that holds agents"), "{err}");
         assert!(!plain.path().join(".thclaws").exists());
     }
 
@@ -360,7 +357,7 @@ mod tests {
         let err = deregister(ws.path(), "main", false)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("only bot"), "{err}");
+        assert!(err.contains("only agent"), "{err}");
         assert_eq!(BotsConfig::load(ws.path()).unwrap().bots.len(), 1);
     }
 
@@ -497,6 +494,6 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(err.contains("not a multi-bot workspace"), "{err}");
+        assert!(err.contains("not a workspace that holds agents"), "{err}");
     }
 }

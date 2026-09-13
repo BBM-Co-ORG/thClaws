@@ -115,7 +115,7 @@ export function HostPanel({
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between mb-3">
-          <h2 className="font-semibold">Workspace bots</h2>
+          <h2 className="font-semibold">Agents in this workspace</h2>
           <button
             onClick={onClose}
             className="text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
@@ -136,8 +136,8 @@ export function HostPanel({
                 onClick={() => restart(b.slug)}
                 title={
                   b.state === "crash_looped"
-                    ? "The supervisor gave up on this bot; try it again"
-                    : "Stop and start this bot's process"
+                    ? "thClaws stopped retrying this agent; try again"
+                    : "Stop and start this agent"
                 }
                 className="px-2 py-0.5 rounded text-xs border border-[var(--border)] disabled:opacity-40 hover:bg-[var(--bg-tertiary)]"
               >
@@ -148,7 +148,7 @@ export function HostPanel({
                 onClick={() => remove(b.slug)}
                 title={
                   bots.length < 2
-                    ? "A workspace always has at least one bot"
+                    ? "A workspace always has at least one agent"
                     : "Remove from this workspace. Its folder — sessions, logins — stays on disk."
                 }
                 className="px-2 py-0.5 rounded text-xs border border-[var(--border)] disabled:opacity-40 hover:bg-[var(--bg-tertiary)]"
@@ -160,7 +160,7 @@ export function HostPanel({
         </ul>
 
         <label className="block text-xs text-[var(--text-secondary)] mb-1">
-          Install from the catalogue
+          Get from Agent Templates
         </label>
         <div className="flex gap-2">
           <input
@@ -169,7 +169,7 @@ export function HostPanel({
             onKeyDown={(e) => {
               if (e.key === "Enter" && slug.trim() && !busy) void add();
             }}
-            placeholder="agent slug, e.g. hello-world"
+            placeholder="template name, e.g. hello-world"
             className="flex-1 px-2 py-1 rounded border border-[var(--border)] bg-[var(--bg-primary)]"
           />
           <button
@@ -177,12 +177,12 @@ export function HostPanel({
             onClick={() => void add()}
             className="px-3 py-1 rounded bg-[var(--accent)] text-[var(--accent-fg)] disabled:opacity-40"
           >
-            {busy ? "Working…" : "Add"}
+            {busy ? "Working…" : "Get"}
           </button>
         </div>
 
         <label className="block text-xs text-[var(--text-secondary)] mt-4 mb-1">
-          Or start an empty bot — no agent, like a new folder
+          Or start a blank agent
         </label>
         <div className="flex gap-2">
           <input
@@ -191,7 +191,7 @@ export function HostPanel({
             onKeyDown={(e) => {
               if (e.key === "Enter" && blankSlug.trim() && !busy) void addBlank();
             }}
-            placeholder="bot name, e.g. scratch"
+            placeholder="agent name, e.g. scratch"
             className="flex-1 px-2 py-1 rounded border border-[var(--border)] bg-[var(--bg-primary)]"
           />
           <button

@@ -3490,8 +3490,8 @@
           "verified_at": "2026-09-13",
           "free": false,
           "chat": true,
-          "input_per_mtok": 0.04984,
-          "output_per_mtok": 0.09968
+          "input_per_mtok": 0.04816,
+          "output_per_mtok": 0.09632
         },
         "deepseek/deepseek-v4-flash-0731": {
           "context": 1048576,
@@ -3529,8 +3529,8 @@
           "verified_at": "2026-09-13",
           "free": false,
           "chat": true,
-          "input_per_mtok": 0.57816,
-          "output_per_mtok": 1.73448
+          "input_per_mtok": 0.57948,
+          "output_per_mtok": 1.73844
         },
         "deepseek/deepseek-v4.1-flash": {
           "context": 1048576,
@@ -6092,11 +6092,11 @@
           "context": 262144,
           "max_output": 128000,
           "source": "https://openrouter.ai/api/v1/models + api:openrouter",
-          "verified_at": "2026-09-11",
+          "verified_at": "2026-09-13",
           "free": false,
           "chat": true,
-          "input_per_mtok": 0.132,
-          "output_per_mtok": 0.528
+          "input_per_mtok": 0.0825,
+          "output_per_mtok": 0.33
         },
         "tencent/hy3-preview": {
           "context": 262144,
@@ -6430,11 +6430,11 @@
           "context": 1310720,
           "max_output": 131072,
           "source": "https://openrouter.ai/api/v1/models + api:openrouter",
-          "verified_at": "2026-09-10",
+          "verified_at": "2026-09-13",
           "free": false,
           "chat": true,
-          "input_per_mtok": 0.15,
-          "output_per_mtok": 0.5
+          "input_per_mtok": 0.075,
+          "output_per_mtok": 0.25
         },
         "z-ai/glm-5v-turbo": {
           "context": 202752,

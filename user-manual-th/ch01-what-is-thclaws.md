@@ -57,7 +57,7 @@ hosted runtime ให้เช่า — ดู bullet ด้านล่าง�
   คือ "โฟลเดอร์" ([บทที่ 8](ch08-memory-and-agents-md.md)) และ
   thClaws.cloud เปลี่ยนโมเดลโฟลเดอร์นี้ให้เป็น *git สำหรับ AI agent*
   **เลือกใช้** จาก catalog ที่
-  [thclaws.cloud/browse](https://thclaws.cloud/browse) **ติดตั้ง** ลง
+  [thclaws.cloud/templates](https://thclaws.cloud/templates) **ติดตั้ง** ลง
   โฟลเดอร์ในเครื่องด้วยคำสั่งเดียว (`/cloud get <slug>`) **เผยแพร่** ของ
   ตัวเอง (`/cloud publish`) — คุณเป็นเจ้าของโฟลเดอร์และใช้ provider key
   ของคุณเอง ผูกเดสก์ท็อปกับ catalog ด้วยการวาง CLI token ครั้งเดียวที่

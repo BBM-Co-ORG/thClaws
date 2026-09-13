@@ -50,7 +50,7 @@ pub fn connect(
             let sock = match open_socket(addr, &token, &slug).await {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("\x1b[33m[host] bot '{slug}': {e} — retrying\x1b[0m");
+                    eprintln!("\x1b[33m[host] agent '{slug}': {e} — retrying\x1b[0m");
                     on_frame(status_frame(&slug, "connecting"));
                     tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                     backoff_ms = (backoff_ms * 2).min(5_000);
@@ -89,7 +89,7 @@ pub fn connect(
                         Some(Ok(TgMessage::Close(_))) | None => break false,
                         Some(Ok(_)) => {}
                         Some(Err(e)) => {
-                            eprintln!("\x1b[33m[host] bot '{slug}' socket: {e}\x1b[0m");
+                            eprintln!("\x1b[33m[host] agent '{slug}' socket: {e}\x1b[0m");
                             break false;
                         }
                     },
@@ -130,12 +130,12 @@ async fn open_socket(
     let url = format!("ws://{addr}/ws?bot={}", urlencoding::encode(slug));
     let mut req = url
         .into_client_request()
-        .map_err(|e| format!("bad bot url: {e}"))?;
+        .map_err(|e| format!("bad agent url: {e}"))?;
     // Header form rather than `?token=`: this end is a Rust client, so the
     // token never has to appear in a URL that could be logged.
     let value = format!("Bearer {token}")
         .parse()
-        .map_err(|_| "bot token is not a valid header value".to_string())?;
+        .map_err(|_| "agent token is not a valid header value".to_string())?;
     req.headers_mut().insert("authorization", value);
     tokio_tungstenite::connect_async(req)
         .await

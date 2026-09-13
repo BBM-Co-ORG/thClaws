@@ -64,7 +64,7 @@ dedicated bullet below and [Chapter 27](ch27-thclaws-cloud.md):
   thClaws is just a folder ([Chapter 8](ch08-memory-and-agents-md.md)),
   and thClaws.cloud turns that folder model into *git for AI agents*.
   **Browse** a curated catalog at
-  [thclaws.cloud/browse](https://thclaws.cloud/browse), **install** any
+  [thclaws.cloud/templates](https://thclaws.cloud/templates), **install** any
   agent into a local folder with one command (`/cloud get <slug>`),
   **publish** your own (`/cloud publish`) — you own the folder and bring
   your own provider keys. Bind your desktop to the catalog by pasting a

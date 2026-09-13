@@ -94,7 +94,7 @@ In the desktop GUI you don't have to hand-edit the `.md`. Two GUI-only
 commands open an editor modal with separate panes for the YAML
 frontmatter and the system prompt:
 
-- **`/agent new <name>`** — opens a starter template for a brand-new
+- **`/agent new <name>`** — opens a starter definition for a brand-new
   agent.
 - **`/agent edit <name>`** — opens an existing agent (loaded from disk,
   or reconstructed from a built-in like `translator`) for editing.

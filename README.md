@@ -21,7 +21,7 @@ A native-Rust AI agent workspace that codes, automates, remembers, and coordinat
 
 ---
 
-## 🆕 New in v0.126.0 — many bots, one workspace
+## 🆕 New in v0.126.0 — many agents, one workspace
 
 **A workspace is no longer one agent. It is a shelf of them.** Keep your coding agent, a research agent, and a book-writing agent side by side in the same project, and switch between them from a rail on the left without losing anything — each one keeps its own conversation, scroll position, and half-typed message while you are away.
 
@@ -29,18 +29,18 @@ A native-Rust AI agent workspace that codes, automates, remembers, and coordinat
 ┌────┬───────────────────────────────────────────────┐
 │ MA │  Chat · Terminal · Files · UI                 │
 │ RE │                                               │
-│ BA │  every bot: its own sessions, memory,         │
+│ BA │  every agent: its own sessions, memory,       │
 │    │  settings, and browser logins                 │
 │  + │                                               │
 └────┴───────────────────────────────────────────────┘
 ```
 
-- **Each bot is a whole agent.** Its own sessions, knowledge bases, settings, and browser profile, in its own folder under `.thclaws/bots/<name>/`. A bot's file tools stop at that folder, so one bot cannot read or write another's work.
-- **They run side by side.** Every bot is its own process, supervised by the app. A bot that crashes is restarted without disturbing the others, and a bot you switch away from keeps working.
-- **Add a bot from the rail's `+`.** Install any agent from the [thClaws.cloud catalogue](https://thclaws.cloud/browse), or start an empty bot that behaves exactly like opening a new folder. Up to 8 bots run at once.
+- **Each agent is self-contained.** Its own sessions, knowledge bases, settings, and browser profile, in its own folder under `.thclaws/bots/<name>/`. An agent's file tools stop at that folder, so one agent cannot read or write another's work.
+- **They run side by side.** Every agent is its own process, supervised by the app. An agent that crashes is restarted without disturbing the others, and an agent you switch away from keeps working.
+- **Add an agent from the rail's `+`.** Get any Agent Template from [thClaws.cloud](https://thclaws.cloud/templates), or start a blank agent that behaves exactly like opening a new folder. Up to 8 agents run at once.
 - **Desktop and browser alike.** The same rail works in the desktop app and in `thclaws --serve`.
 
-**Your existing workspaces upgrade themselves.** The first time v0.126.0 opens a workspace — in the desktop app or with `--serve` — it moves your project into `.thclaws/bots/main/` (git history included) and tells you it did. Scripts keep working: `thclaws -p` and `--cli` at the workspace root step into that first bot automatically. An older thClaws opening an upgraded folder finds a note asking you to update, rather than a broken project.
+**Your existing workspaces upgrade themselves.** The first time v0.126.0 opens a workspace — in the desktop app or with `--serve` — it moves your project into `.thclaws/bots/main/` (git history included) and tells you it did. Scripts keep working: `thclaws -p` and `--cli` at the workspace root step into that first agent automatically. An older thClaws opening an upgraded folder finds a note asking you to update, rather than a broken project.
 
 > **Before you upgrade:** anything that holds your project's old path — an editor window, a script with an absolute path, another clone — needs the new one. Commit or back up first if that matters to you. Your home directory is never upgraded, and hosted workspaces on thClaws.cloud are not migrated by this release.
 

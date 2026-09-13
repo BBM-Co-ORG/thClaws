@@ -76,7 +76,7 @@ Return a concise bullet list. Don't propose fixes unless asked.
 ใน desktop GUI ไม่ต้องแก้ `.md` เอง มี 2 คำสั่ง (GUI เท่านั้น) ที่เปิด
 editor modal แยกช่อง YAML frontmatter กับ system prompt:
 
-- **`/agent new <name>`** — เปิด starter template สำหรับ agent ใหม่
+- **`/agent new <name>`** — เปิด starter definition สำหรับ agent ใหม่
 - **`/agent edit <name>`** — เปิด agent เดิม (โหลดจาก disk หรือ
   reconstruct จาก built-in อย่าง `translator`) มาแก้
 
