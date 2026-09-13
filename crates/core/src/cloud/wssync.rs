@@ -972,6 +972,38 @@ mod tests {
         std::fs::write(p, body).unwrap();
     }
 
+    /// dev-plan/59: publish and sync must disagree about `.thclaws/bots/`,
+    /// and that disagreement is the whole reason bots live there.
+    ///
+    /// `pack::is_strippable` drops the shelf so a published agent never
+    /// carries another agent. Sync must do the OPPOSITE and carry it, so a
+    /// user's bots follow them to every device — `excluded` deliberately
+    /// does not consult `is_strippable` ("push|pull keeps runtime state").
+    ///
+    /// If someone ever "tidies" these two into agreement, one direction
+    /// silently uploads cookies to the catalogue and the other silently
+    /// stops syncing bots. This pins both.
+    #[test]
+    fn sync_keeps_the_bot_shelf_that_publish_strips() {
+        let root = Path::new("/does/not/need/to/exist");
+        for rel in [
+            ".thclaws/bots/research/.thclaws/settings.json",
+            ".thclaws/bots/research/.thclaws/state/sessions/sess-1.jsonl",
+            ".thclaws/bots/research/AGENTS.md",
+            ".thclaws/bots/main/.thclaws/state/kms/vault/note.md",
+        ] {
+            let p = Path::new(rel);
+            assert!(
+                !excluded(root, p),
+                "sync must carry {rel} — bots follow the user across devices"
+            );
+            assert!(
+                crate::cloud::pack::is_strippable(p),
+                "publish must drop {rel} — an agent ships no other agents"
+            );
+        }
+    }
+
     #[test]
     fn roundtrip_and_strip() {
         let src = tmp("src");

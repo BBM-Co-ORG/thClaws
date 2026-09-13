@@ -113,6 +113,14 @@ struct Cli {
     #[arg(long)]
     serve: bool,
 
+    /// dev-plan/59: run `--serve` as the workspace HOST — a supervisor
+    /// that starts one `thclaws --serve` per bot from
+    /// `.thclaws/bots.json`, proxies the browser's socket to it and
+    /// restarts it when it dies. The host itself loads no agent, no
+    /// model and no MCP. This build supervises the first bot listed.
+    #[arg(long)]
+    supervisor: bool,
+
     /// Port for `--serve` mode. Default 8443.
     #[arg(long, default_value_t = 8443)]
     port: u16,
@@ -341,6 +349,13 @@ enum Command {
         #[command(subcommand)]
         cmd: AgentCmd,
     },
+    /// dev-plan/59: the multi-bot workspace layout — inspect it, or move a
+    /// single-agent workspace into it.
+    #[cfg(feature = "gui")]
+    Bots {
+        #[command(subcommand)]
+        cmd: BotsCmd,
+    },
     /// GUI Shell authoring (dev-plan/39 Tier 2) — scaffold a new shell
     /// from a vendored template, preview locally with hot-reload, lint
     /// the manifest, or pack into a single-file HTML for publish.
@@ -348,6 +363,59 @@ enum Command {
     Shell {
         #[command(subcommand)]
         cmd: ShellCmd,
+    },
+}
+
+#[cfg(feature = "gui")]
+#[derive(Subcommand)]
+enum BotsCmd {
+    /// Print the workspace layout version and the bots in it.
+    Status {
+        /// Workspace to inspect. Defaults to the current directory.
+        #[arg(long)]
+        path: Option<String>,
+    },
+    /// Install a catalogue agent as a bot in this workspace
+    /// (`.thclaws/bots/<slug>/`) and list it in `.thclaws/bots.json`.
+    /// A running host picks it up on its next start.
+    Add {
+        /// Catalogue slug, as `/cloud list` shows it.
+        slug: String,
+        /// Pin a version instead of taking the latest.
+        #[arg(long)]
+        version: Option<String>,
+        /// Overwrite a folder bound to a different agent.
+        #[arg(long)]
+        force: bool,
+        /// Workspace to install into. Defaults to the current directory.
+        #[arg(long)]
+        path: Option<String>,
+    },
+    /// Stop listing a bot. Its folder — sessions, KMS, browser logins —
+    /// stays on disk unless `--purge`.
+    Remove {
+        slug: String,
+        /// Also delete the bot's folder and everything in it.
+        #[arg(long)]
+        purge: bool,
+        #[arg(long)]
+        path: Option<String>,
+    },
+    /// Move a single-agent (v2) workspace into the multi-bot (v3) layout.
+    /// Everything at the workspace root — your files, your git repository
+    /// and `.thclaws/` alike — becomes `.thclaws/bots/main/`, and the root
+    /// becomes the host that supervises it. Resumable: if it is interrupted,
+    /// run it again.
+    Migrate {
+        /// Print what would move, then stop.
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+        /// Workspace to migrate. Defaults to the current directory.
+        #[arg(long)]
+        path: Option<String>,
     },
 }
 
@@ -600,6 +668,21 @@ enum ScheduleCmd {
     /// and a brief recent-fires summary across all schedules.
     Status,
 }
+/// Any panic in a tokio task unwinds that task but leaves the runtime — and
+/// the bound port — alive, so systemd `Restart=on-failure` sits on a
+/// never-failing parent and the user has to `kill -9` to get the port back.
+/// Chain the default hook so the traceback still reaches stderr, then abort so
+/// the OS releases the listening socket immediately (#151). Shared by
+/// `--serve` and `--serve --supervisor`, which have the same port to lose.
+#[cfg(feature = "gui")]
+fn install_serve_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        eprintln!("\x1b[31m[--serve] panic — aborting so the port is released\x1b[0m");
+        std::process::abort();
+    }));
+}
 
 /// Hide the console allocated for the Windows console-subsystem binary when
 /// the user is launching the GUI. CLI mode keeps the console attached so
@@ -716,6 +799,20 @@ fn respawn_detached_for_gui_if_needed(cli: &Cli) {
 #[cfg(not(all(windows, feature = "gui")))]
 fn respawn_detached_for_gui_if_needed(_cli: &Cli) {}
 
+/// dev-plan/59: a workspace holding `.thclaws/bots.json` is a v3 host tree.
+/// The layout decides the process shape — see `server::run_supervisor`.
+#[cfg(feature = "gui")]
+fn workspace_is_v3() -> bool {
+    std::env::current_dir()
+        .map(|d| d.join(thclaws_core::bots::CONFIG_REL).exists())
+        .unwrap_or(false)
+}
+
+#[cfg(not(feature = "gui"))]
+fn workspace_is_v3() -> bool {
+    false
+}
+
 #[tokio::main]
 async fn main() {
     // dev-plan/49: if this is the internal `__confine` re-exec (Linux Landlock
@@ -753,6 +850,16 @@ async fn main() {
     thclaws_core::audit::init();
 
     let cli = Cli::parse();
+
+    // clap's `requires = "serve"` does not fire for a flag: `--serve` has an
+    // implicit `false` default, which counts as present. Without this check
+    // `--supervisor` on its own silently opened the desktop GUI.
+    if cli.supervisor && !cli.serve {
+        eprintln!(
+            "\x1b[31m--supervisor is a mode of --serve; use `thclaws --serve --supervisor`\x1b[0m"
+        );
+        std::process::exit(1);
+    }
 
     // Subcommand short-circuit. `thclaws schedule …` and
     // `thclaws daemon` don't need the bootstrap, don't open a
@@ -815,6 +922,11 @@ async fn main() {
             std::process::exit(code);
         }
         #[cfg(feature = "gui")]
+        Some(Command::Bots { cmd }) => {
+            let code = run_bots_subcommand(cmd).await;
+            std::process::exit(code);
+        }
+        #[cfg(feature = "gui")]
         Some(Command::Shell { cmd }) => {
             let code = run_shell_subcommand(cmd).await;
             std::process::exit(code);
@@ -828,6 +940,79 @@ async fn main() {
         || cli.messenger
         || cli.workflow.is_some()
         || cli.team_agent.is_some();
+    // dev-plan/59 §7.8: opening a v2 workspace in the app upgrades it. The
+    // desktop and `--serve` are the surfaces a person is looking at, so the
+    // banner below is seen; `-p` and the adapters are left alone, because a
+    // script that opens a folder must not find it rearranged. A container
+    // never does this on its own — 71 hosted workspaces migrating at once on
+    // an image roll is a separate, rehearsed decision (`THCLAWS_AUTO_MIGRATE`).
+    #[cfg(feature = "gui")]
+    {
+        let opens_desktop = !use_cli && (!cli.serve || cli.gui);
+        let auto_allowed = thclaws_core::bots::migrate::auto_migrate_allowed();
+        if auto_allowed && !use_cli && !cli.multi_tenant && (cli.serve || opens_desktop) {
+            if let Ok(cwd) = std::env::current_dir() {
+                use thclaws_core::bots::migrate::AutoOutcome;
+                match thclaws_core::bots::migrate::auto_migrate_if_v2(&cwd) {
+                    AutoOutcome::Migrated(report, moves_git) => {
+                        eprintln!("\x1b[36m[thclaws] This workspace was upgraded to the multi-bot layout.\x1b[0m");
+                        eprintln!(
+                            "\x1b[36m  Your project — files, sessions{} — is now at {}\x1b[0m",
+                            if moves_git { ", git repository" } else { "" },
+                            report.bot_dir.display()
+                        );
+                        eprintln!("\x1b[36m  Anything holding the old path (an editor window, a script, another clone) needs the new one.\x1b[0m");
+                        // The tree under cwd changed; the sandbox root did not,
+                        // but re-derive it rather than trust that.
+                        let _ = Sandbox::init();
+                    }
+                    AutoOutcome::Busy => eprintln!(
+                        "\x1b[33m[thclaws] another thClaws is upgrading this workspace — opening it as it is for now\x1b[0m"
+                    ),
+                    AutoOutcome::Failed(e) => eprintln!(
+                        "\x1b[33m[thclaws] could not upgrade this workspace ({e}) — opening it as it is\x1b[0m"
+                    ),
+                    AutoOutcome::NotV2 | AutoOutcome::AlreadyV3 => {}
+                }
+            }
+        }
+    }
+
+    // dev-plan/59: a v3 root holds the host, not an agent. A script or a
+    // person running `-p` / `--cli` there meant the workspace's agent, which
+    // is now `bots[0]` — so go there, the way `agent run` enters an agent
+    // folder, instead of loading the migration tombstone as instructions.
+    #[cfg(feature = "gui")]
+    if use_cli && workspace_is_v3() {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let target = thclaws_core::bots::BotsConfig::load(&cwd)
+            .ok()
+            .and_then(|c| {
+                c.bots
+                    .first()
+                    .map(|b| thclaws_core::bots::bot_dir(&cwd, &b.slug))
+            });
+        match target {
+            Some(dir) if dir.is_dir() => {
+                if let Err(e) = std::env::set_current_dir(&dir) {
+                    eprintln!("\x1b[31mcannot enter {}: {e}\x1b[0m", dir.display());
+                    std::process::exit(1);
+                }
+                // Same re-init `run_on` does after a gui-shell chdir: the
+                // sandbox root and the project `.env` both follow cwd.
+                let _ = Sandbox::init();
+                load_dotenv();
+                eprintln!(
+                    "\x1b[2m[thclaws] workspace host — running in {}\x1b[0m",
+                    dir.display()
+                );
+            }
+            _ => {
+                eprintln!("\x1b[31mThis directory is a workspace host and its default bot is missing; cd into .thclaws/bots/<slug> and run again.\x1b[0m");
+                std::process::exit(1);
+            }
+        }
+    }
 
     // Issue #109: on Windows, respawn detached so cmd.exe / PowerShell
     // return the prompt instead of waiting on the GUI window. Runs
@@ -880,7 +1065,18 @@ async fn main() {
     // `--print` (short-lived, would add subprocess noise to a 5s
     // run) and when the user passes `--no-scheduler`. The task
     // ends when the process exits.
-    if !cli.print && !cli.no_scheduler {
+    //
+    // dev-plan/59: also skipped when this process is a host. Firing a job is
+    // running an agent, which the host does not do — and each bot runs its
+    // own scheduler over its own HOME, so a host scheduler would fire the
+    // USER-level schedules a second time, in whatever cwd they named. The
+    // check is on what the process IS, not on the flag: `--serve` and the
+    // desktop both become hosts by detecting the layout.
+    // Same shape as `respawn_detached_for_gui_if_needed`: the desktop window
+    // is what runs when no CLI-ish mode was asked for.
+    let opens_gui = !use_cli && (!cli.serve || cli.gui);
+    let acting_as_host = cli.supervisor || (workspace_is_v3() && (cli.serve || opens_gui));
+    if !cli.print && !cli.no_scheduler && !acting_as_host {
         match std::env::current_exe() {
             Ok(binary) => {
                 schedule::spawn_scheduler_task(binary);
@@ -930,6 +1126,34 @@ async fn main() {
                     std::process::exit(1);
                 }
             };
+            // dev-plan/59 Step 3: the host is a different process shape,
+            // not a flag on the old one — it never builds a ServeConfig,
+            // never spawns a shared session, and serves only the bot
+            // surface. Dispatched before any of the agent-side resolution
+            // below so none of it runs in a supervisor.
+            // dev-plan/59 Step 4: the LAYOUT decides the process shape, not a
+            // flag. A workspace holding `.thclaws/bots.json` is a v3 host, and
+            // serving it as a project would start the agent on the host's own
+            // tree. Detecting it here is what makes the cloud runner template
+            // need no change at all: a migrated workspace becomes a host on
+            // its next start, on desktop and in a pod alike.
+            if cli.supervisor || workspace_is_v3() {
+                // A host has no per-user sessions to route; a multiuser pod
+                // is a v2 shape. Refuse rather than silently drop the flag.
+                if cli.multi_tenant {
+                    eprintln!(
+                        "\x1b[31m--multiuser cannot be combined with a multi-bot workspace\x1b[0m"
+                    );
+                    std::process::exit(1);
+                }
+                install_serve_panic_hook();
+                let bind = std::net::SocketAddr::new(bind_ip, cli.port);
+                if let Err(e) = thclaws_core::server::run_supervisor(bind).await {
+                    eprintln!("\n\x1b[31mhost error: {e}\x1b[0m");
+                    std::process::exit(1);
+                }
+                return;
+            }
             // dev-plan/33 Tier 2 Mode B + dev-plan/39 Tier 1: resolve
             // the bound shell from (a) explicit --gui-shell flag,
             // (b) settings.json::guiShell.serveDefault, (c)
@@ -940,11 +1164,23 @@ async fn main() {
                     .and_then(|s| s.serve_default().map(str::to_string))
             });
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            let resolved_shell_id = thclaws_core::gui_shell::resolve_default_shell(
-                cli.gui_shell.as_deref(),
-                settings_default.as_deref(),
-                &cwd,
-            );
+            // dev-plan/59: a bot under a workspace host always serves the
+            // full router. Its window or tab is the host's, which needs
+            // `/ws`; a bound-shell router 404s everything but the shell, so
+            // a bot whose settings name a default shell (`guiShell:
+            // "voxel-craft"`) never took a session, and the desktop opened
+            // on "couldn't reach its backend". The shell still opens — in
+            // the UI tab, through `tabDefault`, as it does on the desktop.
+            let supervised = std::env::var("THCLAWS_SUPERVISED").ok().as_deref() == Some("1");
+            let resolved_shell_id = if supervised {
+                None
+            } else {
+                thclaws_core::gui_shell::resolve_default_shell(
+                    cli.gui_shell.as_deref(),
+                    settings_default.as_deref(),
+                    &cwd,
+                )
+            };
             let gui_shell_mode =
                 resolved_shell_id.map(|shell_id| thclaws_core::server::ShellServeMode {
                     shell_id,
@@ -1016,20 +1252,7 @@ async fn main() {
                 thclaws_core::gui::run_gui_with_serve(serve_config);
                 return;
             }
-            // --serve panic hook: any panic in a tokio task unwinds
-            // that task but leaves the runtime (and the bound port)
-            // alive — systemd `Restart=on-failure` then sits on a
-            // never-failing parent and the user has to `kill -9` to
-            // recover the port. Chain the default hook so the
-            // traceback still hits stderr, then abort() so the OS
-            // releases the listening socket immediately and systemd
-            // can restart on a clean port (#151).
-            let default_hook = std::panic::take_hook();
-            std::panic::set_hook(Box::new(move |info| {
-                default_hook(info);
-                eprintln!("\x1b[31m[--serve] panic — aborting so the port is released\x1b[0m");
-                std::process::abort();
-            }));
+            install_serve_panic_hook();
             if let Err(e) = thclaws_core::server::run(serve_config).await {
                 eprintln!("\n\x1b[31mserve error: {e}\x1b[0m");
                 std::process::exit(1);
@@ -1049,7 +1272,45 @@ async fn main() {
         #[cfg(feature = "gui")]
         {
             detach_console_for_gui();
-            thclaws_core::gui::run_gui();
+            // dev-plan/59 §7.6 step 2: in a v3 workspace the supervisor runs
+            // alongside the window, which is still the window that shipped —
+            // same protocol, same IPC bridge, same untouched bundle. Nothing
+            // about the page changes yet; this only proves the children can
+            // come up without disturbing it.
+            if workspace_is_v3() {
+                let listener = match tokio::net::TcpListener::bind(("127.0.0.1", 0)).await {
+                    Ok(l) => l,
+                    Err(e) => {
+                        eprintln!("\x1b[31m[host] cannot bind a loopback port: {e}\x1b[0m");
+                        std::process::exit(1);
+                    }
+                };
+                let addr = match listener.local_addr() {
+                    Ok(a) => a,
+                    Err(e) => {
+                        eprintln!("\x1b[31m[host] listener has no address: {e}\x1b[0m");
+                        std::process::exit(1);
+                    }
+                };
+                let token = thclaws_core::bots::supervisor::mint_token();
+                // Read by the host when it authenticates, and inherited by
+                // every child — which re-mints its own, so this never becomes
+                // a child's.
+                std::env::set_var("THCLAWS_SERVE_TOKEN", &token);
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let default_bot = thclaws_core::bots::BotsConfig::load(&cwd)
+                    .ok()
+                    .and_then(|c| c.bots.first().map(|b| b.slug.clone()))
+                    .unwrap_or_else(|| "main".to_string());
+                tokio::spawn(async move {
+                    if let Err(e) = thclaws_core::server::run_supervisor_on(listener).await {
+                        eprintln!("\n\x1b[31mhost error: {e}\x1b[0m");
+                    }
+                });
+                thclaws_core::gui::run_gui_host(addr, &token, &default_bot);
+            } else {
+                thclaws_core::gui::run_gui();
+            }
             return;
         }
         #[cfg(not(feature = "gui"))]
@@ -1255,6 +1516,200 @@ fn run_messenger_subcommand(cmd: MessengerCmd) -> i32 {
                  Run `thclaws messenger status` to confirm the binding is detected."
             );
             0
+        }
+    }
+}
+#[cfg(feature = "gui")]
+async fn run_bots_subcommand(cmd: BotsCmd) -> i32 {
+    use thclaws_core::bots::migrate;
+
+    let resolve = |p: Option<String>| -> std::path::PathBuf {
+        p.map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()))
+    };
+
+    match cmd {
+        BotsCmd::Status { path } => {
+            let ws = resolve(path);
+            match migrate::plan(&ws) {
+                Ok(p) => {
+                    println!("workspace  {}", p.workspace.display());
+                    match &p.status {
+                        migrate::Status::AlreadyV3 => println!("layout     v3 (multi-bot)"),
+                        migrate::Status::Migrate => println!(
+                            "layout     v2 (single agent) — `thclaws bots migrate` moves it to v3"
+                        ),
+                        migrate::Status::Resume(phase) => println!(
+                            "layout     MIGRATION INTERRUPTED at '{phase:?}' — re-run `thclaws bots migrate` to finish it"
+                        ),
+                    }
+                    match thclaws_core::bots::BotsConfig::load(&ws) {
+                        Ok(cfg) => {
+                            for b in &cfg.bots {
+                                println!("bot        {} ({})", b.slug, b.display_name());
+                            }
+                        }
+                        Err(_) => println!("bots       none"),
+                    }
+                    0
+                }
+                Err(e) => {
+                    eprintln!("\x1b[31m{e}\x1b[0m");
+                    1
+                }
+            }
+        }
+        BotsCmd::Add {
+            slug,
+            version,
+            force,
+            path,
+        } => {
+            let ws = resolve(path);
+            // `main` is already on a runtime — `block_on` here panicked with
+            // "Cannot start a runtime from within a runtime".
+            match thclaws_core::bots::install::install(&ws, &slug, version.as_deref(), force).await
+            {
+                Ok(done) => {
+                    for line in &done.lines {
+                        println!("{line}");
+                    }
+                    println!(
+                        "\n\x1b[32m✓\x1b[0m {} at {}",
+                        if done.newly_registered {
+                            "installed"
+                        } else {
+                            "updated"
+                        },
+                        done.dir.display()
+                    );
+                    if done.newly_registered {
+                        println!("  restart the host to start it: thclaws --serve");
+                    }
+                    0
+                }
+                Err(e) => {
+                    eprintln!("\x1b[31m{e}\x1b[0m");
+                    1
+                }
+            }
+        }
+        BotsCmd::Remove { slug, purge, path } => {
+            let ws = resolve(path);
+            match thclaws_core::bots::install::deregister(&ws, &slug, purge) {
+                Ok(true) => {
+                    println!(
+                        "✓ removed '{slug}'{}",
+                        if purge {
+                            " and deleted its folder"
+                        } else {
+                            " — its folder is still on disk"
+                        }
+                    );
+                    0
+                }
+                Ok(false) => {
+                    eprintln!("no bot '{slug}' in this workspace");
+                    1
+                }
+                Err(e) => {
+                    eprintln!("\x1b[31m{e}\x1b[0m");
+                    1
+                }
+            }
+        }
+        BotsCmd::Migrate { dry_run, yes, path } => {
+            let ws = resolve(path);
+            let plan = match migrate::plan(&ws) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("\x1b[31m{e}\x1b[0m");
+                    return 1;
+                }
+            };
+            if plan.is_noop() {
+                println!(
+                    "{} is already on the v3 layout — nothing to do.",
+                    ws.display()
+                );
+                return 0;
+            }
+
+            println!("\n\x1b[1mthClaws workspace migration — v2 → v3\x1b[0m\n");
+            println!("  workspace  {}", plan.workspace.display());
+            println!(
+                "  becomes    {}",
+                plan.workspace.join(".thclaws/bots/main").display()
+            );
+            if let migrate::Status::Resume(phase) = &plan.status {
+                println!("  resuming   an interrupted migration, from '{phase:?}'");
+            }
+            println!("\n  moves into the bot ({}):", plan.moves.len());
+            for chunk in plan.moves.chunks(4) {
+                println!("    {}", chunk.join("  "));
+            }
+            if !plan.keeps.is_empty() {
+                println!("\n  stays at the root: {}", plan.keeps.join("  "));
+            }
+            if !plan.schedules.is_empty() {
+                println!(
+                    "\n  schedules rewritten to the new path: {}",
+                    plan.schedules.join(", ")
+                );
+            }
+            if plan.moves_git {
+                println!("\n\x1b[33m  Your git repository moves with everything else.\x1b[0m");
+                println!("  Anything holding the old path — an editor window, CI, another");
+                println!("  clone — will need the new one.");
+            }
+            if dry_run {
+                println!("\n(dry run — nothing was moved)");
+                return 0;
+            }
+            // There is no per-workspace lock on a running engine, so this is
+            // the only thing standing between a migration and a `--serve`
+            // holding the tree it is about to move.
+            println!(
+                "\n\x1b[33m  Close any thClaws window, `--serve`, or agent run on this\x1b[0m"
+            );
+            println!("\x1b[33m  workspace before continuing — nothing here can detect one.\x1b[0m");
+            if !yes {
+                print!("\nType `yes` to continue: ");
+                use std::io::Write as _;
+                let _ = std::io::stdout().flush();
+                let mut answer = String::new();
+                if std::io::stdin().read_line(&mut answer).is_err() || answer.trim() != "yes" {
+                    println!("cancelled — nothing was moved.");
+                    return 1;
+                }
+            }
+            match migrate::apply(&plan) {
+                Ok(report) => {
+                    println!("\n\x1b[32m✓ migrated\x1b[0m");
+                    println!("  {} entries moved", report.moved);
+                    println!("  your project is now at {}", report.bot_dir.display());
+                    if report.minted_identity {
+                        println!("  minted an agent identity for it (needed to publish)");
+                    }
+                    if !report.rewritten_schedules.is_empty() {
+                        println!(
+                            "  rewrote {} schedule(s): {}",
+                            report.rewritten_schedules.len(),
+                            report.rewritten_schedules.join(", ")
+                        );
+                    }
+                    // `--serve` detects `.thclaws/bots.json` on its own now, so the
+                    // flag is not part of the instruction.
+                    println!("\n  open it with:  thclaws --serve");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("\n\x1b[31mmigration failed: {e}\x1b[0m");
+                    eprintln!("The workspace is mid-migration and safe to resume — run the same");
+                    eprintln!("command again once the cause is fixed.");
+                    1
+                }
+            }
         }
     }
 }

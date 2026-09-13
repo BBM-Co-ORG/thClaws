@@ -653,7 +653,8 @@ pub async fn get(
     cloud_url: Option<&str>,
     cloud_cfg: Option<&CloudConfig>,
 ) -> Result<(), String> {
-    for line in get_lines(slug, target, version, force, cloud_url, cloud_cfg).await {
+    let outcome = get_lines(slug, target, version, force, cloud_url, cloud_cfg).await;
+    for line in &outcome.lines {
         eprintln!("{line}");
     }
     Ok(())
@@ -681,39 +682,57 @@ pub async fn get_into_cwd_lines(
         cloud_cfg,
     )
     .await
+    .lines
+}
+
+/// What `get_lines` did, for a caller that has to act on it. The slash
+/// command only ever renders the lines, but installing a bot (dev-plan/59
+/// Step 5) must not register a bot whose download or extraction failed.
+pub(crate) struct GetOutcome {
+    pub ok: bool,
+    pub lines: Vec<String>,
+}
+
+impl GetOutcome {
+    fn ok(lines: Vec<String>) -> Self {
+        Self { ok: true, lines }
+    }
+    fn failed(lines: Vec<String>) -> Self {
+        Self { ok: false, lines }
+    }
 }
 
 /// Underlying get-and-report. Errors come back as a single line so
 /// both surfaces (CLI eprintln, GUI/REPL SlashOutput) render identically.
 /// `force` bypasses the UUID-match safety check on non-empty targets.
-async fn get_lines(
+pub(crate) async fn get_lines(
     slug: String,
     target: PathBuf,
     version: Option<String>,
     force: bool,
     cloud_url: Option<&str>,
     cloud_cfg: Option<&CloudConfig>,
-) -> Vec<String> {
+) -> GetOutcome {
     let url = resolve_cloud_url(cloud_url, cloud_cfg);
     let token = crate::cloud::token();
     if token.is_none() {
-        return vec![
+        return GetOutcome::failed(vec![
             "/cloud get: not logged in — paste your CLI token in Settings → thClaws.cloud (mint one at /dashboard)"
                 .to_string(),
-        ];
+        ]);
     }
 
     if let Some(msg) = refuse_in_multiuser("/cloud get") {
-        return vec![msg];
+        return GetOutcome::failed(vec![msg]);
     }
     // `unpack` overwrites AGENTS.md / settings.json / .thclaws/ in place, so
     // an install while a turn is running swaps the agent's own definition out
     // from under it. Same guard `/cloud push` carries.
     if crate::agent_activity::busy_count() > 0 {
-        return vec![
+        return GetOutcome::failed(vec![
             "/cloud get: a turn is active — wait for it to finish before installing an agent"
                 .to_string(),
-        ];
+        ]);
     }
 
     let mut lines = Vec::new();
@@ -731,7 +750,7 @@ async fn get_lines(
         Ok(d) => d,
         Err(e) => {
             lines.push(format!("/cloud get: {e}"));
-            return lines;
+            return GetOutcome::failed(lines);
         }
     };
     lines.push(format!(
@@ -753,11 +772,11 @@ async fn get_lines(
              unverified bytes. (Catalog backend or proxy probably needs a look.)"
                 .into(),
         );
-        return lines;
+        return GetOutcome::failed(lines);
     }
     if let Err(e) = pack::verify_sha256(&dl.bytes, &dl.sha256) {
         lines.push(format!("/cloud get: {e}"));
-        return lines;
+        return GetOutcome::failed(lines);
     }
 
     // Safety check on folders that already hold an agent: refuse unless
@@ -772,7 +791,7 @@ async fn get_lines(
                      overwrite an existing agent folder. (Catalog backend probably needs an update.)"
                         .into(),
                 );
-                return lines;
+                return GetOutcome::failed(lines);
             }
         };
         let local_uuid = load_local_agent_uuid(&target);
@@ -791,7 +810,7 @@ async fn get_lines(
                     local.chars().take(8).collect::<String>(),
                     server_uuid.chars().take(8).collect::<String>()
                 ));
-                return lines;
+                return GetOutcome::failed(lines);
             }
             None => {
                 // No bound UUID = no published agent to protect. The folder was
@@ -846,7 +865,7 @@ async fn get_lines(
                     )),
                 }
             }
-            return lines;
+            return GetOutcome::failed(lines);
         }
     };
     lines.push(format!("✓ Extracted {} file(s)", files.len()));
@@ -873,7 +892,7 @@ async fn get_lines(
             ));
         }
     }
-    lines
+    GetOutcome::ok(lines)
 }
 
 /// Keys in `.thclaws/settings.json` that belong to the installing user's

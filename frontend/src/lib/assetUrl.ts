@@ -6,6 +6,8 @@
 // `window.location.origin` is scheme+host only, so `${origin}/file-asset/…`
 // would skip the prefix and 404 at Traefik. Walk the prefix out of
 // `location.pathname`. Desktop / single-tenant `--serve` have no prefix.
+import { botQuery } from "../hooks/useIPC";
+
 export function workspacePrefix(): string {
   // Path scheme — thclaws.cloud/u/<handle>/<slug>/… → the 3-segment prefix.
   const u = location.pathname.match(/^(\/u\/[^/]+\/[^/]+)/);
@@ -30,5 +32,5 @@ export function assetUrl(absPath: string): string {
   const normalized = absPath.replace(/\\/g, "/");
   const segments = normalized.split("/").map(encodeURIComponent).join("/");
   const leadingSlash = segments.startsWith("/") ? "" : "/";
-  return `${window.location.origin}${workspacePrefix()}/file-asset${leadingSlash}${segments}`;
+  return `${window.location.origin}${workspacePrefix()}/file-asset${leadingSlash}${segments}${botQuery()}`;
 }

@@ -1204,17 +1204,25 @@ impl ProjectConfig {
     /// defaults. Returns whether a file was written. Silent on I/O
     /// errors — bootstrap is best-effort and shouldn't kill startup.
     pub fn ensure_default_exists() -> bool {
-        let path = Self::path();
+        // `project_dir()` is `<root>/.thclaws`, with the root taken from
+        // `THCLAWS_PROJECT_ROOT` before the cwd — the same place `path()`
+        // and `load()` use.
+        match Self::project_dir().parent() {
+            Some(root) => Self::ensure_default_exists_in(root),
+            None => false,
+        }
+    }
+
+    /// [`ensure_default_exists`] for a project folder other than the cwd —
+    /// a bot created empty on a workspace shelf gets the same first-run file a
+    /// new folder opened in the app does.
+    pub fn ensure_default_exists_in(dir: &std::path::Path) -> bool {
+        let path = dir.join(".thclaws").join("settings.json");
         if path.exists() {
             return false;
         }
-        let claude_path = std::env::current_dir()
-            .ok()
-            .map(|p| p.join(".claude/settings.json"));
-        if let Some(p) = claude_path {
-            if p.exists() {
-                return false;
-            }
+        if dir.join(".claude/settings.json").exists() {
+            return false;
         }
         // Hand-rolled JSON enumerating every ProjectConfig field at
         // its default value so users discover available knobs by
@@ -1349,7 +1357,13 @@ impl ProjectConfig {
         if crate::workdir::is_multiuser() {
             return;
         }
-        Self::migrate_workspace_at(&Self::project_dir());
+        let dir = Self::project_dir();
+        // Spill files (agent.rs `maybe_truncate_to_disk`) live under this
+        // tree now so the model can read them back; nothing else sweeps them.
+        // Once per project-open, never mid-session — the running session's
+        // truncation footers have to keep naming files that still exist.
+        crate::agent::prune_tool_output_dir(&dir);
+        Self::migrate_workspace_at(&dir);
     }
 
     /// Migration core, parameterised by the project's `.thclaws/` dir so

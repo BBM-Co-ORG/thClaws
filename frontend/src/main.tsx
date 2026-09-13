@@ -1,7 +1,7 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import "./index.css";
-import App from "./App";
+import { BotShell } from "./components/BotShell";
 import { ThemeProvider } from "./components/ThemeProvider";
 
 // Apply the OS-preferred theme synchronously before React mounts, so the
@@ -22,7 +22,7 @@ import { ThemeProvider } from "./components/ThemeProvider";
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <ThemeProvider>
-      <App />
+      <BotShell />
     </ThemeProvider>
   </StrictMode>
 );

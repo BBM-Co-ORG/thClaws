@@ -217,9 +217,17 @@ impl ShellRegistry {
     /// project shell directories. Project dir is resolved relative to
     /// the current working directory at call time.
     pub fn new() -> Self {
+        Self::new_in(&std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+    }
+
+    /// The same registry with the project scan rooted at `project_root`
+    /// instead of the cwd. A workspace host's cwd is the shelf, and the
+    /// shells it must serve belong to the bot the window is looking at
+    /// (dev-plan/59): `<ws>/.thclaws/bots/<slug>/.thclaws/gui-shell/`.
+    pub fn new_in(project_root: &Path) -> Self {
         let builtin = Self::builtin_only_map();
         let user = scan_dir(&user_shell_dir());
-        let project = scan_dir(&project_shell_dir());
+        let project = scan_dir(&project_root.join(".thclaws").join("gui-shell"));
         Self {
             builtin,
             user,
@@ -577,6 +585,33 @@ mod tests {
         let mut ids: Vec<&str> = found.values().map(|s| s.manifest.id.as_str()).collect();
         ids.sort();
         assert_eq!(ids, ["with-manifest", "with-shell"]);
+    }
+
+    /// dev-plan/59: a workspace host's cwd is the shelf; the shell a bot
+    /// ships (`guiShell.tabDefault`) is under the bot. Resolved against the
+    /// cwd it was absent — a 404 and a blank iframe — so the desktop asks
+    /// for the registry rooted at the bot it is showing.
+    #[test]
+    fn new_in_scans_the_given_project_root() {
+        let ws = tempdir().unwrap();
+        let bot = ws.path().join(".thclaws/bots/author");
+        let shell = bot.join(".thclaws/gui-shell/book-studio");
+        std::fs::create_dir_all(&shell).unwrap();
+        std::fs::write(
+            shell.join("manifest.json"),
+            r#"{"id":"book-studio","name":"Book Studio","version":"0.1.0","description":"t","entry":"index.html"}"#,
+        )
+        .unwrap();
+        std::fs::write(shell.join("index.html"), "<html></html>").unwrap();
+        let at_bot = ShellRegistry::new_in(&bot);
+        let s = at_bot.resolve("book-studio").expect("the bot's shell");
+        assert_eq!(s.source(), ShellSource::Project);
+        assert!(
+            ShellRegistry::new_in(ws.path())
+                .resolve("book-studio")
+                .is_none(),
+            "the shelf has no such shell — this is the 404 the desktop hit"
+        );
     }
 
     #[test]

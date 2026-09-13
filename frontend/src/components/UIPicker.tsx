@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { RefreshCw, Sparkles } from "lucide-react";
-import { send, subscribe } from "../hooks/useIPC";
+import { botQuery, send, subscribe } from "../hooks/useIPC";
 
 // dev-plan/33 Tier 2 — picker modal listing every installed shell:
 // built-ins (embedded), user (~/.config/thclaws/gui-shell/), and
@@ -181,7 +181,7 @@ function ShellCard({
     (window.location.protocol === "http:" || window.location.protocol === "https:");
   const iconUrl = shell.icon
     ? isHttp
-      ? `gui-shell/${encodeURIComponent(shell.id)}/${shell.icon}`
+      ? `gui-shell/${encodeURIComponent(shell.id)}/${shell.icon}${botQuery()}`
       : `thclaws://localhost/gui-shell/${encodeURIComponent(shell.id)}/${shell.icon}`
     : null;
   return (

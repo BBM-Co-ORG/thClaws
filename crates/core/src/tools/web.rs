@@ -176,7 +176,64 @@ async fn plain_get(client: &reqwest::Client, url: &str, max_bytes: usize) -> Res
         .await
         .map_err(|e| Error::Tool(format!("read body {url}: {e}")))?;
 
-    Ok(truncate_for_bytes(&text, max_bytes))
+    Ok(truncate_for_bytes(&strip_html_noise(&text), max_bytes))
+}
+
+/// Drop the parts of an HTML body that cannot help answer a question, so the
+/// byte budget is spent on content instead of markup.
+///
+/// Measured on two real `WebFetch` results that spilled to disk during a
+/// browse session: one 95,925-byte page was 44% `<svg>` and 32% `<script>`,
+/// leaving 7.9% actual text; another at 102,555 bytes was 58% `<style>`.
+/// Both blew the 50 KB truncation limit and made the model read icon path
+/// coordinates instead of the article. Stripped, both fit whole.
+///
+/// Only HTML is touched. The plain-GET section exists precisely so JSON
+/// APIs, sitemaps and XML come back verbatim, and a `<script>`-shaped run of
+/// bytes inside those is content, not noise.
+fn strip_html_noise(body: &str) -> String {
+    if !looks_like_html(body) {
+        return body.to_string();
+    }
+    static RE: std::sync::OnceLock<Vec<regex::Regex>> = std::sync::OnceLock::new();
+    let res = RE.get_or_init(|| {
+        [
+            r"(?is)<script\b[^>]*>.*?</script\s*>",
+            r"(?is)<style\b[^>]*>.*?</style\s*>",
+            r"(?is)<svg\b[^>]*>.*?</svg\s*>",
+            r"(?is)<noscript\b[^>]*>.*?</noscript\s*>",
+            r"(?s)<!--.*?-->",
+        ]
+        .iter()
+        .filter_map(|p| regex::Regex::new(p).ok())
+        .collect()
+    });
+    let mut out = body.to_string();
+    for re in res {
+        out = re.replace_all(&out, "").into_owned();
+    }
+    let saved = body.len().saturating_sub(out.len());
+    // Say so rather than silently handing back something labelled "raw
+    // response body" — a reader comparing byte counts should not have to
+    // guess where the difference went.
+    if saved > 0 {
+        out.push_str(&format!(
+            "\n\n[stripped {} KB of script/style/svg/comment markup from this HTML \
+             so the budget goes to content]",
+            saved / 1024
+        ));
+    }
+    out
+}
+
+/// Cheap sniff for an HTML body. Looks only at the head of the document so a
+/// large JSON payload that happens to embed markup later is left alone.
+fn looks_like_html(body: &str) -> bool {
+    let head: String = body.chars().take(600).collect::<String>().to_lowercase();
+    let head = head.trim_start();
+    head.starts_with("<!doctype html")
+        || head.starts_with("<html")
+        || (head.contains("<html") && head.contains('>'))
 }
 
 /// Byte-bounded truncation that respects UTF-8 char boundaries —
@@ -252,6 +309,55 @@ mod tests {
         // even after the HAL routing was added. Don't silently relax it.
         let t = WebFetchTool::new();
         assert!(t.requires_approval(&json!({"url": "http://x"})));
+    }
+
+    /// Two real WebFetch results that spilled during a browse session were
+    /// 92% and 81% markup — svg icon paths, stylesheets, inline scripts —
+    /// and the model spent its 50 KB budget reading path coordinates while
+    /// the article itself was 7.5 KB. Strip what cannot answer a question.
+    #[test]
+    fn html_noise_is_stripped_before_the_budget_is_spent() {
+        let html = format!(
+            "<!doctype html><html><head><style>{}</style>\
+             <script>{}</script></head><body><svg><path d=\"{}\"/></svg>\
+             <p>the answer is 42</p><!-- {} --></body></html>",
+            "x".repeat(3000),
+            "y".repeat(3000),
+            "1.5 2.5 ".repeat(400),
+            "z".repeat(500),
+        );
+        let out = super::strip_html_noise(&html);
+        assert!(out.contains("the answer is 42"), "content must survive");
+        for junk in ["<style", "<script", "<svg", "<path", "<!--"] {
+            assert!(
+                !out.contains(junk),
+                "{junk} should have been stripped: {out:.200}"
+            );
+        }
+        assert!(
+            out.len() < html.len() / 4,
+            "expected a large cut, got {}",
+            out.len()
+        );
+        assert!(out.contains("stripped"), "must disclose that it stripped");
+    }
+
+    /// The plain-GET section exists so JSON APIs and sitemaps come back
+    /// verbatim. A body that is not HTML must pass through byte-for-byte,
+    /// even when it contains markup-shaped text.
+    #[test]
+    fn non_html_bodies_pass_through_untouched() {
+        for body in [
+            r#"{"note":"<script>not really a script</script>","n":1}"#,
+            "<?xml version=\"1.0\"?><rss><item><title>hi</title></item></rss>",
+            "plain text, no markup at all",
+        ] {
+            assert_eq!(
+                super::strip_html_noise(body),
+                body,
+                "must not touch {body:.40}"
+            );
+        }
     }
 
     #[test]

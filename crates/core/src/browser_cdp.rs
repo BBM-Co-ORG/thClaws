@@ -877,16 +877,34 @@ pub fn input(kind: &str, args: &Value) -> Result<(), String> {
                 release["type"] = json!("mouseReleased");
                 session.call("Input.dispatchMouseEvent", release).await?;
             }
-            "move" => {
+            // The user's own gesture, relayed as it happens: a press, the
+            // moves their hand makes with the button held, the release.
+            // A slider CAPTCHA is a drag, and a drag is nothing but that
+            // sequence — `click` alone could never move one.
+            "down" | "up" => {
                 session
                     .call(
                         "Input.dispatchMouseEvent",
                         json!({
-                            "type": "mouseMoved",
+                            "type": if kind == "down" { "mousePressed" } else { "mouseReleased" },
                             "x": get_f("x"), "y": get_f("y"),
+                            "button": "left", "buttons": if kind == "down" { 1 } else { 0 },
+                            "clickCount": 1,
                         }),
                     )
                     .await?;
+            }
+            "move" => {
+                let held = get_f("buttons") as u32 & 1 == 1;
+                let mut ev = json!({
+                    "type": "mouseMoved",
+                    "x": get_f("x"), "y": get_f("y"),
+                    "buttons": if held { 1 } else { 0 },
+                });
+                if held {
+                    ev["button"] = json!("left");
+                }
+                session.call("Input.dispatchMouseEvent", ev).await?;
             }
             "wheel" => {
                 session
@@ -951,9 +969,73 @@ pub fn input(kind: &str, args: &Value) -> Result<(), String> {
     })
 }
 
+/// One thread applies every takeover input in the order it arrived.
+/// A thread per event let a drag's `up` overtake its last `move`, which
+/// ends the drag short — or lands the release before the press.
+fn input_queue() -> &'static Mutex<std::sync::mpsc::Sender<Box<dyn FnOnce() + Send>>> {
+    static Q: OnceLock<Mutex<std::sync::mpsc::Sender<Box<dyn FnOnce() + Send>>>> = OnceLock::new();
+    Q.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Box<dyn FnOnce() + Send>>();
+        std::thread::Builder::new()
+            .name("browser-input".into())
+            .spawn(move || {
+                for job in rx {
+                    job();
+                }
+            })
+            .expect("browser-input thread");
+        Mutex::new(tx)
+    })
+}
+
+/// Queue one takeover input; `reply` runs on the input thread once it has
+/// been applied, in arrival order with every other input.
+pub fn input_queued(
+    kind: String,
+    args: Value,
+    reply: impl FnOnce(Result<(), String>) + Send + 'static,
+) {
+    let job: Box<dyn FnOnce() + Send> = Box::new(move || reply(input(&kind, &args)));
+    let _ = input_queue().lock().unwrap().send(job);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A drag is `down`, moves, `up` — relayed on separate threads, the
+    /// `up` could land first. The queue keeps arrival order.
+    #[test]
+    fn queued_inputs_apply_in_arrival_order() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        for i in 0..200u32 {
+            let seen = seen.clone();
+            let done_tx = done_tx.clone();
+            let job: Box<dyn FnOnce() + Send> = Box::new(move || {
+                seen.lock().unwrap().push(i);
+                if i == 199 {
+                    let _ = done_tx.send(());
+                }
+            });
+            input_queue().lock().unwrap().send(job).unwrap();
+        }
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("queue drained");
+        assert_eq!(*seen.lock().unwrap(), (0..200).collect::<Vec<_>>());
+        // With no live page a queued input reports, rather than drops, the
+        // error — the tab shows it instead of a drag that silently did
+        // nothing.
+        let (tx, rx) = std::sync::mpsc::channel();
+        input_queued("down".into(), json!({"x": 1, "y": 1}), move |r| {
+            let _ = tx.send(r);
+        });
+        let r = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("reply");
+        assert!(r.is_err());
+    }
 
     #[test]
     fn classic_layout_discovery_picks_highest_revision() {

@@ -4628,9 +4628,14 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                 .to_string();
             let args = msg.get("args").cloned().unwrap_or(serde_json::json!({}));
             let dispatch = ctx.dispatch.clone();
-            std::thread::spawn(move || {
-                let result = crate::browser_cdp::input(&kind, &args);
+            // One ordered queue, not a thread per event: a drag is a press,
+            // a stream of moves and a release, and they must land in that
+            // order. A move's success is not worth a frame back to the
+            // page — dozens arrive a second — its failure is.
+            let quiet_ok = kind == "move";
+            crate::browser_cdp::input_queued(kind.clone(), args, move |result| {
                 let reply = match result {
+                    Ok(()) if quiet_ok => return,
                     Ok(()) => serde_json::json!({
                         "type": "browser_input_result", "ok": true,
                         "tool": format!("cdp_{kind}"),

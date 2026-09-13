@@ -12,6 +12,8 @@
 // the prefix entirely and 404 at Traefik. Walk the prefix out of
 // `location.pathname` instead. Desktop / single-tenant `--serve` have no
 // prefix; this returns "".
+import { botQuery } from "../hooks/useIPC";
+
 export function workspacePrefix(): string {
   // Path scheme — thclaws.cloud/u/<handle>/<slug>/… → the 3-segment prefix.
   const u = location.pathname.match(/^(\/u\/[^/]+\/[^/]+)/);
@@ -32,7 +34,7 @@ export function fileAssetUrl(path: string): string {
   const normalized = path.replace(/\\/g, "/");
   const segments = normalized.split("/").map(encodeURIComponent).join("/");
   const leadingSlash = segments.startsWith("/") ? "" : "/";
-  return `${window.location.origin}${workspacePrefix()}/file-asset${leadingSlash}${segments}`;
+  return `${window.location.origin}${workspacePrefix()}/file-asset${leadingSlash}${segments}${botQuery()}`;
 }
 
 // Resolve a markdown image `src` for rendering. Absolute URLs (http(s),

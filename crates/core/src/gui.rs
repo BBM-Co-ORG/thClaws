@@ -659,9 +659,47 @@ fn request_gui_shutdown(
     crate::browser_cdp::shutdown();
     *control_flow = ControlFlow::Exit;
 }
-
+/// Window size and zoom: the user's stored values, else a default picked from
+/// the primary monitor's logical resolution — roomy on workstation-class
+/// displays (>=1920x1080), conservative on laptop screens.
+fn window_geometry(monitor: Option<tao::monitor::MonitorHandle>) -> (f64, f64, f64) {
+    let big = monitor
+        .map(|m| {
+            let size = m.size();
+            let scale = m.scale_factor().max(0.0001);
+            let logical_w = size.width as f64 / scale;
+            let logical_h = size.height as f64 / scale;
+            logical_w >= 1920.0 && logical_h >= 1080.0
+        })
+        .unwrap_or(false);
+    let (default_w, default_h) = if big {
+        (1760.0, 962.0)
+    } else {
+        (1200.0, 800.0)
+    };
+    crate::config::ProjectConfig::load()
+        .map(|c| {
+            (
+                c.window_width.unwrap_or(default_w),
+                c.window_height.unwrap_or(default_h),
+                c.gui_scale.unwrap_or(1.0),
+            )
+        })
+        .unwrap_or((default_w, default_h, 1.0))
+}
 pub fn run_gui() {
-    run_gui_inner(None);
+    run_gui_inner(None, None);
+}
+
+/// dev-plan/59 §7.6 step 3: the desktop window over a workspace host.
+///
+/// Everything about the window is what shipped — the `thclaws://` scheme, the
+/// IPC bridge, `FRONTEND_HTML` untouched. Only the far end of the bridge
+/// moves: the page's frames go to a bot's `--serve`, and the bot's frames
+/// come back the way the in-process engine's did. Two attempts at replacing
+/// the window's page delivery instead produced a black screen (§7.6).
+pub fn run_gui_host(addr: std::net::SocketAddr, token: &str, slug: &str) {
+    run_gui_inner(None, Some((addr, token.to_string(), slug.to_string())));
 }
 
 /// Combo entry point for `--serve --gui`: builds the desktop window and
@@ -676,20 +714,18 @@ pub fn run_gui() {
 /// the combo, this means: approve on the desktop window, the action
 /// applies to whichever surface triggered it.
 pub fn run_gui_with_serve(config: crate::server::ServeConfig) {
-    run_gui_inner(Some(config));
+    run_gui_inner(Some(config), None);
 }
 
-fn run_gui_inner(serve: Option<crate::server::ServeConfig>) {
-    // M6.42: Pin WebView2's user data folder to %LOCALAPPDATA% before
-    // any wry init. The WebView2 Runtime checks this env var when
-    // creating its environment; without it, wry falls back to a
-    // `<exe>.WebView2/` sibling dir next to thclaws.exe. That sibling
-    // path is read-only when the MSI installs into C:\Program Files\,
-    // making the GUI silently SIGTERM on first launch (the binary
-    // itself runs fine — `thclaws --cli` works — but wry's webview
-    // creation fails when it can't write the user data folder). The
-    // folder is created lazily by WebView2; we just point at a
-    // writable location and let it populate.
+/// M6.42: Pin WebView2's user data folder to %LOCALAPPDATA% before any wry
+/// init. The WebView2 Runtime checks this env var when creating its
+/// environment; without it, wry falls back to a `<exe>.WebView2/` sibling dir
+/// next to thclaws.exe. That sibling path is read-only when the MSI installs
+/// into C:\Program Files\, making the GUI silently SIGTERM on first launch
+/// (the binary itself runs fine — `thclaws --cli` works — but wry's webview
+/// creation fails when it can't write the user data folder). The folder is
+/// created lazily by WebView2; we just point at a writable location.
+fn pin_webview2_data_folder() {
     #[cfg(windows)]
     {
         let local = std::env::var("LOCALAPPDATA")
@@ -704,41 +740,20 @@ fn run_gui_inner(serve: Option<crate::server::ServeConfig>) {
             std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &data_dir);
         }
     }
+}
+
+fn run_gui_inner(
+    serve: Option<crate::server::ServeConfig>,
+    // dev-plan/59: `Some((host addr, token, bot slug))` points the IPC bridge
+    // at a bot instead of at this process's own engine.
+    host: Option<(std::net::SocketAddr, String, String)>,
+) {
+    pin_webview2_data_folder();
 
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
 
-    // Pick a sensible default window size based on the primary
-    // monitor's logical resolution: roomy on workstation-class
-    // displays (>=1920x1080), conservative on laptop screens. Only
-    // applies when no explicit size lives in `.thclaws/settings.json`.
-    let (default_w, default_h) = {
-        let big = event_loop
-            .primary_monitor()
-            .map(|m| {
-                let size = m.size();
-                let scale = m.scale_factor().max(0.0001);
-                let logical_w = size.width as f64 / scale;
-                let logical_h = size.height as f64 / scale;
-                logical_w >= 1920.0 && logical_h >= 1080.0
-            })
-            .unwrap_or(false);
-        if big {
-            (1760.0, 962.0)
-        } else {
-            (1200.0, 800.0)
-        }
-    };
-
-    let (win_w, win_h, initial_zoom) = crate::config::ProjectConfig::load()
-        .map(|c| {
-            (
-                c.window_width.unwrap_or(default_w),
-                c.window_height.unwrap_or(default_h),
-                c.gui_scale.unwrap_or(1.0),
-            )
-        })
-        .unwrap_or((default_w, default_h, 1.0));
+    let (win_w, win_h, initial_zoom) = window_geometry(event_loop.primary_monitor());
     let window = WindowBuilder::new()
         .with_title(&crate::branding::current().name)
         .with_inner_size(LogicalSize::new(win_w, win_h))
@@ -760,7 +775,59 @@ fn run_gui_inner(serve: Option<crate::server::ServeConfig>) {
     let (approver, mut approval_rx) = crate::permissions::GuiApprover::new();
     let approver_for_ipc = approver.clone();
     let shared = Arc::new(crate::shared_session::spawn_with_approver(approver.clone()));
-    spawn_event_translator(&shared, proxy.clone());
+    // In host mode the frames come from a bot's socket, not from an engine
+    // in this process, so the translator that fans out this process's own
+    // ViewEvents must not also be running.
+    // Swappable: switching bots drops this link and opens another, which is
+    // what makes the window follow the rail without the page changing
+    // transport.
+    let bot_link: Arc<std::sync::Mutex<Option<crate::bots::desktop::BotBridge>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let host_conn = host.map(|(addr, token, slug)| {
+        let proxy_for_bot = proxy.clone();
+        *bot_link.lock().expect("bot link") = Some(crate::bots::desktop::connect(
+            addr,
+            token.clone(),
+            slug,
+            move |frame| {
+                let _ = proxy_for_bot.send_event(UserEvent::Dispatch(frame));
+            },
+        ));
+        (addr, token)
+    });
+    if host_conn.is_none() {
+        spawn_event_translator(&shared, proxy.clone());
+    }
+    let bridge_for_ipc = bot_link.clone();
+    // The protocol handler serves shells and files for the bot the window
+    // is attached to. The host's cwd is the shelf — a bot's default shell
+    // (`guiShell.tabDefault`) lives under the bot, and resolving it against
+    // the shelf gave a 404 and a blank iframe the moment such a bot was
+    // opened.
+    let bridge_for_proto = bot_link.clone();
+    let host_root_for_proto = host_conn
+        .as_ref()
+        .map(|_| std::env::current_dir().unwrap_or_default());
+    let active_bot_dir = move || -> Option<std::path::PathBuf> {
+        let root = host_root_for_proto.as_ref()?;
+        let slug = bridge_for_proto
+            .lock()
+            .ok()?
+            .as_ref()
+            .map(|b| b.slug.clone())?;
+        Some(crate::bots::bot_dir(root, &slug))
+    };
+    // The workspace the host serves — what the folder picker offers to
+    // change, and what a pick inside it leaves alone.
+    let host_root_for_ipc = host_conn
+        .as_ref()
+        .map(|_| std::env::current_dir().unwrap_or_default());
+    // The picker is offered once per window, not once per bot: every bot's
+    // tree asks `get_cwd` when it is first shown.
+    let picker_offered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let picker_offered_for_ipc = picker_offered.clone();
+    let host_for_ipc = host_conn;
+    let proxy_for_bots = proxy.clone();
     let shared_for_ipc = shared.clone();
     let shared_for_events = shared.clone();
     let (ask_tx, mut ask_rx) =
@@ -958,7 +1025,10 @@ fn run_gui_inner(serve: Option<crate::server::ServeConfig>) {
             // triggers a handful of asset requests, so the per-request
             // FS scan stays well under the human-perceptible threshold.
             if let Some(rest) = req_path.strip_prefix("/gui-shell/") {
-                let registry = crate::gui_shell::ShellRegistry::new();
+                let registry = match active_bot_dir() {
+                    Some(dir) => crate::gui_shell::ShellRegistry::new_in(&dir),
+                    None => crate::gui_shell::ShellRegistry::new(),
+                };
                 return serve_gui_shell_asset(&registry, rest);
             }
 
@@ -984,7 +1054,18 @@ fn run_gui_inner(serve: Option<crate::server::ServeConfig>) {
                 // hosted workspaces but rendered broken thumbnails in the
                 // desktop GUI.
                 let abs_first = format!("/{decoded}");
+                // Under a host a relative path is relative to the bot's
+                // folder, not the shelf; the shelf never holds a bot's
+                // `images/…`, so it is tried last rather than first.
+                let in_bot = active_bot_dir()
+                    .map(|dir| dir.join(&decoded).to_string_lossy().into_owned());
                 let resolved = crate::sandbox::Sandbox::check(&abs_first)
+                    .or_else(|e| match &in_bot {
+                        Some(p) if std::path::Path::new(p).is_file() => {
+                            crate::sandbox::Sandbox::check(p)
+                        }
+                        _ => Err(e),
+                    })
                     .or_else(|_| crate::sandbox::Sandbox::check(&decoded));
                 // HTTP Range support — <video>/<audio> in shells stream large
                 // media (a chapter mp4 is tens of MB); without 206 responses
@@ -1075,6 +1156,222 @@ fn run_gui_inner(serve: Option<crate::server::ServeConfig>) {
         .with_devtools(devtools_on)
         .with_ipc_handler(move |req| {
             let body = req.body();
+            // dev-plan/59 §7.6 step 3: in host mode every frame belongs to a
+            // bot. Forwarded verbatim — the host does not parse the protocol,
+            // and a frame it does not recognise is an agent frame, which is
+            // the safe direction to guess.
+            if let Some((host_addr, host_token)) = &host_for_ipc {
+                // Two frames belong to the window, not to any bot: which bots
+                // exist, and which one to talk to. Everything else is an agent
+                // frame and goes through verbatim.
+                let parsed: serde_json::Value =
+                    serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+                let kind = parsed.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                // The folder picker is the window's, as it always was: a bot's
+                // `--serve` has no dialog to open, and a bot changing ITS cwd
+                // is not what "open another workspace" means. A pick inside
+                // this workspace dismisses the picker; any other folder is
+                // handed to a fresh process, which opens it the way a launch
+                // there would — as a host if it is (or upgrades to) v3, as
+                // the classic window otherwise.
+                // `get_cwd` is the page's first frame, and its "no reply in
+                // 3s" check reads silence as a broken bridge. Forwarded, it
+                // waited inside the host until the bot finished starting,
+                // which on a release build with a GUI shell took longer than
+                // that, so the window opened on "couldn't reach its backend".
+                // The window knows the answer, so it gives it at once.
+                if kind == "get_cwd" {
+                    let slug = bridge_for_ipc
+                        .lock()
+                        .ok()
+                        .and_then(|b| b.as_ref().map(|b| b.slug.clone()))
+                        .unwrap_or_default();
+                    let root = host_root_for_ipc.clone().unwrap_or_default();
+                    let dir = crate::bots::bot_dir(&root, &slug);
+                    let initial_tab = std::fs::read_to_string(dir.join(".thclaws/settings.json"))
+                        .ok()
+                        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                        .and_then(|v| v.get("guiShell").cloned())
+                        .and_then(|g| {
+                            serde_json::from_value::<crate::config::GuiShellSetting>(g).ok()
+                        })
+                        .and_then(|g| g.tab_default().map(|_| "ui"));
+                    // Offered until the user ANSWERS it, not just once: the
+                    // page renders a lone app first and swaps in one tree
+                    // per bot when the list arrives. Marking "offered" on the
+                    // first ask gave the picker to the tree that was about to
+                    // be replaced, and the tree that stayed opened without it.
+                    let first = !picker_offered_for_ipc.load(std::sync::atomic::Ordering::SeqCst);
+                    let _ = proxy_for_bots.send_event(UserEvent::Dispatch(
+                        serde_json::json!({
+                            "type": "current_cwd",
+                            "path": dir.to_string_lossy(),
+                            "needs_modal": first,
+                            "recent_dirs": crate::recent_dirs::load_recent_dirs(),
+                            "initial_tab": initial_tab,
+                        })
+                        .to_string(),
+                    ));
+                    return;
+                }
+                if kind == "pick_directory" {
+                    let start_dir = parsed
+                        .get("start")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                        .unwrap_or_else(|| {
+                            std::env::current_dir()
+                                .map(|p| p.to_string_lossy().to_string())
+                                .unwrap_or_else(|_| ".".into())
+                        });
+                    let picked = pick_directory_native(&start_dir, "Select working directory");
+                    let _ = proxy_for_bots.send_event(UserEvent::Dispatch(
+                        serde_json::json!({ "type": "directory_picked", "path": picked })
+                            .to_string(),
+                    ));
+                    return;
+                }
+                if kind == "set_cwd" {
+                    let path = parsed
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let target = std::path::Path::new(&path);
+                    let inside = host_root_for_ipc.as_ref().is_some_and(|root| {
+                        let canon = |p: &std::path::Path| {
+                            p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
+                        };
+                        canon(target).starts_with(canon(root))
+                    });
+                    let reply = if inside {
+                        // Answered: other bots' trees open without it now.
+                        picker_offered_for_ipc.store(true, std::sync::atomic::Ordering::SeqCst);
+                        serde_json::json!({ "type": "cwd_changed", "path": path, "ok": true })
+                    } else if target.is_dir() {
+                        crate::recent_dirs::save_recent_dir(&path);
+                        match std::env::set_current_dir(target) {
+                            Ok(()) => {
+                                eprintln!(
+                                    "\x1b[36m[thclaws] opening workspace {} — restarting\x1b[0m",
+                                    target.display()
+                                );
+                                let _ = proxy_for_bots.send_event(UserEvent::ReloadRequested);
+                                return;
+                            }
+                            Err(e) => serde_json::json!({
+                                "type": "cwd_changed", "path": path, "ok": false,
+                                "error": format!("cannot enter '{path}': {e}"),
+                            }),
+                        }
+                    } else {
+                        serde_json::json!({
+                            "type": "cwd_changed", "path": path, "ok": false,
+                            "error": format!("'{path}' is not a valid directory"),
+                        })
+                    };
+                    let _ = proxy_for_bots.send_event(UserEvent::Dispatch(reply.to_string()));
+                    return;
+                }
+                if kind == "bots_list" {
+                    let (addr, token) = (*host_addr, host_token.clone());
+                    let active = bridge_for_ipc
+                        .lock()
+                        .ok()
+                        .and_then(|b| b.as_ref().map(|b| b.slug.clone()))
+                        .unwrap_or_default();
+                    let proxy_list = proxy_for_bots.clone();
+                    tokio::spawn(async move {
+                        let payload = crate::bots::desktop::list_frame(addr, &token, &active).await;
+                        let _ = proxy_list.send_event(UserEvent::Dispatch(payload));
+                    });
+                    return;
+                }
+                if matches!(kind, "bots_add" | "bots_remove" | "bots_restart") {
+                    // Host mutations from the panel. Over the bridge rather
+                    // than `fetch`, because the page's `/bots` fetch would go
+                    // to the `thclaws://` protocol handler, which serves files,
+                    // not the host. The answer is one frame, then a fresh list
+                    // so the rail catches up without a poll.
+                    let (addr, token) = (*host_addr, host_token.clone());
+                    let slug = parsed
+                        .get("slug")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let purge = parsed.get("purge").and_then(|b| b.as_bool()).unwrap_or(false);
+                    let blank = parsed.get("blank").and_then(|b| b.as_bool()).unwrap_or(false);
+                    let (method, path, body) = match kind {
+                        "bots_add" => (
+                            "POST",
+                            "/bots".to_string(),
+                            Some(serde_json::json!({ "slug": slug, "blank": blank })),
+                        ),
+                        "bots_remove" => (
+                            "DELETE",
+                            format!(
+                                "/bots/{}?purge={purge}",
+                                urlencoding::encode(&slug)
+                            ),
+                            None,
+                        ),
+                        _ => (
+                            "POST",
+                            format!("/bots/{}/restart", urlencoding::encode(&slug)),
+                            None,
+                        ),
+                    };
+                    let active = bridge_for_ipc
+                        .lock()
+                        .ok()
+                        .and_then(|b| b.as_ref().map(|b| b.slug.clone()))
+                        .unwrap_or_default();
+                    let proxy_act = proxy_for_bots.clone();
+                    tokio::spawn(async move {
+                        let result =
+                            crate::bots::desktop::action_frame(addr, &token, method, &path, body)
+                                .await;
+                        let _ = proxy_act.send_event(UserEvent::Dispatch(result));
+                        let list = crate::bots::desktop::list_frame(addr, &token, &active).await;
+                        let _ = proxy_act.send_event(UserEvent::Dispatch(list));
+                    });
+                    return;
+                }
+                if kind == "bot_switch" {
+                    let slug = parsed
+                        .get("slug")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    if !slug.is_empty() {
+                        let (addr, token) = (*host_addr, host_token.clone());
+                        let proxy_for_bot = proxy_for_bots.clone();
+                        let link = crate::bots::desktop::connect(
+                            addr,
+                            token,
+                            slug.clone(),
+                            move |frame| {
+                                let _ = proxy_for_bot.send_event(UserEvent::Dispatch(frame));
+                            },
+                        );
+                        // Dropping the old bridge closes its socket, so the
+                        // bot we left keeps running but stops streaming here.
+                        if let Ok(mut cur) = bridge_for_ipc.lock() {
+                            *cur = Some(link);
+                        }
+                        let _ = proxy_for_bots.send_event(UserEvent::Dispatch(
+                            serde_json::json!({"type": "bot_switched", "slug": slug}).to_string(),
+                        ));
+                    }
+                    return;
+                }
+                if let Ok(link) = bridge_for_ipc.lock() {
+                    if let Some(bridge) = link.as_ref() {
+                        bridge.send(body.to_string());
+                    }
+                }
+                return;
+            }
             let Ok(msg) = serde_json::from_str::<serde_json::Value>(body) else {
                 return;
             };
@@ -1118,6 +1415,28 @@ fn run_gui_inner(serve: Option<crate::server::ServeConfig>) {
                     on_zoom,
                     workflow_approver: shared_for_ipc.workflow_approver.clone(),
                 };
+                // dev-plan/59: a folder picked at startup that is a multi-bot
+                // workspace — or a v2 agent this app would upgrade — is not
+                // something the in-process engine can be pointed at: it
+                // would load the migration tombstone as its instructions.
+                // Such a pick restarts the app there, and the launch path
+                // does what it does for any folder.
+                if msg.get("type").and_then(|t| t.as_str()) == Some("set_cwd") {
+                    if let Some(path) = msg.get("path").and_then(|v| v.as_str()) {
+                        let target = std::path::Path::new(path);
+                        if target.is_dir() && crate::bots::migrate::opens_as_host(target) {
+                            crate::recent_dirs::save_recent_dir(path);
+                            if std::env::set_current_dir(target).is_ok() {
+                                eprintln!(
+                                    "\x1b[36m[thclaws] opening workspace {} — restarting\x1b[0m",
+                                    target.display()
+                                );
+                                let _ = proxy_for_bots.send_event(UserEvent::ReloadRequested);
+                                return;
+                            }
+                        }
+                    }
+                }
                 if crate::ipc::handle_ipc(msg.clone(), &ipc_ctx) {
                     return;
                 }

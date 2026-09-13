@@ -1050,6 +1050,39 @@ pub fn collect_mcp_instructions(clients: &[Arc<McpClient>]) -> Vec<(String, Stri
         .collect()
 }
 
+/// Browser MCP tools hidden from the MODEL's tool registry.
+///
+/// `@playwright/mcp --caps=vision` advertises 30 tools — ~21 KB of JSON
+/// schema, or roughly 5,400 tokens attached to EVERY request for as long as
+/// the browser is enabled, whether or not the turn touches a page. Most of
+/// that surface is not for the model:
+///
+/// - `browser_mouse_*` exist for the Browser tab's human takeover. That path
+///   calls the MCP client DIRECTLY from `ipc.rs` (`browser_input_call`), and
+///   `call_tool` does not consult this list, so hiding them from the model
+///   costs the takeover nothing.
+/// - `browser_close` / `browser_resize` fight the engine, which owns the
+///   Chromium lifecycle and the viewport (`--viewport-size`).
+/// - `browser_run_code_unsafe` is, by its own description, "Unsafe: executes
+///   arbitrary code" — in a browser carrying the user's live cookies, under a
+///   default `permissions: "auto"` that approves every call without asking.
+///   `browser_evaluate` covers the legitimate uses at page scope.
+/// - `browser_drop` is a drag-and-drop file gesture with no agent workflow.
+///
+/// Escape hatch: `THCLAWS_BROWSER_ALL_TOOLS=1` registers the raw list.
+const BROWSER_MODEL_HIDDEN_TOOLS: &[&str] = &[
+    "browser_mouse_move_xy",
+    "browser_mouse_click_xy",
+    "browser_mouse_drag_xy",
+    "browser_mouse_down",
+    "browser_mouse_up",
+    "browser_mouse_wheel",
+    "browser_run_code_unsafe",
+    "browser_close",
+    "browser_resize",
+    "browser_drop",
+];
+
 impl McpClient {
     /// Send a JSON-RPC request and wait for the matching response.
     pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
@@ -1192,6 +1225,15 @@ impl McpClient {
                 ui_resource_uri,
             });
         }
+        // Trim the browser server's model-facing surface. Done HERE, the one
+        // place tool lists are produced, so all six registration sites get it
+        // and `call_tool` — which takes a name and never reads this list —
+        // keeps working for the takeover path in `ipc.rs`.
+        if self.name() == "browser"
+            && std::env::var("THCLAWS_BROWSER_ALL_TOOLS").ok().as_deref() != Some("1")
+        {
+            out.retain(|t| !BROWSER_MODEL_HIDDEN_TOOLS.contains(&t.name.as_str()));
+        }
         Ok(out)
     }
 
@@ -1323,17 +1365,64 @@ fn handle_incoming(msg: Value, pending: &Pending) {
     let _ = tx.send(result);
 }
 
+/// Per-result cap on TEXT forwarded to the model.
+///
+/// Images were capped from the start; text never was. That asymmetry made the
+/// cheapest-LOOKING path the only unbounded one: `WebFetch` truncates at 100 KB
+/// a section, while one `browser_snapshot` of a heavy page hands the whole
+/// accessibility tree to the model with nothing in the way. 256 KB is generous
+/// for a real answer and still bounds the blast radius of a single page.
+///
+/// Override with `THCLAWS_MCP_MAX_TEXT_BYTES` (0 disables the cap).
+const MAX_MCP_TEXT_BYTES: usize = 256 * 1024;
+
+fn mcp_text_budget() -> usize {
+    std::env::var("THCLAWS_MCP_MAX_TEXT_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(MAX_MCP_TEXT_BYTES)
+}
+
+/// Truncate on a UTF-8 boundary, saying what was dropped so the model can
+/// narrow its next call instead of assuming it saw the whole page.
+fn cap_mcp_text(text: String) -> String {
+    let budget = mcp_text_budget();
+    if budget == 0 || text.len() <= budget {
+        return text;
+    }
+    cap_mcp_text_to(&text, budget)
+}
+
+/// `cap_mcp_text` with the budget supplied by the caller, for the multimodal
+/// path where several blocks share one allowance.
+fn cap_mcp_text_to(text: &str, budget: usize) -> String {
+    let mut end = budget;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n\n... [truncated at {} KB of {} KB. Narrow the result — `browser_find` \
+         searches the page and returns only matches, where `browser_snapshot` returns \
+         all of it]",
+        &text[..end],
+        budget / 1024,
+        text.len() / 1024
+    )
+}
+
 /// Pull text out of a `tools/call` result. MCP tool results are an array of
 /// content blocks; we concatenate all `{type: "text"}` parts.
 fn extract_text(result: &Value) -> String {
     let Some(content) = result.get("content").and_then(Value::as_array) else {
         return String::new();
     };
-    content
-        .iter()
-        .filter_map(|c| c.get("text").and_then(Value::as_str).map(String::from))
-        .collect::<Vec<_>>()
-        .join("\n")
+    cap_mcp_text(
+        content
+            .iter()
+            .filter_map(|c| c.get("text").and_then(Value::as_str).map(String::from))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
 }
 
 /// Per-result cap on image payload forwarded to the model. Same value
@@ -1358,13 +1447,25 @@ fn mcp_content_to_blocks(result: &Value) -> Option<crate::types::ToolResultConte
     }
     let mut blocks: Vec<ToolResultBlock> = Vec::new();
     let mut image_budget = MAX_MCP_IMAGE_BYTES;
+    // Text is budgeted across the whole result, not per block — otherwise a
+    // screenshot with a full snapshot stapled to it slips the cap that
+    // `extract_text` applies on the text-only path.
+    let mut text_budget = mcp_text_budget();
     for b in content {
         match b.get("type").and_then(Value::as_str) {
             Some("text") => {
                 if let Some(t) = b.get("text").and_then(Value::as_str) {
-                    blocks.push(ToolResultBlock::Text {
-                        text: t.to_string(),
-                    });
+                    let t = if text_budget == 0 {
+                        t.to_string()
+                    } else if t.len() <= text_budget {
+                        text_budget -= t.len();
+                        t.to_string()
+                    } else {
+                        let capped = cap_mcp_text_to(t, text_budget);
+                        text_budget = 0;
+                        capped
+                    };
+                    blocks.push(ToolResultBlock::Text { text: t });
                 }
             }
             Some("image") => {
@@ -2230,12 +2331,101 @@ mod tests {
         };
 
         let err = McpClient::spawn(cfg).await.unwrap_err().to_string();
-        assert!(err.contains("transport closed"), "got: {err}");
+        // WHICH mcp-layer error surfaces is a race, not a contract: if the
+        // reader notices the dead child first, the handshake fails as "mcp
+        // transport closed"; if the write wins, it fails as "mcp write:
+        // Broken pipe". Linux loses that race nearly always and macOS nearly
+        // never, so pinning the macOS spelling here shipped a CI that could
+        // only ever be red — the test job runs on ubuntu alone, so this never
+        // passed there once. Assert the framing, not the winner.
+        assert!(err.contains("mcp"), "not reported as an mcp failure: {err}");
+        // What the test is actually about, and what holds down either path:
+        // the launcher's own stderr and the command that fixes it reach the
+        // user instead of being swallowed with the child.
         assert!(err.contains("ENOTEMPTY"), "stderr tail missing: {err}");
         assert!(
             err.contains("rm -rf /home/u/.npm/_npx/9833c18b2d85bc59"),
             "fix hint missing: {err}"
         );
+    }
+
+    /// The takeover in `ipc.rs` reaches the mouse tools through
+    /// `call_tool`, which takes a name and never consults `list_tools`.
+    /// Hiding them from the model must therefore leave that path intact —
+    /// so the list this filter uses has to stay a SUBSET of what the
+    /// takeover is allowed to call, never the other way round.
+    #[test]
+    fn hidden_browser_tools_do_not_break_the_takeover_path() {
+        // Mirrors ipc.rs `browser_input_call` ALLOWED.
+        const TAKEOVER_ALLOWED: &[&str] = &[
+            "browser_mouse_click_xy",
+            "browser_mouse_move_xy",
+            "browser_mouse_drag_xy",
+            "browser_mouse_down",
+            "browser_mouse_up",
+            "browser_mouse_wheel",
+            "browser_press_key",
+            "browser_navigate",
+            "browser_navigate_back",
+        ];
+        // Every mouse tool the takeover uses is hidden from the model...
+        for t in TAKEOVER_ALLOWED.iter().filter(|t| t.contains("mouse")) {
+            assert!(
+                BROWSER_MODEL_HIDDEN_TOOLS.contains(t),
+                "{t} is a takeover-only tool and should not cost the model schema"
+            );
+        }
+        // ...and nothing the MODEL still needs to drive a page got hidden.
+        for t in [
+            "browser_navigate",
+            "browser_navigate_back",
+            "browser_press_key",
+            "browser_snapshot",
+            "browser_find",
+            "browser_click",
+            "browser_type",
+            "browser_fill_form",
+            "browser_select_option",
+            "browser_take_screenshot",
+            "browser_wait_for",
+        ] {
+            assert!(
+                !BROWSER_MODEL_HIDDEN_TOOLS.contains(&t),
+                "{t} is how the model drives a page — it must stay registered"
+            );
+        }
+    }
+
+    /// Text was the one unbounded thing in a tool result: images were
+    /// capped from the start, so a single `browser_snapshot` of a heavy
+    /// page could hand the model the whole accessibility tree.
+    #[test]
+    fn oversize_mcp_text_is_truncated_on_a_char_boundary() {
+        let _g = crate::kms::test_env_lock();
+        std::env::set_var("THCLAWS_MCP_MAX_TEXT_BYTES", "64");
+        // Multi-byte on purpose: a naive slice at 64 would split the Thai
+        // characters and panic.
+        let big = "ก".repeat(200);
+        let out = cap_mcp_text(big.clone());
+        std::env::remove_var("THCLAWS_MCP_MAX_TEXT_BYTES");
+
+        assert!(out.len() < big.len(), "oversize text must shrink");
+        assert!(out.contains("truncated at"), "must say it truncated: {out}");
+        // Points at the cheaper tool rather than leaving the model to guess.
+        assert!(out.contains("browser_find"), "must name the narrower tool");
+        assert!(
+            out.starts_with('\u{e01}'),
+            "kept prefix must still be valid text"
+        );
+    }
+
+    /// A cap that fires on short results would break every ordinary tool.
+    #[test]
+    fn normal_mcp_text_passes_through_untouched() {
+        let _g = crate::kms::test_env_lock();
+        std::env::remove_var("THCLAWS_MCP_MAX_TEXT_BYTES");
+        let text = "a short tool result".to_string();
+        assert_eq!(cap_mcp_text(text.clone()), text);
     }
 
     #[test]

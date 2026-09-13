@@ -332,16 +332,53 @@ pub(crate) fn services_prompt_section(browser_active: bool) -> String {
     // only for things you genuinely have to *see*.
     if browser_active {
         bullets.push(
-            "**Browser automation** (Playwright tools active). When you need to \
-             READ or EXTRACT content from a page — translating headlines, \
-             scraping a list, pulling article text, reading a table — use \
-             `browser_snapshot` as your PRIMARY source. It returns the page's \
-             actual text / accessibility tree (effectively the source content), \
-             which is more accurate, cheaper, and more reliable than reading \
-             pixels. Use `browser_take_screenshot` ONLY as a fallback — when the \
-             answer isn't in the snapshot: charts, canvases, image-embedded \
-             text, or layout you must visually see. Do NOT default to \
-             screenshots for text you could read from the snapshot."
+            "**Browser automation** (Playwright tools active). Read pages as \
+             TEXT, and read as little of it as the question needs. In cost order, \
+             cheapest first:\n\
+             - `browser_find` — searches the page and returns only what matches. \
+             Reach for this FIRST whenever you know what you are looking for: a \
+             price, a status, one row of a table, whether a word is present.\n\
+             - `browser_snapshot` — the page's full text / accessibility tree. \
+             Correct for orienting yourself on a page you have not seen. It is \
+             the largest thing you can put in context, so do not use it as a \
+             reflex after every click — act, then read only what you need to \
+             confirm.\n\
+             **A snapshot is not the page.** It is an accessibility tree, and \
+             product grids, cards and other list content frequently do not \
+             appear in it even though they are plainly on screen. It is also the \
+             result most likely to be truncated, leaving you looking at a small \
+             percentage of it. So NEVER report that something is absent on the \
+             strength of a snapshot or a `browser_find` that came back empty — \
+             confirm with `browser_evaluate` against the live DOM first. \
+             Answering \"there is no X here\" when X is on the user's screen is \
+             worse than any number of extra tool calls.\n\
+             - `browser_evaluate` — runs JavaScript against the real DOM and \
+             returns the value. When you know the shape of the page, this is by \
+             far the cheapest way to read it: \
+             `() => document.querySelector('.price').textContent` costs a few \
+             tokens where a snapshot costs thousands. It is also the only way to \
+             read things the accessibility tree does not carry — a `data-` \
+             attribute, an input's live `value`, computed style, element counts, \
+             or the shape of a JSON blob the page already fetched. Prefer \
+             returning ONE small extracted value over dumping `innerHTML`.\n\
+             - `browser_take_screenshot` — pixels, and a LAST resort. Only when \
+             the answer cannot be text: charts, canvases, text baked into an \
+             image, or a layout you must visually judge. Never screenshot to \
+             read text that a snapshot would have given you.\n\
+             Interact by the refs a snapshot or find returns (`browser_click`, \
+             `browser_type`, `browser_fill_form`, `browser_select_option`) — \
+             `browser_fill_form` fills a whole form in one call, so prefer it \
+             over a chain of per-field types. After an action that navigates or \
+             submits, `browser_wait_for` the text you expect rather than \
+             snapshotting repeatedly to poll.\n\
+             A good loop is: `browser_find` or `browser_evaluate` to locate what \
+             you need \u{2192} act on it \u{2192} `browser_wait_for` the change you \
+             expect. Reach for a full `browser_snapshot` when you are lost or \
+             genuinely need the whole page, not between every step. For listings \
+             — search results, product grids, tables of rows — go straight to \
+             `browser_evaluate` with a `querySelectorAll` and return just the \
+             fields you need; it is both the cheapest and the only one that sees \
+             what the page actually rendered."
                 .to_string(),
         );
     }
@@ -784,6 +821,43 @@ mod tests {
     /// briefing — the model treats the placeholder as an unfilled template
     /// and asks the user to "send the real number", which the un-masker then
     /// rewrites into a sentence claiming the real number is a placeholder.
+    /// The browser section is the only steering the model gets on how to
+    /// read a page, and the whole cost profile turns on it: a screenshot
+    /// is the most expensive and least accurate way to read text, while
+    /// `browser_find` / `browser_evaluate` are orders of magnitude
+    /// cheaper than dumping a snapshot. The section named neither of the
+    /// cheap two until v0.126 — the model reached for snapshot-then-
+    /// screenshot because nothing told it otherwise.
+    #[test]
+    fn browser_section_ranks_the_cheap_readers_above_screenshots() {
+        let s = services_prompt_section(true);
+        for tool in [
+            "browser_find",
+            "browser_evaluate",
+            "browser_snapshot",
+            "browser_take_screenshot",
+            "browser_fill_form",
+            "browser_wait_for",
+        ] {
+            assert!(s.contains(tool), "browser section must name {tool}");
+        }
+        // Cost order has to survive an edit: cheapest named first, pixels last.
+        let at = |t: &str| s.find(t).expect("named above");
+        assert!(
+            at("browser_find") < at("browser_snapshot"),
+            "find must be offered before snapshot"
+        );
+        assert!(
+            at("browser_snapshot") < at("browser_take_screenshot"),
+            "screenshots must come last"
+        );
+        // And nothing steers toward the tool we hide from the registry.
+        assert!(
+            !s.contains("browser_run_code_unsafe"),
+            "must not advertise a tool the model cannot see"
+        );
+    }
+
     #[test]
     fn masking_briefs_the_model_only_while_armed() {
         let _pin = crate::sensitive::pin_for_test();

@@ -18,6 +18,15 @@ pub const STRIP_PREFIXES: &[&str] = &[
     // chromium profile (cookies/tokens must NEVER ride along). Authored
     // workflow scripts live in `.thclaws/agent_workflow/` and are kept.
     ".thclaws/state/",
+    // dev-plan/59: installed bots live at `.thclaws/bots/<slug>/`, each a
+    // complete agent folder with its OWN `.thclaws/state/` — sessions, KMS,
+    // and a chromium profile holding real logins. Matching here is
+    // root-anchored, so a nested `.thclaws/bots/x/.thclaws/state/…` does not
+    // match the rule above; without this entry the whole shelf would be
+    // packed into a published agent and uploaded. Stripped whole rather than
+    // per-bot: a published agent carries no other agents, not even their
+    // definitions.
+    ".thclaws/bots/",
     // Hosted runners put the engine's $HOME on the workspace PVC under
     // `.home/` so `/schedule` and friends survive a pause. It is mounted
     // into the pod at /home/thclaws, but the PVC is also mounted whole
@@ -334,6 +343,29 @@ pub fn unpack(bytes: &[u8], target: &Path, force: bool) -> Result<Vec<PathBuf>, 
             return Err(format!("refused unsafe entry path: {}", path.display()));
         }
         let out = canonical_target.join(&path);
+        // Entry type, before anything tries to open `out` as a file. A tar
+        // may carry directory entries (`./`, `.thclaws/`) — every agent
+        // published through a packer that walks directories does, including
+        // the first-party `hello-world` — and `File::create` on one fails with
+        // "Is a directory", leaving the install half-extracted. Found by
+        // installing a real catalogue agent, not by reading this.
+        let kind = entry.header().entry_type();
+        if kind.is_dir() {
+            std::fs::create_dir_all(&out).map_err(|e| format!("mkdir {}: {}", out.display(), e))?;
+            continue;
+        }
+        if !kind.is_file() {
+            // Symlinks and hardlinks are the interesting ones: their target
+            // lives in the header, not the body, so the path checks above
+            // never see it. Nothing this packer produces has them
+            // (`follow_symlinks(false)` plus explicit `append_data`), so an
+            // archive that does is not one of ours.
+            return Err(format!(
+                "refused non-regular archive entry {} ({:?})",
+                path.display(),
+                kind
+            ));
+        }
         if let Some(parent) = out.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
@@ -366,9 +398,131 @@ fn ensure_write<W: Write>(w: W) -> W {
 }
 
 #[cfg(test)]
+mod unpack_tests {
+    use super::unpack;
+    use std::io::Write;
+
+    /// Build a tarball the way a directory-walking packer does: a `./` entry,
+    /// directory entries, then the files. Every first-party agent published
+    /// that way — `hello-world` among them — looks like this.
+    fn tar_with_dir_entries() -> Vec<u8> {
+        let mut tar = tar::Builder::new(Vec::new());
+        for dir in ["./", "./.thclaws/", "./.thclaws/skills/"] {
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Directory);
+            h.set_size(0);
+            h.set_mode(0o755);
+            h.set_cksum();
+            tar.append_data(&mut h, dir, std::io::empty()).unwrap();
+        }
+        for (name, body) in [
+            ("./AGENTS.md", "# hello\n"),
+            ("./.thclaws/settings.json", "{}"),
+            ("./.thclaws/skills/a.md", "skill"),
+        ] {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(body.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            tar.append_data(&mut h, name, body.as_bytes()).unwrap();
+        }
+        let raw = tar.into_inner().unwrap();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&raw).unwrap();
+        gz.finish().unwrap()
+    }
+
+    /// `/cloud get hello-world` failed with "create …/./: Is a directory" —
+    /// `unpack` called `File::create` on every entry without looking at its
+    /// type, so any archive carrying directory entries was un-installable.
+    #[test]
+    fn extracts_an_archive_that_carries_directory_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = unpack(&tar_with_dir_entries(), dir.path(), true).expect("extracts");
+        assert_eq!(files.len(), 3, "directories are not counted as files");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap(),
+            "# hello\n"
+        );
+        assert!(dir.path().join(".thclaws/skills/a.md").is_file());
+        // Re-running over the same folder is what an update does.
+        unpack(&tar_with_dir_entries(), dir.path(), true).expect("re-extracts");
+    }
+
+    /// A symlink's target lives in the header, not the body, so the path
+    /// checks never see it. This packer never emits one.
+    #[test]
+    fn refuses_a_symlink_entry() {
+        let mut tar = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Symlink);
+        h.set_size(0);
+        h.set_cksum();
+        tar.append_link(&mut h, "escape", "/etc/passwd").unwrap();
+        let raw = tar.into_inner().unwrap();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&raw).unwrap();
+        let bytes = gz.finish().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let err = unpack(&bytes, dir.path(), true).unwrap_err();
+        assert!(err.contains("non-regular"), "{err}");
+        assert!(!dir.path().join("escape").exists());
+    }
+}
+
+#[cfg(test)]
 mod strip_tests {
     use super::is_strippable;
     use std::path::Path;
+
+    /// dev-plan/59: a workspace may hold installed bots at
+    /// `.thclaws/bots/<slug>/`, each a complete agent folder with its own
+    /// `.thclaws/state/` — sessions, KMS, and a chromium profile holding
+    /// real logins.
+    ///
+    /// `is_strippable` matches by root-anchored prefix, so a nested
+    /// `.thclaws/bots/x/.thclaws/state/…` does NOT match `.thclaws/state/`.
+    /// Without a rule of its own the whole shelf would be packed into a
+    /// published agent and uploaded to the catalogue — every bot's cookies
+    /// with it. A published agent carries no other agents, not even their
+    /// definitions, so the shelf is stripped whole.
+    #[test]
+    fn strips_the_whole_bot_shelf_so_a_publish_never_carries_another_agent() {
+        for p in [
+            // The reason this rule exists: a sibling bot's live cookie jar.
+            ".thclaws/bots/research/.thclaws/state/browser-profile/Cookies",
+            ".thclaws/bots/research/.thclaws/state/sessions/sess-1.jsonl",
+            ".thclaws/bots/research/.thclaws/state/kms/vault/note.md",
+            // Definitions too — an agent does not ship other agents.
+            ".thclaws/bots/research/.thclaws/settings.json",
+            ".thclaws/bots/research/AGENTS.md",
+            ".thclaws/bots/book-author/manifest.json",
+            // The host's own agent after the v3 migration.
+            ".thclaws/bots/main/.thclaws/state/browser-profile/Cookies",
+        ] {
+            assert!(is_strippable(Path::new(p)), "should strip {p}");
+        }
+        // A file that merely mentions bots is not the shelf.
+        for p in ["bots/README.md", "docs/bots.md", ".thclaws/agents/bots.md"] {
+            assert!(!is_strippable(Path::new(p)), "should keep {p}");
+        }
+    }
+
+    /// dev-plan/59 §5.5: a bot's `$HOME` is `<bot>/.home/`, so when the BOT
+    /// itself is published — root is the bot folder, and `.thclaws/bots/`
+    /// never matches — the `.home/` rule is the only thing standing between a
+    /// publish and the bot's gui-shell tokens and provider config.
+    #[test]
+    fn a_bot_publishing_itself_does_not_ship_its_own_home() {
+        for p in [
+            ".home/.config/thclaws/settings.json",
+            ".home/.config/thclaws/schedules.json",
+            ".home/.cache/thclaws/catalogue.json",
+        ] {
+            assert!(is_strippable(Path::new(p)), "should strip {p}");
+        }
+    }
 
     #[test]
     fn strips_runtime_artifacts_that_leaked_into_a_user_publish() {

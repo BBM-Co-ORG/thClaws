@@ -116,6 +116,10 @@ pub mod secrets;
 pub mod sensitive;
 #[cfg(feature = "gui")]
 pub mod server;
+// dev-plan/59: the bot supervisor rides on `--serve` (it spawns children that
+// are `--serve` processes and proxies their sockets), so it shares its gate.
+#[cfg(feature = "gui")]
+pub mod bots;
 pub mod session;
 pub mod shared;
 #[cfg(feature = "gui")]

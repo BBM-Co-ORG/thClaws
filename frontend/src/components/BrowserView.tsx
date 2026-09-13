@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { send, subscribe } from "../hooks/useIPC";
+import { ChatMarkdown } from "./ChatMarkdown";
 
 // docs/browser Phase 1 — the Browser tab for the engine-managed
 // Playwright MCP browser (`browserEnabled` in settings.json).
@@ -44,6 +45,11 @@ type ChatMsg = {
 const MAX_ENTRIES = 200;
 const MAX_CHAT = 80;
 const SHOT_DEBOUNCE_MS = 1000;
+// Ceiling on how often a screencast frame is painted. Chromium emits a frame
+// per paint, which during an agent run is far more than a human can read; each
+// one is a base64 data: URL swap, so the cost is ours, not the browser's.
+// ~12 fps still reads as live and leaves the render thread alone.
+const FRAME_MIN_INTERVAL_MS = 80;
 
 function shorten(s: string, n: number): string {
   return s.length > n ? s.slice(0, n) + "…" : s;
@@ -76,6 +82,10 @@ export function BrowserView({ active }: { active: boolean }) {
   const chatRef = useRef<HTMLDivElement | null>(null);
   const activeRef = useRef(active);
   const shotTimer = useRef<number | null>(null);
+  const lastFrameAt = useRef(0);
+  // Proof that Chromium is already running, so the screencast can attach
+  // without being the thing that launches it.
+  const [browserUp, setBrowserUp] = useState(false);
   // Browser activity that happened while the tab was hidden — capture
   // one fresh screenshot when the user comes back.
   const staleShot = useRef(false);
@@ -112,25 +122,110 @@ export function BrowserView({ active }: { active: boolean }) {
     return { x: Math.round(x), y: Math.round(y) };
   }
 
-  function onShotClick(e: React.MouseEvent<HTMLImageElement>) {
-    if (!takeover) return;
+  // Takeover relays the pointer itself — press, every move with the
+  // button held, release — so a drag is the user's own drag, with its
+  // own path and timing. A slider CAPTCHA is exactly that, and the
+  // click this used to send could never move one. A click is the same
+  // gesture with no movement between press and release.
+  //
+  // Live (engine-owned Chromium): straight over CDP, moves coalesced to
+  // one per animation frame, hovers included so pages that watch the
+  // pointer before a click see it arrive.
+  //
+  // Screenshot mode (playwright-mcp's own browser): the same gesture as
+  // `browser_mouse_move_xy` / `_down` / `_up` tool calls, one at a time
+  // in order — a call takes tens of milliseconds, and a release that
+  // overtook the last move would end the drag short — with queued moves
+  // collapsed to the latest position.
+  const dragging = useRef(false);
+  const mcpQueue = useRef<{ tool: string; args: Record<string, unknown> }[]>([]);
+  const mcpInFlight = useRef(false);
+  function pumpMcp() {
+    if (mcpInFlight.current) return;
+    const next = mcpQueue.current.shift();
+    if (!next) return;
+    mcpInFlight.current = true;
+    sendInput(next.tool, next.args);
+  }
+  function enqueueMcp(tool: string, args: Record<string, unknown>) {
+    const q = mcpQueue.current;
+    const last = q[q.length - 1];
+    if (tool === "browser_mouse_move_xy" && last?.tool === tool) q[q.length - 1] = { tool, args };
+    else q.push({ tool, args });
+    pumpMcp();
+  }
+  const mcpInFlightRef = mcpInFlight;
+  const pumpMcpRef = useRef(pumpMcp);
+  pumpMcpRef.current = pumpMcp;
+  function mcpMove(pt: { x: number; y: number }) {
+    enqueueMcp("browser_mouse_move_xy", { element: "user takeover pointer", x: pt.x, y: pt.y });
+  }
+  const pendingMove = useRef<{ x: number; y: number; buttons: number } | null>(null);
+  const moveRaf = useRef<number | null>(null);
+  function flushMove() {
+    moveRaf.current = null;
+    const m = pendingMove.current;
+    pendingMove.current = null;
+    if (m) send({ type: "browser_cdp_input", kind: "move", args: m });
+  }
+  function relayMove(pt: { x: number; y: number }, buttons: number) {
+    pendingMove.current = { x: pt.x, y: pt.y, buttons };
+    if (moveRaf.current === null) moveRaf.current = requestAnimationFrame(flushMove);
+  }
+  function onShotPointerDown(e: React.PointerEvent<HTMLImageElement>) {
+    if (!takeoverRef.current || e.button !== 0) return;
     const pt = imgClickCoords(e);
     if (!pt) return;
-    if (liveRef.current) {
-      send({ type: "browser_cdp_input", kind: "click", args: { x: pt.x, y: pt.y } });
+    e.preventDefault();
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      /* a pointer that is already gone — the gesture still relays */
+    }
+    dragging.current = true;
+    if (!liveRef.current) {
+      mcpMove(pt);
+      enqueueMcp("browser_mouse_down", {});
       return;
     }
-    sendInput("browser_mouse_click_xy", {
-      element: "user takeover click",
-      x: pt.x,
-      y: pt.y,
-    });
+    // The press lands where the pointer already is, as it does for a mouse.
+    if (moveRaf.current !== null) {
+      cancelAnimationFrame(moveRaf.current);
+      flushMove();
+    }
+    send({ type: "browser_cdp_input", kind: "down", args: { x: pt.x, y: pt.y } });
+  }
+  function onShotPointerUp(e: React.PointerEvent<HTMLImageElement>) {
+    if (!dragging.current) return;
+    dragging.current = false;
+    try {
+      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+      }
+    } catch {
+      /* same */
+    }
+    // Wherever the hand let go — clamped, since a drag may run off the image.
+    const pt = imgClickCoords(e) ?? hoverPos.current;
+    if (!liveRef.current) {
+      mcpMove(pt);
+      enqueueMcp("browser_mouse_up", {});
+      return;
+    }
+    if (moveRaf.current !== null) {
+      cancelAnimationFrame(moveRaf.current);
+      flushMove();
+    }
+    send({ type: "browser_cdp_input", kind: "up", args: { x: pt.x, y: pt.y } });
   }
 
-  function onShotMouseMove(e: React.MouseEvent<HTMLImageElement>) {
+  function onShotMouseMove(e: React.PointerEvent<HTMLImageElement>) {
     if (!takeoverRef.current) return;
     const pt = imgClickCoords(e);
-    if (pt) hoverPos.current = pt;
+    if (!pt) return;
+    hoverPos.current = pt;
+    if (liveRef.current) relayMove(pt, dragging.current ? 1 : 0);
+    else if (dragging.current) mcpMove(pt);
   }
 
   // Wheel → remote scroll, throttled by accumulating deltas. Attached
@@ -211,6 +306,11 @@ export function BrowserView({ active }: { active: boolean }) {
         return;
       }
       if (msg.type === "browser_frame" && typeof msg.data === "string") {
+        // Drop frames that arrive inside the interval rather than queueing
+        // them — a stale frame has no value once a newer one exists.
+        const now = Date.now();
+        if (now - lastFrameAt.current < FRAME_MIN_INTERVAL_MS) return;
+        lastFrameAt.current = now;
         setShot({
           src: `data:image/jpeg;base64,${msg.data}`,
           at: new Date().toLocaleTimeString([], { hour12: false }),
@@ -231,9 +331,18 @@ export function BrowserView({ active }: { active: boolean }) {
       }
       if (msg.type === "browser_nav" && typeof msg.url === "string") {
         setPageUrl(msg.url);
+        setBrowserUp(true);
         return;
       }
       if (msg.type === "browser_input_result") {
+        if (
+          typeof msg.tool === "string" &&
+          msg.tool.startsWith("browser_mouse_") &&
+          mcpInFlightRef.current
+        ) {
+          mcpInFlightRef.current = false;
+          pumpMcpRef.current();
+        }
         if (msg.ok) {
           // The page just changed under user input — refresh promptly.
           scheduleShot();
@@ -313,6 +422,9 @@ export function BrowserView({ active }: { active: boolean }) {
         if (!raw.startsWith("browser__")) return;
         const detail = typeof msg.output === "string" ? shorten(msg.output, 300) : "";
         push("result", raw.slice("browser__".length), detail);
+        // A browser tool just returned, so Chromium is up — the screencast
+        // can attach from here without launching anything itself.
+        setBrowserUp(true);
         // The page just (probably) changed — refresh the screenshot.
         scheduleShot();
       }
@@ -374,17 +486,31 @@ export function BrowserView({ active }: { active: boolean }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active]);
 
-  // slice 3: screencast lifecycle — run while takeover is on, the tab
-  // is visible, and the engine owns the browser (status.cdp).
+  // Screencast lifecycle. It used to require takeover, which reserved the
+  // live view for the one case where a HUMAN was driving, while an agent
+  // working the page got the slow path: one `browser_take_screenshot`
+  // debounced 1s behind each tool result, trailing edge only, so a burst of
+  // tool calls left the view frozen until the agent paused. The screencast
+  // rides the engine's own CDP session, so unlike that screenshot — which
+  // shares the one stdio pipe the agent's tool calls use
+  // (`browser_screenshot_get` in ipc.rs) — it costs the agent nothing.
+  //
+  // But it cannot simply key off `status.cdp`: that means the endpoint is
+  // ARMED, not that Chromium is running, and `screencast_start` calls
+  // `ensure_up()`, which launches it. Opening this tab to look around would
+  // then start the heaviest process the engine owns for nothing. So: takeover
+  // still forces it (the user asked, and waiting for Chromium is expected
+  // there), and otherwise it waits for proof the browser is already up — the
+  // first browser tool result or navigation of the session.
   useEffect(() => {
-    const want = takeover && active && Boolean(status?.cdp);
+    const want = active && Boolean(status?.cdp) && (takeover || browserUp);
     if (want && !live) {
       send({ type: "browser_screencast_start" });
     } else if (!want && live) {
       send({ type: "browser_screencast_stop" });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [takeover, active, status?.cdp]);
+  }, [takeover, browserUp, active, status?.cdp]);
 
   useEffect(() => {
     if (active && listRef.current) {
@@ -500,8 +626,10 @@ export function BrowserView({ active }: { active: boolean }) {
                     outline: takeover ? "2px solid var(--accent)" : "none",
                     outlineOffset: -2,
                   }}
-                  onClick={onShotClick}
-                  onMouseMove={onShotMouseMove}
+                  onPointerMove={onShotMouseMove}
+                  onPointerDown={onShotPointerDown}
+                  onPointerUp={onShotPointerUp}
+                  onPointerCancel={onShotPointerUp}
                   draggable={false}
                 />
                 <div
@@ -681,7 +809,9 @@ export function BrowserView({ active }: { active: boolean }) {
           {chat.map((m) => (
             <div
               key={m.id}
-              className="rounded-md px-2 py-1.5 text-[12px] leading-relaxed whitespace-pre-wrap break-words"
+              className={`rounded-md px-2 py-1.5 text-[12px] leading-relaxed break-words${
+                m.role === "assistant" ? "" : " whitespace-pre-wrap"
+              }`}
               style={
                 m.role === "user"
                   ? { background: "var(--accent)", color: "white", alignSelf: "flex-end", maxWidth: "92%" }
@@ -690,7 +820,12 @@ export function BrowserView({ active }: { active: boolean }) {
                     : { background: "var(--bg-primary)", color: "var(--text-primary)", alignSelf: "flex-start", maxWidth: "92%", border: "1px solid var(--border)" }
               }
             >
-              {m.text}
+              {/* Assistant replies go through markdown for the same reason
+                  the Chat tab does it: a table or a **bold** run rendered
+                  raw here reads as literal pipes and asterisks. User and
+                  system lines stay verbatim — one is what the user typed,
+                  the other is log output. */}
+              {m.role === "assistant" ? <ChatMarkdown text={m.text} /> : m.text}
             </div>
           ))}
         </div>

@@ -2547,6 +2547,48 @@ fn redact_consumed_images_from_history(history: &mut Vec<Message>) {
     }
 }
 
+/// How many spill files to keep when a session opens.
+///
+/// These used to live in the system temp dir, where the OS eventually swept
+/// them; moving them inside the workspace so the model can actually READ them
+/// made their lifetime our problem. Three browse sessions left 9 files and
+/// 779 KB behind, on a cloud runner's PVC.
+///
+/// The count is not about disk — at ~87 KB a file, 20 is 1.7 MB and a PVC
+/// will not notice. It is about RESUME: `session.rs` replays stored
+/// `ToolResult` blocks into context, so a resumed session hands the model
+/// truncation footers naming paths from its earlier life. Prune too eagerly
+/// and those paths are dead. One real session produced SEVEN spills, so a
+/// keep-5 rule would have broken it on the first resume.
+const TOOL_OUTPUT_KEEP: usize = 20;
+
+/// Delete all but the newest [`TOOL_OUTPUT_KEEP`] spill files. Called once at
+/// project-open, never mid-session: the current session's own footers must
+/// keep pointing at files that exist.
+pub fn prune_tool_output_dir(thclaws_dir: &std::path::Path) {
+    let dir = thclaws_dir.join("state/tool-output");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return; // never spilled here — nothing to do
+    };
+    let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let m = e.metadata().ok()?;
+            if !m.is_file() {
+                return None;
+            }
+            Some((m.modified().ok()?, e.path()))
+        })
+        .collect();
+    if files.len() <= TOOL_OUTPUT_KEEP {
+        return;
+    }
+    files.sort_by_key(|(t, _)| std::cmp::Reverse(*t));
+    for (_, path) in files.into_iter().skip(TOOL_OUTPUT_KEEP) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// If `content` exceeds `TOOL_RESULT_CONTEXT_LIMIT`, save the full content
 /// to a temp file and return a preview + file path. The model sees the preview
 /// and can reference the full file if needed.
@@ -2554,14 +2596,30 @@ fn maybe_truncate_to_disk(content: &str) -> String {
     if content.len() <= TOOL_RESULT_CONTEXT_LIMIT {
         return content.to_string();
     }
-    // Save full content to a temp file.
+    // Save full content where the model can actually READ it back.
+    //
     // M2 (M6.17): include a UUID per truncation. Pre-fix the filename
     // was just `tool-<pid>.txt` — every truncation in the same process
     // overwrote the previous one, so the model's "reference the full
     // file" affordance was a lie after the second truncation. Surface
     // any write failure in the truncation message instead of silently
     // promising a file that doesn't exist.
-    let tmp_dir = std::env::temp_dir().join("thclaws-tool-output");
+    //
+    // The second way that affordance was a lie: the spill lived in the
+    // SYSTEM temp dir, which is outside the sandbox root, so `Read` on
+    // the advertised path answered "access denied: … is outside the
+    // workspace root". Observed live — a 108 KB Lazada snapshot spilled,
+    // the model saw 2 KB of it, asked for the rest once, was refused, and
+    // then concluded from 2% of a page that the product it was sent to
+    // find did not exist. Keep the spill INSIDE the workspace:
+    // `.thclaws/` is denied to the write tools but readable, and engine
+    // code writes it directly, so the path we advertise is one the model
+    // can open. Fall back to the temp dir only when there is no sandbox
+    // root (tests, some headless paths) — the old behaviour, unchanged.
+    let tmp_dir = match crate::sandbox::Sandbox::root() {
+        Some(root) => root.join(".thclaws/state/tool-output"),
+        None => std::env::temp_dir().join("thclaws-tool-output"),
+    };
     let mkdir_err = std::fs::create_dir_all(&tmp_dir).err();
     let filename = format!(
         "tool-{}-{}.txt",
@@ -2571,15 +2629,29 @@ fn maybe_truncate_to_disk(content: &str) -> String {
     let path = tmp_dir.join(&filename);
     let write_err = std::fs::write(&path, content).err();
 
-    let preview_end = content
-        .char_indices()
-        .nth(2000)
-        .map(|(i, _)| i)
-        .unwrap_or(content.len().min(2000));
+    // Preview as much as an UNtruncated result would have been allowed to
+    // carry. A flat 2,000 characters put a 25x cliff at the threshold: a
+    // 49,999-byte result arrived whole, a 50,001-byte one collapsed to 2 KB.
+    // That cliff is what made the Lazada snapshot useless — 108 KB of page
+    // reduced to 2 KB of header chrome, from which the model concluded the
+    // product was not there. Same ceiling on both sides of the threshold now,
+    // and the file still holds 100% for when the excerpt is not enough.
+    let preview_end = {
+        let mut end = content.len().min(TOOL_RESULT_CONTEXT_LIMIT);
+        while end > 0 && !content.is_char_boundary(end) {
+            end -= 1;
+        }
+        end
+    };
     let footer = match (mkdir_err, write_err) {
         (None, None) => format!(
-            "... [truncated: {} total bytes — full output saved to {}]",
+            "... [truncated: you are seeing {} of {} bytes — {:.0}% of this result. \
+             Do NOT conclude something is absent because it is not in this excerpt; \
+             the rest may contain it. Read the full output at {}, or re-run the tool \
+             with a narrower query.]",
+            preview_end,
             content.len(),
+            (preview_end as f64 / content.len() as f64) * 100.0,
             path.display()
         ),
         (Some(e), _) | (_, Some(e)) => format!(
@@ -2883,6 +2955,111 @@ mod tests {
             matches!(bs[0], ToolResultBlock::Image { .. }),
             "image kept (not evicted)"
         );
+    }
+
+    /// Regression for the Lazada false negative: a 108 KB browser snapshot
+    /// spilled, the model was shown 2 KB of page chrome, and it reported that
+    /// the product the user could see on screen did not exist. Three things
+    /// have to hold for that not to repeat — the excerpt is no longer a cliff,
+    /// the text says what fraction it is, and the path it names is one the
+    /// sandbox will actually open.
+    #[test]
+    fn truncated_tool_output_is_readable_and_declares_what_it_hid() {
+        let _g = crate::kms::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::var("THCLAWS_PROJECT_ROOT").ok();
+        std::env::set_var("THCLAWS_PROJECT_ROOT", dir.path());
+        crate::sandbox::Sandbox::init().unwrap();
+
+        let big = "x".repeat(TOOL_RESULT_CONTEXT_LIMIT * 2);
+        let out = maybe_truncate_to_disk(&big);
+
+        crate::sandbox::Sandbox::reset();
+        match prev {
+            Some(v) => std::env::set_var("THCLAWS_PROJECT_ROOT", v),
+            None => std::env::remove_var("THCLAWS_PROJECT_ROOT"),
+        }
+
+        // The excerpt is the same ceiling an untruncated result gets, not 2 KB.
+        assert!(
+            out.len() > TOOL_RESULT_CONTEXT_LIMIT,
+            "excerpt collapsed to {} bytes — the 2 KB cliff is back",
+            out.len()
+        );
+        // It states the fraction rather than only the total.
+        assert!(
+            out.contains("you are seeing"),
+            "got: {}",
+            &out[out.len() - 400..]
+        );
+        assert!(
+            out.contains("Do NOT conclude something is absent"),
+            "must warn against reading absence into an excerpt"
+        );
+        // And the spill lands inside the workspace, where Read is allowed.
+        assert!(
+            out.contains(".thclaws/state/tool-output"),
+            "spill must sit inside the sandbox root, not the system temp dir"
+        );
+    }
+
+    /// Keeps the newest N and drops the rest. The count matters because a
+    /// resumed session replays old truncation footers into context, so a
+    /// pruned-away path becomes a dead reference the model may try to Read.
+    #[test]
+    fn tool_output_prune_keeps_the_newest_and_drops_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("state/tool-output");
+        std::fs::create_dir_all(&out).unwrap();
+
+        // Written oldest-first, with mtimes spread so the ordering is real
+        // rather than whatever the filesystem happens to return.
+        let n = TOOL_OUTPUT_KEEP + 5;
+        let mut paths = Vec::new();
+        for i in 0..n {
+            let p = out.join(format!("tool-{i}.txt"));
+            std::fs::write(&p, "x").unwrap();
+            let t = std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(1_700_000_000 + i as u64 * 60);
+            std::fs::File::options()
+                .write(true)
+                .open(&p)
+                .unwrap()
+                .set_modified(t)
+                .unwrap();
+            paths.push(p);
+        }
+
+        prune_tool_output_dir(dir.path());
+
+        let left = std::fs::read_dir(&out).unwrap().count();
+        assert_eq!(left, TOOL_OUTPUT_KEEP, "should keep exactly the cap");
+        // The newest survive, the oldest are gone.
+        assert!(paths[n - 1].exists(), "newest file must survive");
+        assert!(!paths[0].exists(), "oldest file must be pruned");
+    }
+
+    /// Under the cap, nothing is touched — and a workspace that never
+    /// spilled has no such directory at all, which must not panic.
+    #[test]
+    fn tool_output_prune_is_a_noop_below_the_cap_and_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        prune_tool_output_dir(dir.path()); // no directory — must not panic
+
+        let out = dir.path().join("state/tool-output");
+        std::fs::create_dir_all(&out).unwrap();
+        for i in 0..3 {
+            std::fs::write(out.join(format!("tool-{i}.txt")), "x").unwrap();
+        }
+        prune_tool_output_dir(dir.path());
+        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 3);
+    }
+
+    /// A result under the limit must still pass through completely untouched.
+    #[test]
+    fn small_tool_output_is_not_truncated() {
+        let small = "just a short result".to_string();
+        assert_eq!(maybe_truncate_to_disk(&small), small);
     }
 
     #[test]

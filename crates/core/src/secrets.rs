@@ -230,11 +230,37 @@ pub fn keychain_set_raw(account: &str, value: &str) -> Result<()> {
         .map_err(|e| Error::Config(format!("keychain write failed: {e}")))
 }
 
+/// Whether the OS keychain is off for this process.
+///
+/// `THCLAWS_DISABLE_KEYCHAIN` decides it when set, by VALUE — the check used
+/// to be presence-based, so `=0` silently disabled the thing it looks like it
+/// enables.
+///
+/// Otherwise the answer is "am I somewhere with a user session", and the
+/// honest signal for that is the container, not the surface. `--serve` used
+/// to force it off on the theory that serving means a headless server; that
+/// is not true of `--serve` on a laptop, and it is not true of a bot
+/// (dev-plan/59), which is a `--serve` in the user's own login session. The
+/// result was that the same user, on the same machine, with the same
+/// credential in the keychain, got "no API key" from `--serve` and a working
+/// agent from the desktop — two surfaces that differ only in how the
+/// frontend is delivered. Both container images set `THCLAWS_INSIDE_DOCKER`,
+/// so the deployments that really are headless still say so.
+pub fn keychain_disabled() -> bool {
+    match std::env::var("THCLAWS_DISABLE_KEYCHAIN") {
+        Ok(v) => {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true")
+        }
+        Err(_) => std::env::var("THCLAWS_INSIDE_DOCKER").ok().as_deref() == Some("1"),
+    }
+}
+
 /// Direct keychain read counterpart to [`keychain_set_raw`]. Same
 /// rationale — SSO storage uses this, not [`get`], so a Dotenv-
 /// preferring user can still sign in.
 pub fn keychain_get_raw(account: &str) -> Option<String> {
-    if std::env::var("THCLAWS_DISABLE_KEYCHAIN").is_ok() {
+    if keychain_disabled() {
         return None;
     }
     keyring::Entry::new(SERVICE, account)
@@ -272,7 +298,7 @@ pub fn set(provider: &str, key: &str) -> Result<()> {
 /// `api-keys` bundle entry (cached for the lifetime of the process)
 /// so N providers = 1 macOS prompt per launch.
 pub fn get(provider: &str) -> Option<String> {
-    if std::env::var("THCLAWS_DISABLE_KEYCHAIN").is_ok() {
+    if keychain_disabled() {
         log_trace(&format!(
             "get({provider}) → blocked by THCLAWS_DISABLE_KEYCHAIN"
         ));
@@ -468,6 +494,51 @@ pub fn load_into_env() {
 
 #[cfg(test)]
 mod tests {
+
+    /// dev-plan/59: `--serve` and the desktop differ only in how the frontend
+    /// is delivered. They must not differ in whether a user's keychain
+    /// credential is readable — that produced "no API key" on one surface and
+    /// a working agent on the other, same machine, same user, same key.
+    #[test]
+    fn the_keychain_is_off_for_containers_and_by_explicit_value_only() {
+        let _g = crate::kms::test_env_lock();
+        let prev_dis = std::env::var("THCLAWS_DISABLE_KEYCHAIN").ok();
+        let prev_doc = std::env::var("THCLAWS_INSIDE_DOCKER").ok();
+        std::env::remove_var("THCLAWS_DISABLE_KEYCHAIN");
+        std::env::remove_var("THCLAWS_INSIDE_DOCKER");
+
+        // A user's own machine — desktop, `--serve`, or a bot alike.
+        assert!(!keychain_disabled());
+
+        // The deployments that really are headless say so themselves; both
+        // container images set this.
+        std::env::set_var("THCLAWS_INSIDE_DOCKER", "1");
+        assert!(keychain_disabled());
+        std::env::remove_var("THCLAWS_INSIDE_DOCKER");
+
+        // Explicit beats everything, and is read by VALUE: `=0` used to
+        // disable the very thing it reads as enabling.
+        std::env::set_var("THCLAWS_DISABLE_KEYCHAIN", "1");
+        assert!(keychain_disabled());
+        std::env::set_var("THCLAWS_DISABLE_KEYCHAIN", "true");
+        assert!(keychain_disabled());
+        std::env::set_var("THCLAWS_DISABLE_KEYCHAIN", "0");
+        assert!(!keychain_disabled());
+        std::env::set_var("THCLAWS_INSIDE_DOCKER", "1");
+        assert!(
+            !keychain_disabled(),
+            "an explicit 0 wins inside a container too"
+        );
+
+        match prev_dis {
+            Some(v) => std::env::set_var("THCLAWS_DISABLE_KEYCHAIN", v),
+            None => std::env::remove_var("THCLAWS_DISABLE_KEYCHAIN"),
+        }
+        match prev_doc {
+            Some(v) => std::env::set_var("THCLAWS_INSIDE_DOCKER", v),
+            None => std::env::remove_var("THCLAWS_INSIDE_DOCKER"),
+        }
+    }
     use super::*;
 
     #[test]

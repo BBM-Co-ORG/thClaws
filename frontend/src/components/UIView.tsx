@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { send, subscribe } from "../hooks/useIPC";
+import { botQuery, send, subscribe } from "../hooks/useIPC";
 import { useTheme } from "../hooks/useTheme";
 
 // dev-plan/33 Tier 1: render a GUI Shell inside a sandboxed iframe.
@@ -167,8 +167,10 @@ export function UIView({ active, shellId, fullscreen = false }: UIViewProps) {
   const isHttp =
     typeof window !== "undefined" &&
     (window.location.protocol === "http:" || window.location.protocol === "https:");
+  // Under a workspace host the `bot=` picks whose shell this is; the
+  // shell's own sub-assets inherit it through the Referer.
   const src = isHttp
-    ? `gui-shell/${encodeURIComponent(shellId)}/?session=${encodeURIComponent(TIER1_SESSION_ID)}`
+    ? `gui-shell/${encodeURIComponent(shellId)}/?session=${encodeURIComponent(TIER1_SESSION_ID)}${botQuery().replace(/^\?/, "&")}`
     : `thclaws://localhost/gui-shell/${encodeURIComponent(shellId)}/index.html` +
       `?session=${encodeURIComponent(TIER1_SESSION_ID)}`;
 

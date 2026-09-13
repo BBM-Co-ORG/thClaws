@@ -231,14 +231,6 @@ pub async fn run_on(
     config: ServeConfig,
     listener: tokio::net::TcpListener,
 ) -> crate::error::Result<()> {
-    // M6.36 SERVE6 hint: keychain access doesn't make sense on a
-    // headless server (no user session, often no Secret Service
-    // running). Skip the keychain probe by default; users put API
-    // keys in `.thclaws/.env` instead. CLI flag override TBD.
-    if std::env::var_os("THCLAWS_DISABLE_KEYCHAIN").is_none() {
-        std::env::set_var("THCLAWS_DISABLE_KEYCHAIN", "1");
-    }
-
     // dev-plan/33 Tier 2 Mode B: a shell lives INSIDE a project folder;
     // the project root is where the agent's context comes from.
     //
@@ -513,70 +505,7 @@ pub async fn run_with_engine(
     let app = if let Some(mode) = config.gui_shell.clone() {
         build_shell_router(&config.bind, state, mode)?
     } else {
-        // Mode C (cloud serve / browser SSH-tunnel): the React webapp
-        // hosts gui-shells in iframes. Browser has no `thclaws://`
-        // protocol handler, so expose the shell folders over HTTP
-        // under `/gui-shell/<id>/...`. The bridge runs in postMessage
-        // mode (inline-injected) — no per-shell WS.
-        Router::new()
-            .route("/", get(serve_index))
-            .route("/healthz", get(serve_health))
-            .route("/ws", get(ws_handler))
-            .route("/upload", post(serve_upload))
-            .route("/gui-shell/{shell_id}", get(serve_gui_shell_index))
-            .route("/gui-shell/{shell_id}/", get(serve_gui_shell_index))
-            .route(
-                "/gui-shell/{shell_id}/index.html",
-                get(serve_gui_shell_index),
-            )
-            .route("/gui-shell/{shell_id}/{*rest}", get(serve_gui_shell_asset))
-            // Workspace file passthrough — GUI shells can render
-            // agent-produced files (image-batch's images/<slug>/*.png,
-            // generated PDFs, contact-sheet HTML) via direct
-            // <img src="/file-asset/images/foo/bar.png"> tags. The
-            // server-side check is `Sandbox::check_in(cwd, rel)` so
-            // paths can't escape the workspace. Single-tenant per
-            // pod, so no cross-user concern (multi-tenant adds the
-            // HMAC layer in build_shell_router).
-            .route("/file-asset/{*rel}", get(serve_file_asset))
-            // Workspace sync (dev-plan/51): /cloud push|pull against the
-            // workspace dir. Same auth surface as /upload — the cloud ingress
-            // ForwardAuth gates hosted runners (and the multiuser_auth layer
-            // below covers multiuser pods); local --serve relies on
-            // api_v1/loopback. push raises the body limit for the tarball.
-            // job-artifacts Tier 1: `THCLAWS_SYNC_REQUIRE_AUTH=1` opts the
-            // whole sync group into the SAME Bearer policy as /v1 (the
-            // route_layer below), so an external orchestrator can use
-            // export/push holding only THCLAWS_API_TOKEN — no tunnel /
-            // ForwardAuth. Unset = classic trusted-network behavior,
-            // existing deployments unaffected.
-            .merge(
-                axum::Router::new()
-                    .route("/workspace/sync/stat", get(sync_stat))
-                    .route("/workspace/sync/pull", get(sync_pull))
-                    .route(
-                        "/workspace/sync/push",
-                        post(sync_push).layer(DefaultBodyLimit::max(
-                            crate::cloud::wssync::MAX_SYNC_BYTES as usize,
-                        )),
-                    )
-                    // P2 incremental: manifest diff + per-subset transfer/trash.
-                    .route("/workspace/sync/manifest", get(sync_manifest))
-                    .route(
-                        "/workspace/sync/export",
-                        post(sync_export).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
-                    )
-                    .route(
-                        "/workspace/sync/trash",
-                        post(sync_trash).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
-                    )
-                    // Agreed sync revision, recorded after a sync lands (both
-                    // directions) so the two ends name the same number.
-                    .route("/workspace/sync/revision", post(sync_revision))
-                    .route_layer(axum::middleware::from_fn(sync_bearer_gate)),
-            )
-            .with_state(state)
-            .merge(crate::api_v1::router())
+        classic_router(state)
     };
 
     // dev-plan/42: gate the ENTIRE surface behind HMAC identity in a
@@ -591,20 +520,35 @@ pub async fn run_with_engine(
         app
     };
 
-    if config.gui_shell.is_none() {
-        eprintln!(
-            "\x1b[36m[serve] thClaws listening on http://{}\x1b[0m",
-            config.bind
-        );
-        eprintln!("\x1b[36m[serve] open the URL above in your browser (over an SSH tunnel for remote access)\x1b[0m");
-    }
     let listener = match listener {
         Some(l) => l,
         None => tokio::net::TcpListener::bind(&config.bind)
             .await
             .map_err(|e| crate::error::Error::Tool(format!("bind {}: {e}", config.bind)))?,
     };
+    // The address actually bound, not the one asked for: with `--port 0` the
+    // two differ, and the banner used to print `:0`.
+    let bound = listener.local_addr().unwrap_or(config.bind);
+    if config.gui_shell.is_none() {
+        eprintln!("\x1b[36m[serve] thClaws listening on http://{bound}\x1b[0m");
+        eprintln!("\x1b[36m[serve] open the URL above in your browser (over an SSH tunnel for remote access)\x1b[0m");
+    }
+    publish_bound_addr(bound);
+    // dev-plan/59: a supervised child outlives a host that was killed
+    // outright unless it watches for the closed pipe itself. It then leaves
+    // through axum's graceful shutdown rather than `process::exit`, so this
+    // function returns, the runtime unwinds, and the bot's own MCP children
+    // — held with `kill_on_drop` — are reaped instead of orphaned.
+    let supervised = std::env::var("THCLAWS_SUPERVISED").ok().as_deref() == Some("1");
+    let stdin_closed = async move {
+        if supervised {
+            crate::bots::supervisor::stdin_closed().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
     axum::serve(listener, app)
+        .with_graceful_shutdown(stdin_closed)
         .await
         .map_err(|e| crate::error::Error::Tool(format!("serve: {e}")))?;
     Ok(())
@@ -874,6 +818,490 @@ async fn sync_trash(State(state): State<ServeState>, Json(paths): Json<Vec<Strin
         .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
+}
+
+/// The classic `--serve` router: React webapp over HTTP/WS, gui-shell
+/// folders, workspace file passthrough and `/cloud push|pull` sync.
+///
+/// dev-plan/59 Step 2: when `THCLAWS_SERVE_TOKEN` is set, every route
+/// except `/healthz` sits behind `serve_token_gate`. The review of the
+/// first cut found the bearer on `/ws` + `/upload` alone left
+/// `/file-asset/{*rel}` (any workspace file, including a bot's
+/// chromium cookies) and `/workspace/sync/pull` (the whole workspace as
+/// a tarball) open on the same port, so the gate is a layer over the
+/// group rather than a check copied into handlers. `/v1/*` keeps its
+/// own `THCLAWS_API_TOKEN` policy and is merged outside the gate.
+fn classic_router(state: ServeState) -> Router {
+    let single_user = state.multi_tenant.is_none();
+    // Mode C (cloud serve / browser SSH-tunnel): the React webapp
+    // hosts gui-shells in iframes. Browser has no `thclaws://`
+    // protocol handler, so expose the shell folders over HTTP
+    // under `/gui-shell/<id>/...`. The bridge runs in postMessage
+    // mode (inline-injected) — no per-shell WS.
+    let gated = Router::new()
+        .route("/", get(serve_index))
+        .route("/ws", get(ws_handler))
+        .route("/upload", post(serve_upload))
+        .route("/gui-shell/{shell_id}", get(serve_gui_shell_index))
+        .route("/gui-shell/{shell_id}/", get(serve_gui_shell_index))
+        .route(
+            "/gui-shell/{shell_id}/index.html",
+            get(serve_gui_shell_index),
+        )
+        .route("/gui-shell/{shell_id}/{*rest}", get(serve_gui_shell_asset))
+        // Workspace file passthrough — GUI shells can render
+        // agent-produced files (image-batch's images/<slug>/*.png,
+        // generated PDFs, contact-sheet HTML) via direct
+        // <img src="/file-asset/images/foo/bar.png"> tags. The
+        // server-side check is `Sandbox::check_in(cwd, rel)` so
+        // paths can't escape the workspace. Single-tenant per
+        // pod, so no cross-user concern (multi-tenant adds the
+        // HMAC layer in build_shell_router).
+        .route("/file-asset/{*rel}", get(serve_file_asset))
+        // Workspace sync (dev-plan/51): /cloud push|pull against the
+        // workspace dir. Same auth surface as /upload — the cloud ingress
+        // ForwardAuth gates hosted runners (and the multiuser_auth layer
+        // below covers multiuser pods); local --serve relies on
+        // api_v1/loopback. push raises the body limit for the tarball.
+        // job-artifacts Tier 1: `THCLAWS_SYNC_REQUIRE_AUTH=1` opts the
+        // whole sync group into the SAME Bearer policy as /v1 (the
+        // route_layer below), so an external orchestrator can use
+        // export/push holding only THCLAWS_API_TOKEN — no tunnel /
+        // ForwardAuth. Unset = classic trusted-network behavior,
+        // existing deployments unaffected.
+        .merge(
+            axum::Router::new()
+                .route("/workspace/sync/stat", get(sync_stat))
+                .route("/workspace/sync/pull", get(sync_pull))
+                .route(
+                    "/workspace/sync/push",
+                    post(sync_push).layer(DefaultBodyLimit::max(
+                        crate::cloud::wssync::MAX_SYNC_BYTES as usize,
+                    )),
+                )
+                // P2 incremental: manifest diff + per-subset transfer/trash.
+                .route("/workspace/sync/manifest", get(sync_manifest))
+                .route(
+                    "/workspace/sync/export",
+                    post(sync_export).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
+                )
+                .route(
+                    "/workspace/sync/trash",
+                    post(sync_trash).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
+                )
+                // Agreed sync revision, recorded after a sync lands (both
+                // directions) so the two ends name the same number.
+                .route("/workspace/sync/revision", post(sync_revision))
+                .route_layer(axum::middleware::from_fn(sync_bearer_gate)),
+        )
+        .route_layer(axum::middleware::from_fn_with_state(
+            single_user,
+            serve_token_gate,
+        ));
+    Router::new()
+        .route("/healthz", get(serve_health))
+        .merge(gated)
+        .with_state(state)
+        .merge(crate::api_v1::router())
+}
+
+/// dev-plan/59 Step 3: run this process as the workspace HOST.
+///
+/// The host is a supervisor, not an agent: it spawns one `--serve` child per
+/// bot, proxies the browser's socket to the focused one, and restarts it when
+/// it dies. It initialises no agent, no model and no MCP — the authority to
+/// reach every bot's folder is held by deterministic code rather than by
+/// something a web page can talk to.
+///
+/// Step 3 starts exactly one bot, named by a hand-edited `.thclaws/bots.json`.
+pub async fn run_supervisor(bind: SocketAddr) -> crate::error::Result<()> {
+    let listener = tokio::net::TcpListener::bind(&bind)
+        .await
+        .map_err(|e| crate::error::Error::Tool(format!("bind {bind}: {e}")))?;
+    run_supervisor_on(listener).await
+}
+
+/// Serve the host on a listener the caller already bound.
+///
+/// The desktop binds port 0 itself so it can put the real port in the
+/// webview's URL before the server starts — asking the OS for a port, closing
+/// it and re-binding is the race `run_on`'s own doc comment warns about.
+pub async fn run_supervisor_on(listener: tokio::net::TcpListener) -> crate::error::Result<()> {
+    if !crate::policy::serve_allowed() {
+        return Err(crate::error::Error::Tool(
+            "--serve is disabled by org policy (policies.runtime.allow_serve = false)".into(),
+        ));
+    }
+    let workspace = std::env::current_dir()
+        .map_err(|e| crate::error::Error::Tool(format!("workspace cwd unavailable: {e}")))?;
+    // dev-plan/59 Step 4. Two ways to have no bot list, and they must not be
+    // confused: a directory with nothing in it is a new workspace and gets a
+    // host plus one empty bot; a directory that already holds an agent is a v2
+    // workspace, and starting a host over it would leave that agent
+    // unreachable at a root the host now owns.
+    if !workspace.join(crate::bots::CONFIG_REL).exists() {
+        if crate::bots::migrate::looks_like_v2_agent(&workspace) {
+            return Err(crate::error::Error::Config(format!(
+                "{} is a single-agent (v2) workspace: its agent lives at the root, where the host \
+                 belongs in v3.\n  Run `thclaws bots migrate` to move it into \
+                 .thclaws/bots/main/ first.",
+                workspace.display()
+            )));
+        }
+        let dest =
+            crate::bots::migrate::mint_new_workspace(&workspace, crate::bots::migrate::MAIN_SLUG)?;
+        eprintln!(
+            "\x1b[36m[bots] new workspace — minted a host and one bot at {}\x1b[0m",
+            dest.display()
+        );
+    }
+    // Held for the life of the host. Two hosts on one workspace would both
+    // spawn children and fight over bots.json and the address files.
+    let _lock = crate::bots::lock_workspace(&workspace, "this host")?;
+    let cfg = crate::bots::BotsConfig::load(&workspace)?;
+    let sup = crate::bots::supervisor::BotSupervisor::new(&workspace)?;
+    let cap = crate::bots::supervisor::MAX_LIVE_BOTS;
+    if cfg.bots.len() > cap {
+        eprintln!(
+            "\x1b[33m[bots] {} bots listed; starting the first {cap}. An idle policy that tears \
+             children down is what lifts this, not a bigger number.\x1b[0m",
+            cfg.bots.len()
+        );
+    }
+    // The first entry is the default a browser reaches — `bots.json` order,
+    // not alphabetical.
+    sup.set_default(&cfg.bots[0].slug);
+    // One bot that cannot start — a folder the user deleted by hand, say —
+    // must not keep the whole workspace from opening. It is skipped loudly;
+    // only a workspace where NOTHING starts is an error.
+    let mut started = 0usize;
+    for def in cfg.bots.iter().take(cap) {
+        match sup.start(def) {
+            Ok(_) => {
+                started += 1;
+                eprintln!(
+                    "\x1b[36m[bots] supervising '{}' from {}\x1b[0m",
+                    def.slug,
+                    crate::bots::bot_dir(&workspace, &def.slug).display()
+                );
+            }
+            Err(e) => eprintln!("\x1b[33m[bots] '{}' not started: {e}\x1b[0m", def.slug),
+        }
+    }
+    if started == 0 {
+        return Err(crate::error::Error::Config(
+            "none of this workspace's bots could be started — see the lines above".into(),
+        ));
+    }
+
+    let bound = listener
+        .local_addr()
+        .map_err(|e| crate::error::Error::Tool(format!("listener address: {e}")))?;
+    eprintln!("\x1b[36m[serve] thClaws host listening on http://{bound}\x1b[0m");
+    publish_bound_addr(bound);
+    axum::serve(listener, supervisor_router(sup))
+        .await
+        .map_err(|e| crate::error::Error::Tool(format!("serve: {e}")))?;
+    Ok(())
+}
+
+/// The host's surface: the React bundle, the proxied socket, the bot list and
+/// its mutations, and the two file routes forwarded to a bot with that bot's
+/// own bearer. `/workspace/sync/*` is deliberately absent — it operates on a
+/// whole workspace directory, which under a host is the shelf, not any one
+/// bot's tree.
+fn supervisor_router(sup: Arc<crate::bots::supervisor::BotSupervisor>) -> Router {
+    Router::new()
+        .route("/", get(serve_index))
+        .route("/ws", get(supervisor_ws))
+        .route("/bots", get(supervisor_bots).post(supervisor_add_bot))
+        .route("/bots/{slug}", axum::routing::delete(supervisor_remove_bot))
+        .route("/bots/{slug}/restart", post(supervisor_restart_bot))
+        .route("/file-asset/{*rel}", get(supervisor_forward))
+        // A bot's shells live under the bot, and the bot's own `--serve`
+        // already resolves and bridges them, so the host only carries the
+        // request there. Without these a bot with a default shell opened
+        // to an empty iframe.
+        .route("/gui-shell/{shell_id}", get(supervisor_forward))
+        .route("/gui-shell/{shell_id}/", get(supervisor_forward))
+        .route("/gui-shell/{shell_id}/{*rel}", get(supervisor_forward))
+        // No body-limit layer, matching the classic router's `/upload`: the
+        // host must not be a different size of pipe than serving directly.
+        .route("/upload", post(supervisor_forward))
+        // Same opt-in bearer as the classic router. `route_layer` covers the
+        // routes registered above it, so `/healthz` below stays open for a
+        // parent supervisor's probe.
+        .route_layer(axum::middleware::from_fn_with_state(true, serve_token_gate))
+        .route("/healthz", get(supervisor_health))
+        .with_state(sup)
+}
+
+/// Which bot a request is for. `?bot=<slug>` names one; without it the
+/// caller gets the default — the first entry in `bots.json`, not the first
+/// alphabetically.
+#[derive(serde::Deserialize, Default)]
+struct BotQuery {
+    #[serde(default)]
+    bot: Option<String>,
+}
+
+fn pick_bot(
+    sup: &crate::bots::supervisor::BotSupervisor,
+    want: Option<&str>,
+) -> std::result::Result<Arc<crate::bots::supervisor::Bot>, Response> {
+    match want.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(slug) => sup.get(slug).ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("no bot '{slug}' is running in this workspace"),
+            )
+                .into_response()
+        }),
+        None => sup.focused().ok_or_else(|| {
+            (StatusCode::SERVICE_UNAVAILABLE, "no bots are running").into_response()
+        }),
+    }
+}
+
+async fn supervisor_ws(
+    ws: WebSocketUpgrade,
+    State(sup): State<Arc<crate::bots::supervisor::BotSupervisor>>,
+    Query(q): Query<BotQuery>,
+) -> Response {
+    // dev-plan/59 §6.3: the UI holds one socket per bot, so the slug travels
+    // in the URL rather than in every frame. No `?bot=` is the plain
+    // single-bot case and the pre-UI default.
+    let bot = match pick_bot(&sup, q.bot.as_deref()) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    ws.on_upgrade(move |socket| crate::bots::proxy::relay(socket, bot))
+}
+
+/// `GET /file-asset/<rel>` and `POST /upload` against the focused bot.
+///
+/// §7.3 left these 404ing, which meant image previews and uploads did not
+/// work under a host. They are forwarded rather than served here: the host
+/// has no business reading inside a bot's tree, and the bot already serves
+/// both behind its own bearer — which the host attaches, because the browser
+/// never learns a child's token.
+/// The `bot=` a same-origin subresource request inherited: a shell's
+/// `app.js` or a previewed page's stylesheet is fetched relative to its
+/// document, which drops the query the page put there, but the Referer still
+/// carries it.
+fn bot_from_referer(req: &Request) -> Option<String> {
+    let referer = req
+        .headers()
+        .get(axum::http::header::REFERER)?
+        .to_str()
+        .ok()?;
+    let query = referer.split_once('?')?.1;
+    query
+        .split('&')
+        .filter_map(|kv| kv.split_once('='))
+        .find(|(k, _)| *k == "bot")
+        .and_then(|(_, v)| urlencoding::decode(v).ok())
+        .map(|v| v.into_owned())
+        .filter(|v| !v.is_empty())
+}
+
+async fn supervisor_forward(
+    State(sup): State<Arc<crate::bots::supervisor::BotSupervisor>>,
+    Query(q): Query<BotQuery>,
+    req: Request,
+) -> Response {
+    let want = q.bot.clone().or_else(|| bot_from_referer(&req));
+    let bot = match pick_bot(&sup, want.as_deref()) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let (addr, token) = match bot.wait_ready(std::time::Duration::from_secs(30)).await {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
+    };
+    match crate::bots::proxy::forward_http(&addr, &token, req).await {
+        Ok(resp) => resp,
+        Err(e) => (StatusCode::BAD_GATEWAY, format!("bot '{}': {e}", bot.slug)).into_response(),
+    }
+}
+
+/// dev-plan/59 Step 5: `POST /bots {"slug": …}` installs a catalogue agent
+/// into `.thclaws/bots/<slug>/`, lists it, and starts supervising it — the
+/// call the host UI makes. It is a host action rather than a slash command
+/// because a bot's sandbox root is its own folder: a bot cannot write to a
+/// sibling's, which is the isolation working, not a gap.
+#[derive(serde::Deserialize)]
+struct AddBotBody {
+    slug: String,
+    #[serde(default)]
+    version: Option<String>,
+    /// Overwrite a folder bound to a different agent.
+    #[serde(default)]
+    force: bool,
+    /// No catalogue agent: an empty bot, like a new folder.
+    #[serde(default)]
+    blank: bool,
+}
+
+async fn supervisor_add_bot(
+    State(sup): State<Arc<crate::bots::supervisor::BotSupervisor>>,
+    Json(body): Json<AddBotBody>,
+) -> Response {
+    let added = if body.blank {
+        sup.add_blank_bot(&body.slug).await
+    } else {
+        sup.add_bot(&body.slug, body.version.as_deref(), body.force)
+            .await
+    };
+    match added {
+        Ok(done) => Json(serde_json::json!({
+            "ok": true,
+            "slug": done.slug,
+            "dir": done.dir.display().to_string(),
+            "newly_registered": done.newly_registered,
+            "log": done.lines,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize, Default)]
+struct RemoveBotQuery {
+    /// Also delete the bot's folder — its sessions, KMS and browser logins.
+    #[serde(default)]
+    purge: bool,
+}
+
+async fn supervisor_remove_bot(
+    State(sup): State<Arc<crate::bots::supervisor::BotSupervisor>>,
+    axum::extract::Path(slug): axum::extract::Path<String>,
+    Query(q): Query<RemoveBotQuery>,
+) -> Response {
+    match sup.remove_bot(&slug, q.purge).await {
+        Ok(()) => Json(serde_json::json!({ "ok": true, "slug": slug })).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn supervisor_restart_bot(
+    State(sup): State<Arc<crate::bots::supervisor::BotSupervisor>>,
+    axum::extract::Path(slug): axum::extract::Path<String>,
+) -> Response {
+    match sup.restart_bot(&slug).await {
+        Ok(_) => Json(serde_json::json!({ "ok": true, "slug": slug })).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(serde::Serialize)]
+struct BotRow {
+    slug: String,
+    #[serde(flatten)]
+    state: crate::bots::supervisor::BotState,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    stderr_tail: Vec<String>,
+}
+
+fn bot_rows(sup: &crate::bots::supervisor::BotSupervisor) -> Vec<BotRow> {
+    sup.list()
+        .into_iter()
+        .map(|b| BotRow {
+            slug: b.slug.clone(),
+            state: b.state(),
+            stderr_tail: b.stderr_tail(),
+        })
+        .collect()
+}
+
+async fn supervisor_bots(
+    State(sup): State<Arc<crate::bots::supervisor::BotSupervisor>>,
+) -> impl IntoResponse {
+    Json(serde_json::json!({ "bots": bot_rows(&sup) }))
+}
+
+/// A host is healthy while it has any bot that is serving or still trying.
+/// Every bot parked is a host that will never serve again on its own — a
+/// liveness probe should restart that pod rather than keep it. Merely
+/// starting is not unhealthy: a cold bot can take longer than a probe's
+/// grace period, and restarting it for that would loop forever.
+fn host_ok(states: &[crate::bots::supervisor::BotState]) -> bool {
+    states.is_empty()
+        || !states
+            .iter()
+            .all(|s| matches!(s, crate::bots::supervisor::BotState::CrashLooped { .. }))
+}
+
+async fn supervisor_health(
+    State(sup): State<Arc<crate::bots::supervisor::BotSupervisor>>,
+) -> Response {
+    let rows = bot_rows(&sup);
+    let ready = rows
+        .iter()
+        .filter(|r| matches!(r.state, crate::bots::supervisor::BotState::Ready { .. }))
+        .count();
+    let states: Vec<_> = rows.iter().map(|r| r.state.clone()).collect();
+    let ok = host_ok(&states);
+    let body = Json(serde_json::json!({
+        "ok": ok,
+        "role": "host",
+        "bots": rows.len(),
+        "ready": ready,
+    }));
+    if ok {
+        body.into_response()
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, body).into_response()
+    }
+}
+
+/// dev-plan/59: write the address this process actually bound to the file a
+/// supervisor named, so it can be reached without the supervisor having to
+/// pre-bind a port and hand the number down — which would leave a window for
+/// anything on the machine to take it. Written last, once the listener exists,
+/// so the file appearing means the port is real.
+fn publish_bound_addr(bound: SocketAddr) {
+    let Some(path) = std::env::var_os("THCLAWS_SERVE_ADDR_FILE") else {
+        return;
+    };
+    let path = std::path::PathBuf::from(path);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::write(&path, bound.to_string()) {
+        eprintln!(
+            "\x1b[33m[serve] cannot write THCLAWS_SERVE_ADDR_FILE {}: {e}\x1b[0m",
+            path.display()
+        );
+    }
+}
+
+/// dev-plan/59 Step 2: single-user bearer over the classic router.
+/// Runs before a WS upgrade so a wrong token never opens a socket. No
+/// token configured → passes, which is every existing deployment. A
+/// multiuser pod is skipped: `multiuser_auth` already proves identity
+/// there and the supervisor never runs one as a child.
+async fn serve_token_gate(State(single_user): State<bool>, req: Request, next: Next) -> Response {
+    if single_user && !serve_token_ok(req.headers(), req.uri().query()) {
+        eprintln!(
+            "\x1b[33m[serve] {} rejected: bad or missing bearer\x1b[0m",
+            req.uri().path()
+        );
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    next.run(req).await
 }
 
 /// Build the Mode B Axum router. Mounts the bound shell at
@@ -1491,7 +1919,7 @@ async fn serve_upload(
     State(state): State<ServeState>,
     Query(q): Query<UploadQuery>,
     mut multipart: Multipart,
-) -> impl IntoResponse {
+) -> Response {
     let workspace = state.workspace.as_ref();
     let target_dir = q.dir.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let uploads_dir = match target_dir {
@@ -1697,6 +2125,70 @@ fn verify_file_asset_for_user(
 /// Single-tenant: return the default shared session handle.
 /// Multi-tenant: verify the three cloud-routing headers and look up
 /// (or spawn) the per-user session in the registry.
+/// dev-plan/59 Step 2: optional bearer for single-user `--serve`.
+///
+/// Single-user `--serve` has never authenticated `/ws`: the router binds it
+/// with no auth layer, so anything that can reach the port drives the engine
+/// — runs tools, reads the workspace. That was defensible while the posture
+/// was "127.0.0.1, one user, one project". It stops being defensible when a
+/// supervisor runs several engines on loopback for different bots, because
+/// then any one of them is reachable by anything else on the machine.
+///
+/// Configured by `THCLAWS_SERVE_TOKEN`, deliberately an env var and NOT a
+/// flag: argv is world-readable through `ps`, while the environment of a
+/// process is not readable by other users on either macOS or Linux.
+///
+/// **Unset or empty = no auth = exactly today's behaviour.** This is
+/// additive; an existing `--serve` user sees no change unless they opt in.
+fn serve_token() -> Option<String> {
+    std::env::var("THCLAWS_SERVE_TOKEN")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// Constant-time compare so a wrong token cannot be recovered byte by byte
+/// from response timing.
+fn token_matches(expected: &str, given: &str) -> bool {
+    let (a, b) = (expected.as_bytes(), given.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Check the bearer on a request that carries one, when one is required.
+///
+/// Accepts either `Authorization: Bearer <t>` (what the supervisor's Rust WS
+/// client sends) or `?token=<t>` (what a browser could send, since the
+/// WebSocket API cannot set headers). Multi-tenant mode has its own HMAC
+/// identity check and is left alone — adding a second shared secret there
+/// would be a downgrade, not an upgrade.
+fn serve_token_ok(headers: &axum::http::HeaderMap, query: Option<&str>) -> bool {
+    let Some(expected) = serve_token() else {
+        return true; // not configured — unchanged behaviour
+    };
+    if let Some(v) = headers.get(axum::http::header::AUTHORIZATION) {
+        if let Some(t) = v.to_str().ok().and_then(|s| s.strip_prefix("Bearer ")) {
+            if token_matches(&expected, t.trim()) {
+                return true;
+            }
+        }
+    }
+    if let Some(q) = query {
+        for pair in q.split('&') {
+            if let Some(t) = pair.strip_prefix("token=") {
+                // The value arrives percent-encoded from a browser.
+                let decoded = urlencoding::decode(t).unwrap_or(std::borrow::Cow::Borrowed(t));
+                if token_matches(&expected, decoded.trim()) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 fn resolve_session_handle(
     state: &ServeState,
     headers: &axum::http::HeaderMap,
@@ -2637,6 +3129,317 @@ mod tests {
                 .unwrap(),
         );
         assert!(multiuser_request_authed("/", &signed, &ed, now));
+    }
+
+    /// dev-plan/59 Step 2. Single-user `--serve` authenticated nothing:
+    /// anything that could reach the port could drive the engine. The guard
+    /// has to be opt-in, because every existing deployment runs without it —
+    /// The host's own surface gets the same treatment as the classic one:
+    /// `/healthz` open for a parent probe, everything else behind the bearer.
+    /// It serves none of the workspace routes — `/file-asset` and
+    /// `/workspace/sync/*` read and write a bot's tree, and the bot serves
+    /// those itself behind its own token.
+    #[tokio::test]
+    async fn supervisor_router_gates_everything_but_healthz() {
+        use tower::ServiceExt as _;
+        let _g = crate::kms::test_env_lock();
+        let prev = std::env::var("THCLAWS_SERVE_TOKEN").ok();
+        let dir = tempfile::tempdir().unwrap();
+        let app = supervisor_router(crate::bots::supervisor::BotSupervisor::with_program(
+            dir.path(),
+            "/nonexistent",
+        ));
+
+        async fn status(app: &Router, uri: &str, auth: Option<&str>) -> StatusCode {
+            let mut req = axum::http::Request::builder().uri(uri);
+            if let Some(a) = auth {
+                req = req.header(axum::http::header::AUTHORIZATION, a);
+            }
+            app.clone()
+                .oneshot(req.body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status()
+        }
+
+        std::env::set_var("THCLAWS_SERVE_TOKEN", "host-secret");
+        for uri in [
+            "/",
+            "/ws",
+            "/bots",
+            "/bots/research",
+            "/file-asset/x.png",
+            "/upload",
+        ] {
+            assert_eq!(
+                status(&app, uri, None).await,
+                StatusCode::UNAUTHORIZED,
+                "{uri}"
+            );
+        }
+        // dev-plan/59 Step 5: the mutating routes install and delete folders,
+        // so they must sit behind the same bearer as everything else.
+        for (m, uri) in [("POST", "/bots"), ("DELETE", "/bots/research")] {
+            let req = axum::http::Request::builder()
+                .method(m)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            let got = app.clone().oneshot(req).await.unwrap().status();
+            assert_eq!(got, StatusCode::UNAUTHORIZED, "{m} {uri}");
+        }
+        assert_eq!(status(&app, "/healthz", None).await, StatusCode::OK);
+        // Every bot parked is a host that will never serve on its own;
+        // merely starting is not that.
+        use crate::bots::supervisor::BotState as S;
+        assert!(host_ok(&[]));
+        assert!(host_ok(&[S::Starting]));
+        assert!(host_ok(&[
+            S::CrashLooped { reason: "x".into() },
+            S::Starting
+        ]));
+        assert!(!host_ok(&[S::CrashLooped { reason: "x".into() }]));
+        assert!(!host_ok(&[
+            S::CrashLooped { reason: "x".into() },
+            S::CrashLooped { reason: "y".into() }
+        ]));
+        // dev-plan/59 §6.3: `?bot=` names a bot; an unknown one is a 404, not
+        // a silent fall-through to whichever bot happens to be default.
+        assert_eq!(
+            status(
+                &app,
+                "/file-asset/x.png?bot=nope",
+                Some("Bearer host-secret")
+            )
+            .await,
+            StatusCode::NOT_FOUND
+        );
+        assert_ne!(
+            status(&app, "/bots", Some("Bearer host-secret")).await,
+            StatusCode::UNAUTHORIZED
+        );
+        // `/file-asset` is forwarded to a bot, so with none running it is
+        // "nothing to forward to", not "no such route".
+        assert_eq!(
+            status(&app, "/file-asset/anything", Some("Bearer host-secret")).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        // A bot's shells are forwarded the same way — a bot with a default
+        // shell opened to an empty iframe while the host had no such route.
+        for uri in [
+            "/gui-shell/book-studio",
+            "/gui-shell/book-studio/",
+            "/gui-shell/book-studio/app.js",
+        ] {
+            assert_eq!(
+                status(&app, uri, Some("Bearer host-secret")).await,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{uri}"
+            );
+        }
+        // …and the bot a shell's sub-asset belongs to rides on the Referer,
+        // because `app.js` is fetched relative to a document whose `?bot=`
+        // the browser drops from the sub-request.
+        let referred = axum::http::Request::builder()
+            .uri("/gui-shell/book-studio/app.js")
+            .header(axum::http::header::AUTHORIZATION, "Bearer host-secret")
+            .header(
+                axum::http::header::REFERER,
+                "http://127.0.0.1:1/gui-shell/book-studio/?session=x&bot=nope&token=t",
+            )
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(referred).await.unwrap().status(),
+            StatusCode::NOT_FOUND,
+            "the Referer's bot is looked up, and 'nope' is not a bot"
+        );
+        // Sync stays absent: it operates on a whole workspace directory, and
+        // under a host that is the shelf, not any one bot's tree.
+        assert_eq!(
+            status(&app, "/workspace/sync/pull", Some("Bearer host-secret")).await,
+            StatusCode::NOT_FOUND
+        );
+
+        match prev {
+            Some(x) => std::env::set_var("THCLAWS_SERVE_TOKEN", x),
+            None => std::env::remove_var("THCLAWS_SERVE_TOKEN"),
+        }
+    }
+
+    /// Route-level proof of the gate, through the real router. The first
+    /// cut checked the bearer inside `ws_handler` + `serve_upload` only;
+    /// this pins every other route on the port (`/file-asset`, sync,
+    /// gui-shell, index) as gated too, `/healthz` as open, and a
+    /// multiuser state as skipped.
+    #[tokio::test]
+    async fn serve_bearer_gates_every_classic_route_except_healthz() {
+        use tower::ServiceExt as _;
+        let _g = crate::kms::test_env_lock();
+        let prev = std::env::var("THCLAWS_SERVE_TOKEN").ok();
+        // The sync handlers walk `state.workspace`; keep it an empty dir.
+        // One state only — `dummy_state` spawns a shared session (~25 s);
+        // the gate reads the env per request, so one router serves both
+        // halves.
+        let ws = tempfile::tempdir().unwrap();
+        let mut st = dummy_state(None);
+        st.workspace = std::sync::Arc::new(ws.path().to_path_buf());
+        let app = classic_router(st);
+
+        async fn status(app: &Router, method: &str, uri: &str, auth: Option<&str>) -> StatusCode {
+            let mut req = axum::http::Request::builder().method(method).uri(uri);
+            if let Some(a) = auth {
+                req = req.header(axum::http::header::AUTHORIZATION, a);
+            }
+            app.clone()
+                .oneshot(req.body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status()
+        }
+
+        // Unconfigured: nothing on the port answers 401.
+        std::env::remove_var("THCLAWS_SERVE_TOKEN");
+        for (m, u) in [
+            ("GET", "/file-asset/no-such-file"),
+            ("GET", "/workspace/sync/stat"),
+            ("GET", "/gui-shell/nope/x.js"),
+            ("GET", "/"),
+        ] {
+            assert_ne!(
+                status(&app, m, u, None).await,
+                StatusCode::UNAUTHORIZED,
+                "{m} {u}"
+            );
+        }
+
+        std::env::set_var("THCLAWS_SERVE_TOKEN", "route-secret");
+        for (m, u) in [
+            ("GET", "/"),
+            ("GET", "/ws"),
+            ("POST", "/upload"),
+            ("GET", "/file-asset/no-such-file"),
+            ("GET", "/gui-shell/nope/x.js"),
+            ("GET", "/workspace/sync/stat"),
+            ("GET", "/workspace/sync/pull"),
+            ("GET", "/workspace/sync/manifest"),
+        ] {
+            assert_eq!(
+                status(&app, m, u, None).await,
+                StatusCode::UNAUTHORIZED,
+                "{m} {u}"
+            );
+            assert_eq!(
+                status(&app, m, u, Some("Bearer route-secrex")).await,
+                StatusCode::UNAUTHORIZED,
+                "wrong token {m} {u}"
+            );
+        }
+        assert_eq!(status(&app, "GET", "/healthz", None).await, StatusCode::OK);
+        assert_ne!(
+            status(
+                &app,
+                "GET",
+                "/file-asset/no-such-file",
+                Some("Bearer route-secret")
+            )
+            .await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_ne!(
+            status(
+                &app,
+                "GET",
+                "/file-asset/no-such-file?token=route-secret",
+                None
+            )
+            .await,
+            StatusCode::UNAUTHORIZED
+        );
+
+        // Multiuser: identity comes from `multiuser_auth`, the gate steps
+        // aside. `classic_router` hands the gate `multi_tenant.is_none()`,
+        // so `false` here is the multiuser shape.
+        let mt = Router::new()
+            .route("/probe", get(|| async { "ok" }))
+            .route_layer(axum::middleware::from_fn_with_state(
+                false,
+                serve_token_gate,
+            ));
+        assert_eq!(status(&mt, "GET", "/probe", None).await, StatusCode::OK);
+
+        match prev {
+            Some(x) => std::env::set_var("THCLAWS_SERVE_TOKEN", x),
+            None => std::env::remove_var("THCLAWS_SERVE_TOKEN"),
+        }
+    }
+
+    /// so "no token configured" must behave exactly as before.
+    #[test]
+    fn serve_bearer_is_opt_in_and_accepts_header_or_query() {
+        let _g = crate::kms::test_env_lock();
+        let prev = std::env::var("THCLAWS_SERVE_TOKEN").ok();
+        let restore = |v: &Option<String>| match v {
+            Some(x) => std::env::set_var("THCLAWS_SERVE_TOKEN", x),
+            None => std::env::remove_var("THCLAWS_SERVE_TOKEN"),
+        };
+
+        // Unconfigured: everything passes. This is today's behaviour and the
+        // reason the change is safe to ship on its own.
+        std::env::remove_var("THCLAWS_SERVE_TOKEN");
+        assert!(serve_token_ok(&axum::http::HeaderMap::new(), None));
+        assert!(serve_token_ok(
+            &axum::http::HeaderMap::new(),
+            Some("token=anything")
+        ));
+
+        std::env::set_var("THCLAWS_SERVE_TOKEN", "s3cret-value");
+
+        // Nothing presented → refused.
+        assert!(!serve_token_ok(&axum::http::HeaderMap::new(), None));
+
+        // Header form — what the supervisor's Rust WS client sends.
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer s3cret-value".parse().unwrap(),
+        );
+        assert!(serve_token_ok(&h, None));
+
+        // Wrong secret in the right shape → refused.
+        let mut bad = axum::http::HeaderMap::new();
+        bad.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer s3cret-valuf".parse().unwrap(),
+        );
+        assert!(!serve_token_ok(&bad, None));
+
+        // Query form — a browser WebSocket cannot set headers.
+        assert!(serve_token_ok(
+            &axum::http::HeaderMap::new(),
+            Some("token=s3cret-value")
+        ));
+        // …including alongside other params, and percent-encoded.
+        assert!(serve_token_ok(
+            &axum::http::HeaderMap::new(),
+            Some("x=1&token=s3cret-value&y=2")
+        ));
+        assert!(!serve_token_ok(
+            &axum::http::HeaderMap::new(),
+            Some("token=wrong")
+        ));
+        // A prefix of the real token must not pass — length is compared too.
+        assert!(!serve_token_ok(
+            &axum::http::HeaderMap::new(),
+            Some("token=s3cret")
+        ));
+
+        // Whitespace-only is treated as unset, so a stray export cannot
+        // silently lock a user out of their own serve.
+        std::env::set_var("THCLAWS_SERVE_TOKEN", "   ");
+        assert!(serve_token_ok(&axum::http::HeaderMap::new(), None));
+
+        restore(&prev);
     }
 
     #[test]

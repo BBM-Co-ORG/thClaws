@@ -198,7 +198,14 @@ function StartupModal({
     let gotResponse = false;
     const unsub = subscribe((msg) => {
       if (msg.type === "current_cwd" && typeof msg.path === "string") {
+        // The retry loop below can put several asks in flight before the
+        // first answer lands. Only the first decides: a later one saying
+        // "no picker" would otherwise skip a picker the first one opened.
+        if (gotResponse) return;
         gotResponse = true;
+        // A slow backend is not a dead one — clear the diagnostic if the
+        // answer arrives after the deadline.
+        setIpcDead(false);
         setCwd(msg.path as string);
         if (Array.isArray(msg.recent_dirs)) {
           setRecentDirs(msg.recent_dirs as string[]);
@@ -946,7 +953,11 @@ export default function App() {
     // swap) could scroll this container down by the tab-bar height — the tab
     // bar then rendered above the viewport with an equal empty gap below
     // (navbar "gone"). `clip` makes the box unscrollable, so nothing can shift.
-    <div className="fixed inset-x-0 top-0 flex flex-col h-[100dvh] overflow-clip">
+    // dev-plan/59 §6.3: `left` comes from `--rail-w`, which the workspace
+    // shell sets when it renders the bot rail (0 when there is none). The
+    // root has to stay `fixed` — see above — so it cannot simply live inside
+    // the shell's flex row.
+    <div className="fixed right-0 top-0 left-[var(--rail-w,0px)] flex flex-col h-[100dvh] overflow-clip">
       <FrontendReadyBeacon />
       {fullscreen && (
         <FullscreenExitChrome

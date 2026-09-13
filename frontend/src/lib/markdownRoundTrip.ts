@@ -282,7 +282,12 @@ turndownService.addRule("mdImage", {
     const alt = el.getAttribute("alt") || "";
     const title = el.getAttribute("title");
     const target = /\s/.test(src) ? `<${src}>` : src;
-    const md = `![${alt}](${target}${title ? ` "${title.replace(/"/g, '\\"')}"` : ""})`;
+    // Escape the backslashes BEFORE the quotes: escaping only `"` turns a
+    // title of `a\"b` into `a\\"b`, which markdown reads as an escaped
+    // backslash followed by a live quote — the title string ends early and
+    // the rest of the line leaks into the document.
+    const mdTitle = title?.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+    const md = `![${alt}](${target}${title ? ` "${mdTitle}"` : ""})`;
     const parent = el.parentNode?.nodeName ?? "";
     return BLOCK_IMG_PARENTS.includes(parent) ? `\n\n${md}\n\n` : md;
   },
@@ -317,7 +322,12 @@ function cellMarkdown(cell: HTMLElement): string {
   return turndownService
     .turndown(cell.innerHTML)
     .trim()
-    .replace(/\|/g, "\\|")
+    // Escape the pipe along with any backslash run in front of it. A bare
+    // `.replace(/\|/g, "\\|")` turns `a\|b` into `a\\|b` — an escaped
+    // backslash and then a LIVE cell separator, which splits the row. Only
+    // the run touching the pipe is doubled; turndown's own escapes
+    // (`\*`, `\_`) elsewhere in the cell must be left exactly as they are.
+    .replace(/(\\*)\|/g, (_m, slashes: string) => `${slashes}${slashes}\\|`)
     .replace(/\s*\n+\s*/g, "<br>");
 }
 

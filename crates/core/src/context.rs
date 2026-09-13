@@ -160,6 +160,16 @@ fn load_claude_md_compat_flag() -> bool {
 /// (user-level Claude Code memory). Default behavior (`false`) skips
 /// those — the user's Claude Code identity isn't generic agent
 /// instructions and shouldn't bleed into thClaws's prompt.
+/// `<…>/.thclaws/bots` — the shelf a bot sits on. Reaching it while walking
+/// up means the walk has left the bot and entered the host.
+fn is_bot_shelf(dir: &Path) -> bool {
+    dir.file_name().is_some_and(|n| n == "bots")
+        && dir
+            .parent()
+            .and_then(|p| p.file_name())
+            .is_some_and(|n| n == ".thclaws")
+}
+
 pub fn find_claude_md_with(start: &Path, claude_md_compat: bool) -> Option<String> {
     // Shared-agent mode (dev-plan/41): instructions are LOCKED to the
     // company brain's `AGENTS.md`. Every other source — working-dir
@@ -209,6 +219,14 @@ pub fn find_claude_md_with(start: &Path, claude_md_compat: bool) -> Option<Strin
     let mut ancestor_groups: Vec<Vec<String>> = Vec::new();
     let mut cur = Some(start);
     while let Some(dir) = cur {
+        // dev-plan/59: a bot lives at `<ws>/.thclaws/bots/<slug>/`, and above
+        // it is the host — someone else's tree. Without this stop, every bot
+        // would load the host's AGENTS.md, which after a v2→v3 migration is
+        // the tombstone addressed to an OLD binary: every migrated bot would
+        // open by telling its user the workspace needs upgrading.
+        if is_bot_shelf(dir) {
+            break;
+        }
         let mut group: Vec<String> = Vec::new();
         for name in ["CLAUDE.md", "AGENTS.md"] {
             let candidate = dir.join(name);
@@ -462,6 +480,49 @@ pub fn scan_claude_md_oversize(start: &Path) -> Vec<ClaudeMdOversize> {
 
 #[cfg(test)]
 mod tests {
+
+    /// dev-plan/59: the ancestor walk must stop at the shelf. A bot at
+    /// `<ws>/.thclaws/bots/<slug>/` is not part of the host's project, and
+    /// the host's AGENTS.md after a migration is a tombstone addressed to an
+    /// older binary — loading it would make every migrated bot open by
+    /// telling its user the workspace is broken.
+    #[test]
+    fn a_bot_does_not_inherit_the_hosts_instructions() {
+        let ws = tempfile::tempdir().unwrap();
+        let bot = ws.path().join(".thclaws/bots/main");
+        std::fs::create_dir_all(&bot).unwrap();
+        std::fs::write(
+            ws.path().join("AGENTS.md"),
+            "TOMBSTONE: this workspace has been upgraded",
+        )
+        .unwrap();
+        std::fs::write(bot.join("AGENTS.md"), "I am the research bot.").unwrap();
+
+        let loaded = find_claude_md_with(&bot, false).unwrap_or_default();
+        assert!(loaded.contains("I am the research bot."), "{loaded}");
+        assert!(
+            !loaded.contains("TOMBSTONE"),
+            "the host's instructions leaked into a bot:\n{loaded}"
+        );
+
+        // A bot with no instructions of its own inherits nothing either.
+        let bare = ws.path().join(".thclaws/bots/bare");
+        std::fs::create_dir_all(&bare).unwrap();
+        let loaded = find_claude_md_with(&bare, false).unwrap_or_default();
+        assert!(!loaded.contains("TOMBSTONE"), "{loaded}");
+    }
+
+    /// The stop is specific to the shelf: an ordinary `bots/` folder in
+    /// someone's project must keep inheriting its parents.
+    #[test]
+    fn an_ordinary_bots_folder_is_not_a_shelf() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("bots/worker");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(root.path().join("AGENTS.md"), "PROJECT RULES").unwrap();
+        let loaded = find_claude_md_with(&nested, false).unwrap_or_default();
+        assert!(loaded.contains("PROJECT RULES"), "{loaded}");
+    }
     use super::*;
     use tempfile::tempdir;
 
