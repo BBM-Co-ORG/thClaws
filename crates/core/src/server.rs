@@ -386,7 +386,7 @@ pub async fn run_with_engine(
 ) -> crate::error::Result<()> {
     let workspace = match config.workspace.clone() {
         Some(p) => p,
-        None => std::env::current_dir()
+        None => Ok::<_, std::io::Error>(crate::workdir::workspace_root())
             .map_err(|e| crate::error::Error::Tool(format!("workspace cwd unavailable: {e}")))?,
     };
     // dev-plan/42: flag the process as multiuser so global cwd/sandbox
@@ -1016,6 +1016,26 @@ pub async fn run_supervisor_on(listener: tokio::net::TcpListener) -> crate::erro
     // Held for the life of the host. Two hosts on one workspace would both
     // spawn children and fight over bots.json and the address files.
     let _lock = crate::bots::lock_workspace(&workspace, "this host")?;
+    // dev-plan/61: files the first multi-agent upgrade hid under
+    // `.thclaws/bots/main/` go back to the root every agent shares.
+    match crate::bots::migrate::restore_shared_files(&workspace) {
+        Ok(r) if !r.moved.is_empty() || r.removed_tombstone || r.stamped_v4 => eprintln!(
+            "\x1b[36m[bots] put {} item(s) back at the workspace root{}\x1b[0m",
+            r.moved.len(),
+            if r.clashes.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; left in .thclaws/bots/main/ because the root has the same name: {}",
+                    r.clashes.join(", ")
+                )
+            }
+        ),
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("\x1b[33m[bots] could not put files back at the workspace root: {e}\x1b[0m")
+        }
+    }
     let cfg = crate::bots::BotsConfig::load(&workspace)?;
     let sup = crate::bots::supervisor::BotSupervisor::new(&workspace)?;
     spawn_host_heartbeat(sup.clone());
@@ -2127,7 +2147,7 @@ async fn serve_file_asset(
     axum::extract::Path(rel): axum::extract::Path<String>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let cwd = crate::workdir::workspace_root();
     let range = headers
         .get(axum::http::header::RANGE)
         .and_then(|v| v.to_str().ok());

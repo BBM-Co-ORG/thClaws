@@ -86,6 +86,8 @@ pub enum BotState {
 pub struct Bot {
     pub slug: String,
     pub dir: PathBuf,
+    /// The workspace whose files every agent shares (dev-plan/61).
+    workspace_root: PathBuf,
     /// Where the child publishes the address it actually bound. Lives under
     /// the HOST's `state/`, not in the bot's tree: it is the supervisor's
     /// runtime bookkeeping and is stripped from any publish.
@@ -298,6 +300,7 @@ impl BotSupervisor {
         let bot = Arc::new(Bot {
             slug: def.slug.clone(),
             dir,
+            workspace_root: self.workspace.clone(),
             addr_file,
             token: StdMutex::new(String::new()),
             stop_tx,
@@ -641,6 +644,9 @@ fn spawn_child(bot: &Arc<Bot>, program: &Path) -> Result<Spawned> {
         .env("THCLAWS_SERVE_TOKEN", &token)
         .env("THCLAWS_SERVE_ADDR_FILE", &bot.addr_file)
         .env("THCLAWS_SUPERVISED", "1")
+        // dev-plan/61: an agent's files are the workspace's. Its own folder
+        // stays its cwd, for its settings, sessions and memory.
+        .env("THCLAWS_WORKSPACE_ROOT", &bot.workspace_root)
         .env("HOME", &home)
         // Held open by this process: the child exits when it reads EOF, so a
         // host that dies without reaping does not leave orphans behind.
@@ -817,6 +823,7 @@ impl Bot {
         Arc::new(Bot {
             slug: slug.to_string(),
             dir: PathBuf::from("."),
+            workspace_root: PathBuf::from("."),
             addr_file: PathBuf::from("."),
             token: StdMutex::new(token.to_string()),
             stop_tx: watch::channel(false).0,
@@ -835,6 +842,7 @@ impl Bot {
         Arc::new(Bot {
             slug: slug.to_string(),
             dir: PathBuf::from("."),
+            workspace_root: PathBuf::from("."),
             addr_file: PathBuf::from("."),
             token: StdMutex::new(String::new()),
             stop_tx: watch::channel(false).0,

@@ -134,11 +134,25 @@ pub fn create_blank(workspace: &Path, slug: &str) -> Result<Installed> {
 /// routing choice was missing. Copied at install, never afterwards, so a bot
 /// the user later re-points keeps its own answer.
 fn seed_workspace_gateway_choice(workspace: &Path, dest: &Path) {
+    // Read the way `apply_to` reads a project: an explicit `gatewayProxy`
+    // wins, and a non-empty legacy `gatewayUseFor` list means "on". Hosted
+    // runners write only the list, so reading the flag alone found no choice
+    // on the host or on `main`, and every agent added to a hosted workspace
+    // opened without the gateway.
     let flag_in = |path: PathBuf| -> Option<bool> {
-        std::fs::read(path)
+        let v = std::fs::read(path)
             .ok()
-            .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())
-            .and_then(|v| v.get("gatewayProxy").and_then(|b| b.as_bool()))
+            .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())?;
+        if let Some(b) = v.get("gatewayProxy").and_then(|b| b.as_bool()) {
+            return Some(b);
+        }
+        v.get("gatewayUseFor")
+            .and_then(|l| l.as_array())
+            .filter(|l| {
+                l.iter()
+                    .any(|p| p.as_str().is_some_and(|s| !s.trim().is_empty()))
+            })
+            .map(|_| true)
     };
     let host_on = flag_in(workspace.join(".thclaws/settings.json"))
         // After a migration the workspace's original agent — and the choice
@@ -276,6 +290,62 @@ mod tests {
             cfg.bots.iter().map(|b| b.slug.as_str()).collect::<Vec<_>>(),
             vec!["main", "scratch"]
         );
+    }
+
+    fn write_settings(path: &Path, body: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    fn proxy_of(dir: &Path) -> Option<bool> {
+        let raw = std::fs::read(dir.join(".thclaws/settings.json")).ok()?;
+        serde_json::from_slice::<serde_json::Value>(&raw)
+            .ok()?
+            .get("gatewayProxy")
+            .and_then(|b| b.as_bool())
+    }
+
+    /// A hosted runner writes only the legacy `gatewayUseFor` list, on the
+    /// host and on every agent. An agent added there has to open on the
+    /// gateway, or its first turn fails on a placeholder key.
+    #[test]
+    fn an_agent_added_to_a_hosted_workspace_gets_the_gateway() {
+        let ws = v3_workspace();
+        write_settings(
+            &ws.path().join(".thclaws/settings.json"),
+            r#"{"workspaceVersion":3,"gatewayUseFor":["anthropic","openai"]}"#,
+        );
+        let made = create_blank(ws.path(), "scratch").unwrap();
+        assert_eq!(proxy_of(&made.dir), Some(true));
+    }
+
+    /// The first start after an upgrade: the host's settings are the minimal
+    /// file the migration wrote, and the list lives in `main`.
+    #[test]
+    fn the_gateway_list_in_main_counts_when_the_host_has_none() {
+        let ws = v3_workspace();
+        write_settings(
+            &ws.path().join(".thclaws/settings.json"),
+            r#"{"workspaceVersion":3}"#,
+        );
+        write_settings(
+            &bot_dir(ws.path(), "main").join(".thclaws/settings.json"),
+            r#"{"gatewayUseFor":["deepseek"]}"#,
+        );
+        let made = create_blank(ws.path(), "helper").unwrap();
+        assert_eq!(proxy_of(&made.dir), Some(true));
+    }
+
+    /// An explicit `gatewayProxy: false` is a choice, and it beats a list.
+    #[test]
+    fn an_explicit_byok_choice_on_the_host_is_not_overridden_by_a_list() {
+        let ws = v3_workspace();
+        write_settings(
+            &ws.path().join(".thclaws/settings.json"),
+            r#"{"gatewayProxy":false,"gatewayUseFor":["anthropic"]}"#,
+        );
+        let made = create_blank(ws.path(), "byok").unwrap();
+        assert_ne!(proxy_of(&made.dir), Some(true));
     }
 
     #[test]

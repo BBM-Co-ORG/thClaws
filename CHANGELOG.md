@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.128.0] — 2026-09-14
+
+**Your files stay in your workspace.** Every agent in a workspace now reads and writes the same files at the workspace root, the files you see in Finder and drag in yourself.
+
+### Changed
+- **All agents in a workspace share its files.** An agent's own folder under `.thclaws/bots/` holds only the agent: its settings, sessions, memory and identity. File tools, the shell, the Files tab and uploads all work on the workspace root.
+- **Upgrading a single-agent workspace moves only the agent.** Its `.thclaws/`, `AGENTS.md`, `CLAUDE.md` and `manifest.json` move into `.thclaws/bots/main/`. Your files and your git repository stay where they are. The workspace is marked layout version 4.
+
+### Fixed
+- **v0.126.0 and v0.127.0 hid your files inside `.thclaws/bots/main/`.** The first time 0.128.0 opens such a workspace, it moves them back to the root and marks it version 4. Nothing is overwritten: a name the root already has stays in the agent folder, and the start-up log names it.
+- **An agent added to a hosted workspace opened without the gateway.** The new agent copies the workspace's gateway choice, but hosted workspaces record it as a provider list, and only the on/off flag was read. The list now counts the same way it does everywhere else.
+
 ## [0.127.0] — 2026-09-13
 
 **Workspaces with more than one agent, finished.** Schedules, `/cloud push` and `/cloud pull`, and the OpenAI-compatible API all work again in a workspace that holds several agents, and a workspace that was upgraded can be taken back.

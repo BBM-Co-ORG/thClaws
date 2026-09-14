@@ -26,8 +26,14 @@ impl Sandbox {
     /// project root would be denied.
     /// Falls back to current_dir for standalone (non-team) invocations.
     pub fn init() -> Result<()> {
-        let root_path = match std::env::var("THCLAWS_PROJECT_ROOT") {
-            Ok(s) if !s.is_empty() => PathBuf::from(s),
+        // A workspace host's agent shares the workspace's files (dev-plan/61);
+        // a worktree teammate's project root is the next choice.
+        let root_path = match (
+            std::env::var("THCLAWS_WORKSPACE_ROOT"),
+            std::env::var("THCLAWS_PROJECT_ROOT"),
+        ) {
+            (Ok(s), _) if !s.trim().is_empty() => PathBuf::from(s),
+            (_, Ok(s)) if !s.is_empty() => PathBuf::from(s),
             _ => std::env::current_dir()?,
         };
         let root = root_path

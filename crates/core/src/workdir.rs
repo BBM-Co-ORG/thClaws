@@ -55,7 +55,19 @@ pub fn is_multiuser() -> bool {
 pub fn current_workdir() -> PathBuf {
     WORKDIR
         .try_with(|p| p.clone())
-        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default())
+        .unwrap_or_else(|_| workspace_root())
+}
+
+/// dev-plan/61: the folder a user's files live in. An agent under a workspace
+/// host runs with its own folder as the process cwd, so its settings,
+/// sessions and memory stay its own, but its files are the workspace's: the
+/// host passes `THCLAWS_WORKSPACE_ROOT`, and every agent reads and writes
+/// there. Without the variable this is the process cwd, as before.
+pub fn workspace_root() -> PathBuf {
+    match std::env::var("THCLAWS_WORKSPACE_ROOT") {
+        Ok(s) if !s.trim().is_empty() => PathBuf::from(s),
+        _ => std::env::current_dir().unwrap_or_default(),
+    }
 }
 
 /// True when a per-session working root is active (i.e. we're inside a
@@ -77,6 +89,40 @@ where
 
 #[cfg(test)]
 mod tests {
+
+    /// dev-plan/61: an agent under a workspace host shares the workspace's
+    /// files. The host passes `THCLAWS_WORKSPACE_ROOT`; the agent's own folder
+    /// stays its process cwd.
+    #[test]
+    fn an_agent_under_a_host_resolves_files_against_the_workspace() {
+        let _g = crate::kms::test_env_lock();
+        let prev = std::env::var("THCLAWS_WORKSPACE_ROOT").ok();
+        let ws = tempfile::tempdir().unwrap();
+
+        std::env::remove_var("THCLAWS_WORKSPACE_ROOT");
+        assert_eq!(workspace_root(), std::env::current_dir().unwrap());
+
+        std::env::set_var("THCLAWS_WORKSPACE_ROOT", ws.path());
+        assert_eq!(workspace_root(), ws.path());
+        assert_eq!(
+            current_workdir(),
+            ws.path(),
+            "unscoped tools use the shared root"
+        );
+
+        std::env::set_var("THCLAWS_WORKSPACE_ROOT", "   ");
+        assert_eq!(
+            workspace_root(),
+            std::env::current_dir().unwrap(),
+            "blank is unset"
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("THCLAWS_WORKSPACE_ROOT", v),
+            None => std::env::remove_var("THCLAWS_WORKSPACE_ROOT"),
+        }
+    }
+
     use super::*;
 
     #[tokio::test]

@@ -29,7 +29,17 @@ use std::path::{Path, PathBuf};
 /// `ProjectConfig::CURRENT_WORKSPACE_VERSION`: bumping that would make the
 /// v1→v2 pass treat every v2 workspace as stale, move nothing, and stamp it
 /// v3 — marking workspaces migrated that never were.
-pub const HOST_WORKSPACE_VERSION: u32 = 3;
+pub const HOST_WORKSPACE_VERSION: u32 = 4;
+
+/// dev-plan/61: the layout versions of a workspace with a host.
+/// - 3 — v0.126.0/v0.127.0: the user's files were moved into
+///   `.thclaws/bots/main/`, hidden from Finder and from every other agent.
+/// - 4 — the files stay at the root, which every agent shares; an agent folder
+///   holds only the agent (settings, sessions, memory, identity).
+///
+/// Any version from 3 up has a host, so "is this already a host workspace"
+/// reads [`FIRST_HOST_VERSION`]; only v3 needs its files put back.
+pub const FIRST_HOST_VERSION: u32 = 3;
 
 /// The bot a migrated workspace's agent becomes.
 pub const MAIN_SLUG: &str = "main";
@@ -39,6 +49,21 @@ const MARKER: &str = ".thclaws-v3-migration.marker";
 /// Where `unmigrate` puts the host's `.thclaws/` — its agent list, state and
 /// settings — instead of deleting it.
 pub const HOST_BACKUP: &str = ".thclaws-v3-host";
+
+/// dev-plan/61: what makes a folder an agent. The upgrade moves only these into
+/// `.thclaws/bots/main/`; everything else is the user's and stays at the root,
+/// where every agent reads and writes it.
+const AGENT_ENTRIES: &[&str] = &[".thclaws", "AGENTS.md", "CLAUDE.md", "manifest.json"];
+
+/// What an agent folder keeps when files the old upgrade moved are put back.
+/// `.home` is the agent's own HOME under a host.
+const AGENT_KEEPS: &[&str] = &[
+    ".thclaws",
+    ".home",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "manifest.json",
+];
 
 /// Hosted runners mount the workspace PVC twice — whole at `/workspace`, and
 /// again at the engine's `$HOME` via `subPath: .home`. It is user
@@ -148,6 +173,10 @@ fn movable_entries(workspace: &Path) -> Result<Vec<String>> {
             || name == HOST_BACKUP
             || KEEP_AT_ROOT.contains(&name.as_str())
         {
+            continue;
+        }
+        // dev-plan/61: the user's files stay at the root.
+        if !AGENT_ENTRIES.contains(&name.as_str()) {
             continue;
         }
         names.push(name);
@@ -267,8 +296,8 @@ pub fn plan(workspace: &Path) -> Result<Plan> {
 
     let status = match resume {
         Some(phase) => Status::Resume(phase),
-        None if version >= HOST_WORKSPACE_VERSION && shelf.is_dir() => Status::AlreadyV3,
-        None if version >= HOST_WORKSPACE_VERSION => {
+        None if version >= FIRST_HOST_VERSION && shelf.is_dir() => Status::AlreadyV3,
+        None if version >= FIRST_HOST_VERSION => {
             return Err(Error::Config(format!(
                 "{} declares workspaceVersion {version} but has no {} — its agents are missing, and \
                  migrating again would move the host's own tree into a new one. Restore the shelf \
@@ -562,17 +591,21 @@ pub fn unmigrate(ws: &Path) -> Result<UnmigrateReport> {
                 backup.display()
             )));
         }
-        let stray: Vec<String> = std::fs::read_dir(ws)?
+        // The root holds the user's files (dev-plan/61), so only a name the
+        // agent folder also holds is a problem: moving it back would overwrite.
+        let agent_dir = bot_dir(ws, MAIN_SLUG);
+        let clashes: Vec<String> = std::fs::read_dir(&agent_dir)?
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().to_string())
-            .filter(|n| !host_root_entry_ok(ws, n))
+            .filter(|n| n != ".thclaws" && !KEEP_AT_ROOT.contains(&n.as_str()))
+            .filter(|n| ws.join(n).exists() && !host_root_entry_ok(ws, n))
             .collect();
-        if !stray.is_empty() {
+        if !clashes.is_empty() {
             return Err(Error::Config(format!(
-                "{} has files at its root that belong to neither the host nor the agent: {}. \
-                 Move them into .thclaws/bots/{MAIN_SLUG}/ or aside first.",
+                "{} already has {} at its root, and the agent folder holds the same names. \
+                 Move one of each aside first.",
                 ws.display(),
-                stray.join(", ")
+                clashes.join(", ")
             )));
         }
         Some(super::lock_workspace(ws, "a reverse migration")?)
@@ -641,6 +674,93 @@ fn unrewrite_schedules(ws: &Path) -> Result<Vec<String>> {
     Ok(touched)
 }
 
+#[derive(Debug, Default)]
+pub struct RestoreReport {
+    /// Entries moved from `.thclaws/bots/main/` back to the workspace root.
+    pub moved: Vec<String>,
+    /// Entries left in the agent folder because the root already has the name.
+    pub clashes: Vec<String>,
+    pub removed_tombstone: bool,
+    /// The workspace was v3 and is now v4.
+    pub stamped_v4: bool,
+}
+
+/// dev-plan/61: put back the files the first multi-agent upgrade moved, and
+/// mark the workspace v4.
+///
+/// v0.126.0 and v0.127.0 moved the whole workspace, the user's files included,
+/// into `.thclaws/bots/main/`, which hid them from Finder and from every other
+/// agent. Everything in that folder that is not the agent itself goes back to
+/// the root. Renames only; a name the root already has stays where it is and is
+/// reported, never overwritten. Safe to run on every open: a workspace with
+/// nothing to put back is untouched. The caller holds the workspace lock.
+pub fn restore_shared_files(ws: &Path) -> Result<RestoreReport> {
+    let mut report = RestoreReport::default();
+    if !ws.join(super::CONFIG_REL).exists() {
+        return Ok(report);
+    }
+    // Only a v3 workspace holds files the old upgrade moved. A v4 agent folder
+    // may hold files on purpose, and they stay where they are.
+    let host_settings = ws.join(".thclaws/settings.json");
+    if raw_workspace_version(&host_settings).unwrap_or(0) != FIRST_HOST_VERSION {
+        return Ok(report);
+    }
+    let main = bot_dir(ws, MAIN_SLUG);
+    if !main.is_dir() {
+        stamp_host_version(ws, HOST_WORKSPACE_VERSION)?;
+        report.stamped_v4 = true;
+        return Ok(report);
+    }
+    let tombstone = ws.join("AGENTS.md");
+    if std::fs::read_to_string(&tombstone).is_ok_and(|s| s == TOMBSTONE) {
+        std::fs::remove_file(&tombstone)?;
+        report.removed_tombstone = true;
+    }
+    let mut names: Vec<std::ffi::OsString> = std::fs::read_dir(&main)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name())
+        .collect();
+    names.sort();
+    for name in names {
+        let shown = name.to_string_lossy().to_string();
+        if AGENT_KEEPS.contains(&shown.as_str()) {
+            continue;
+        }
+        let dst = ws.join(&name);
+        if std::fs::symlink_metadata(&dst).is_ok() {
+            report.clashes.push(shown);
+            continue;
+        }
+        std::fs::rename(main.join(&name), &dst).map_err(|e| {
+            Error::Config(format!(
+                "cannot move {} back to the workspace root: {e}",
+                main.join(&name).display()
+            ))
+        })?;
+        report.moved.push(shown);
+    }
+    // A name the root already had stays in the agent folder and is reported
+    // once; putting it back is the user's call, not something to retry on every
+    // open.
+    stamp_host_version(ws, HOST_WORKSPACE_VERSION)?;
+    report.stamped_v4 = true;
+    Ok(report)
+}
+
+/// Set `workspaceVersion` in the host's settings, keeping every other key.
+fn stamp_host_version(ws: &Path, version: u32) -> Result<()> {
+    let path = ws.join(".thclaws/settings.json");
+    let mut base = std::fs::read(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if let Some(obj) = base.as_object_mut() {
+        obj.insert("workspaceVersion".into(), serde_json::json!(version));
+        std::fs::write(&path, serde_json::to_string_pretty(obj)?)?;
+    }
+    Ok(())
+}
+
 // Phases run in order, so `start <= Phase::Install` reads naturally.
 impl PartialOrd for Phase {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
@@ -703,10 +823,10 @@ fn install_host_files(ws: &Path) -> Result<()> {
     // an old binary loads it as project instructions like any other, and the
     // model then explains the situation in the user's own language instead of
     // building on top of what looks like an empty workspace.
-    let tombstone = ws.join("AGENTS.md");
-    if !tombstone.exists() {
-        std::fs::write(&tombstone, TOMBSTONE)?;
-    }
+    // dev-plan/61: no tombstone at the root any more. The root holds the
+    // user's files, and an `AGENTS.md` there loads into every agent through
+    // the ancestor walk. An older binary opening the root now finds the user's
+    // files where they always were.
     Ok(())
 }
 
@@ -1060,11 +1180,13 @@ mod tests {
         apply(&plan(&ws).unwrap()).unwrap();
         // The first rename happened, then the process died.
         std::fs::rename(ws.join(".thclaws"), ws.join(HOST_BACKUP)).unwrap();
-        std::fs::rename(
-            ws.join("AGENTS.md"),
-            ws.join(HOST_BACKUP).join("AGENTS.md.tombstone"),
-        )
-        .unwrap();
+        if ws.join("AGENTS.md").exists() {
+            std::fs::rename(
+                ws.join("AGENTS.md"),
+                ws.join(HOST_BACKUP).join("AGENTS.md.tombstone"),
+            )
+            .unwrap();
+        }
         let report = unmigrate(&ws).unwrap();
         assert!(report.moved > 0);
         assert_eq!(read(&ws.join("AGENTS.md")), "# The agent\n");
@@ -1090,13 +1212,114 @@ mod tests {
     }
 
     #[test]
-    fn unmigrate_refuses_files_it_cannot_place() {
+    fn unmigrate_refuses_a_name_both_the_root_and_the_agent_hold() {
         let (_root, ws) = v2_workspace("stray");
         apply(&plan(&ws).unwrap()).unwrap();
+        // A file the user makes at the root is theirs and never blocks anything.
         std::fs::write(ws.join("new-at-root.txt"), "made after the upgrade").unwrap();
+        // The same name as something in the agent folder would be overwritten.
+        std::fs::write(ws.join("manifest.json"), "the user's own").unwrap();
         let err = unmigrate(&ws).unwrap_err().to_string();
-        assert!(err.contains("new-at-root.txt"), "{err}");
+        assert!(err.contains("manifest.json"), "{err}");
+        assert!(!err.contains("new-at-root.txt"), "{err}");
         assert!(ws.join(".thclaws/bots.json").exists(), "nothing moved");
+        assert_eq!(read(&ws.join("manifest.json")), "the user's own");
+    }
+
+    /// dev-plan/61: the layout v0.126.0/v0.127.0 left behind — the user's
+    /// files inside `.thclaws/bots/main/` and a tombstone at the root — is put
+    /// back on open, without overwriting anything the root already has.
+    #[test]
+    fn files_the_old_upgrade_hid_go_back_to_the_root() {
+        let (_root, ws) = v2_workspace("old-layout");
+        apply(&plan(&ws).unwrap()).unwrap();
+        stamp_host_version(&ws, FIRST_HOST_VERSION).unwrap();
+        let bot = ws.join(".thclaws/bots/main");
+        for name in ["output", "src", ".git", ".gitignore"] {
+            std::fs::rename(ws.join(name), bot.join(name)).unwrap();
+        }
+        std::fs::write(ws.join("AGENTS.md"), TOMBSTONE).unwrap();
+        std::fs::write(ws.join("notes.md"), "made at the root").unwrap();
+        std::fs::write(bot.join("notes.md"), "from before").unwrap();
+
+        let r = restore_shared_files(&ws).unwrap();
+        assert_eq!(r.moved, vec![".git", ".gitignore", "output", "src"]);
+        assert_eq!(r.clashes, vec!["notes.md"]);
+        assert!(r.removed_tombstone);
+        assert!(r.stamped_v4);
+        assert_eq!(
+            raw_workspace_version(&ws.join(".thclaws/settings.json")),
+            Some(4)
+        );
+
+        assert_eq!(read(&ws.join("output/report.md")), "findings\n");
+        assert!(ws.join("src/main.py").exists());
+        assert!(ws.join(".git/config").exists());
+        assert!(!ws.join("AGENTS.md").exists(), "the tombstone is gone");
+        assert_eq!(
+            read(&ws.join("notes.md")),
+            "made at the root",
+            "never overwritten"
+        );
+        assert_eq!(
+            read(&bot.join("notes.md")),
+            "from before",
+            "left where it was"
+        );
+        for rel in ["AGENTS.md", "manifest.json", ".thclaws/settings.json"] {
+            assert!(bot.join(rel).exists(), "the agent keeps {rel}");
+        }
+
+        let again = restore_shared_files(&ws).unwrap();
+        assert!(again.moved.is_empty() && !again.removed_tombstone && !again.stamped_v4);
+        assert_eq!(
+            read(&bot.join("notes.md")),
+            "from before",
+            "v4 never pulls it again"
+        );
+    }
+
+    #[test]
+    fn restoring_leaves_a_single_agent_workspace_alone() {
+        let (_root, ws) = v2_workspace("plain");
+        let r = restore_shared_files(&ws).unwrap();
+        assert!(r.moved.is_empty() && r.clashes.is_empty() && !r.removed_tombstone);
+        assert_eq!(read(&ws.join("AGENTS.md")), "# The agent\n");
+        assert!(!ws.join(".thclaws/bots").exists());
+    }
+
+    /// A user's own `AGENTS.md` at the root is not the tombstone and stays.
+    #[test]
+    fn restoring_keeps_a_users_own_agents_md() {
+        let (_root, ws) = v2_workspace("own-agents-md");
+        apply(&plan(&ws).unwrap()).unwrap();
+        stamp_host_version(&ws, FIRST_HOST_VERSION).unwrap();
+        std::fs::write(ws.join("AGENTS.md"), "# Our project rules\n").unwrap();
+        let r = restore_shared_files(&ws).unwrap();
+        assert!(!r.removed_tombstone);
+        assert_eq!(read(&ws.join("AGENTS.md")), "# Our project rules\n");
+    }
+
+    /// A v4 agent folder may hold files on purpose; nothing is pulled out.
+    #[test]
+    fn a_v4_workspace_is_never_rearranged() {
+        let (_root, ws) = v2_workspace("v4");
+        apply(&plan(&ws).unwrap()).unwrap();
+        let bot = ws.join(".thclaws/bots/main");
+        std::fs::write(bot.join("agent-notes.md"), "kept with the agent").unwrap();
+        let r = restore_shared_files(&ws).unwrap();
+        assert!(r.moved.is_empty() && !r.stamped_v4);
+        assert!(bot.join("agent-notes.md").exists());
+        assert!(!ws.join("agent-notes.md").exists());
+    }
+
+    /// A v3 workspace is still a host workspace to `plan`, not "neither v2 nor v3".
+    #[test]
+    fn a_v3_workspace_is_already_a_host_workspace() {
+        let (_root, ws) = v2_workspace("still-v3");
+        apply(&plan(&ws).unwrap()).unwrap();
+        stamp_host_version(&ws, FIRST_HOST_VERSION).unwrap();
+        assert_eq!(plan(&ws).unwrap().status, Status::AlreadyV3);
     }
 
     fn read(p: &Path) -> String {
@@ -1104,54 +1327,58 @@ mod tests {
     }
 
     #[test]
-    fn moves_the_whole_workspace_under_main_and_leaves_a_host_behind() {
+    fn moves_only_the_agent_and_leaves_the_files_at_the_root() {
         let (_root, ws) = v2_workspace("my-project");
         let plan = plan(&ws).unwrap();
         assert_eq!(plan.status, Status::Migrate);
-        assert!(plan.moves_git, "the repo moves and the user must be told");
+        // dev-plan/61: only what makes the folder an agent moves.
+        assert_eq!(plan.moves, vec![".thclaws", "AGENTS.md", "manifest.json"]);
+        assert!(!plan.moves_git, "the repo stays with the user's files");
         assert!(plan.keeps.contains(&".home".to_string()));
 
         let report = apply(&plan).unwrap();
         let bot = ws.join(".thclaws/bots/main");
         assert_eq!(report.bot_dir, bot);
 
-        // The agent, its files, its state and its repo all land together.
         for rel in [
             "AGENTS.md",
             "manifest.json",
+            ".thclaws/settings.json",
+            ".thclaws/state/sessions/sess-1.jsonl",
+            ".thclaws/state/browser-profile/Cookies",
+        ] {
+            assert!(bot.join(rel).exists(), "the agent should hold {rel}");
+        }
+        // The user's files, and their repo, stay exactly where they were.
+        for rel in [
             "output/report.md",
             "src/main.py",
             ".gitignore",
             ".git/config",
             ".git/objects/ab/cdef",
-            ".thclaws/settings.json",
-            ".thclaws/state/sessions/sess-1.jsonl",
-            ".thclaws/state/browser-profile/Cookies",
         ] {
-            assert!(bot.join(rel).exists(), "bot should hold {rel}");
+            assert!(ws.join(rel).exists(), "{rel} must stay at the root");
+            assert!(
+                !bot.join(rel).exists(),
+                "{rel} must not move into the agent"
+            );
         }
-        assert_eq!(read(&bot.join("output/report.md")), "findings\n");
+        assert_eq!(read(&ws.join("output/report.md")), "findings\n");
 
-        // `.home/` is the runner's second mount point, not agent content.
         assert!(ws.join(".home/.config/thclaws/settings.json").exists());
         assert!(!bot.join(".home").exists());
 
-        // The host is left with its own minimal tree.
         let host: serde_json::Value =
             serde_json::from_str(&read(&ws.join(".thclaws/settings.json"))).unwrap();
-        assert_eq!(host["workspaceVersion"], 3);
+        assert_eq!(host["workspaceVersion"], 4, "a new upgrade lands on v4");
         let bots: serde_json::Value =
             serde_json::from_str(&read(&ws.join(".thclaws/bots.json"))).unwrap();
         assert_eq!(bots["bots"][0]["slug"], "main");
         assert!(ws.join(".thclaws/state").is_dir());
 
-        // T6: the tombstone, not the version field, is what stops an older
-        // binary treating this as an empty project.
-        let tomb = read(&ws.join("AGENTS.md"));
-        assert!(tomb.contains(".thclaws/bots/main"), "{tomb}");
-        assert!(tomb.contains("nothing is missing") || tomb.contains("nothing was lost"));
+        // No tombstone: an `AGENTS.md` at the root would load into every agent.
+        assert!(!ws.join("AGENTS.md").exists());
 
-        // No litter.
         assert!(!ws.join(STAGING).exists());
         assert!(!ws.join(MARKER).exists());
     }
@@ -1160,18 +1387,14 @@ mod tests {
     fn a_second_run_is_a_no_op() {
         let (_root, ws) = v2_workspace("my-project");
         apply(&plan(&ws).unwrap()).unwrap();
-        let before = read(&ws.join(".thclaws/bots/main/output/report.md"));
+        let before = read(&ws.join("output/report.md"));
 
         let again = plan(&ws).unwrap();
         assert_eq!(again.status, Status::AlreadyV3);
         assert!(again.is_noop());
         let report = apply(&again).unwrap();
         assert_eq!(report.moved, 0);
-        assert_eq!(
-            read(&ws.join(".thclaws/bots/main/output/report.md")),
-            before
-        );
-        // Not nested a second level down.
+        assert_eq!(read(&ws.join("output/report.md")), before);
         assert!(!ws.join(".thclaws/bots/main/.thclaws/bots").exists());
     }
 
@@ -1180,19 +1403,19 @@ mod tests {
     /// leave behind at that phase.
     #[test]
     fn resumes_from_a_kill_at_any_phase() {
-        // Killed during collect: some entries moved, marker says collect.
+        // Killed during collect: one agent entry staged, marker says collect.
         let (_r1, ws) = v2_workspace("proj");
         write_phase(&ws, Phase::Collect).unwrap();
         std::fs::create_dir_all(ws.join(STAGING)).unwrap();
-        std::fs::rename(ws.join("output"), ws.join(STAGING).join("output")).unwrap();
-        std::fs::rename(ws.join(".git"), ws.join(STAGING).join(".git")).unwrap();
+        std::fs::rename(ws.join(".thclaws"), ws.join(STAGING).join(".thclaws")).unwrap();
         let p = plan(&ws).unwrap();
         assert_eq!(p.status, Status::Resume(Phase::Collect));
         apply(&p).unwrap();
         let bot = ws.join(".thclaws/bots/main");
-        assert!(bot.join("output/report.md").exists());
-        assert!(bot.join(".git/config").exists());
+        assert!(bot.join(".thclaws/settings.json").exists());
         assert!(bot.join("AGENTS.md").exists());
+        assert!(ws.join("output/report.md").exists());
+        assert!(ws.join(".git/config").exists());
         assert!(!ws.join(STAGING).exists());
 
         // Killed during install: everything staged, nothing installed.
@@ -1205,7 +1428,8 @@ mod tests {
         let p = plan(&ws).unwrap();
         assert_eq!(p.status, Status::Resume(Phase::Install));
         apply(&p).unwrap();
-        assert!(ws.join(".thclaws/bots/main/src/main.py").exists());
+        assert!(ws.join(".thclaws/bots/main/AGENTS.md").exists());
+        assert!(ws.join("src/main.py").exists());
         assert!(ws.join(".thclaws/bots.json").exists());
 
         // Killed during install AFTER a partial merge: both dirs present.
@@ -1216,10 +1440,14 @@ mod tests {
         }
         let bot = ws.join(".thclaws/bots/main");
         std::fs::create_dir_all(&bot).unwrap();
-        std::fs::rename(ws.join(STAGING).join("src"), bot.join("src")).unwrap();
+        std::fs::rename(
+            ws.join(STAGING).join("manifest.json"),
+            bot.join("manifest.json"),
+        )
+        .unwrap();
         write_phase(&ws, Phase::Install).unwrap();
         apply(&plan(&ws).unwrap()).unwrap();
-        assert!(bot.join("src/main.py").exists());
+        assert!(bot.join("manifest.json").exists());
         assert!(bot.join("AGENTS.md").exists());
         assert!(!ws.join(STAGING).exists());
 
@@ -1237,9 +1465,7 @@ mod tests {
         assert_eq!(p.status, Status::Resume(Phase::Finalise));
         apply(&p).unwrap();
         assert!(ws.join(".thclaws/bots.json").exists());
-        assert!(read(&ws.join("AGENTS.md")).contains(".thclaws/bots/main"));
-        // Crucially: resuming at finalise must NOT sweep the host tree it
-        // just built into the bot.
+        assert!(!ws.join("AGENTS.md").exists(), "no tombstone at the root");
         assert!(ws.join(".thclaws/bots/main/AGENTS.md").exists());
         assert!(!ws.join(".thclaws/bots/main/.thclaws/bots").exists());
     }
@@ -1376,7 +1602,7 @@ mod tests {
         let wait = Duration::from_millis(200);
         assert!(matches!(
             auto_migrate_with_wait(&ws, wait),
-            AutoOutcome::Migrated(_, true)
+            AutoOutcome::Migrated(_, false)
         ));
         assert!(ws.join(super::super::CONFIG_REL).exists());
         assert!(matches!(

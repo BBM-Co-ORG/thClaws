@@ -1005,6 +1005,10 @@ async fn main() {
             });
         match target {
             Some(dir) if dir.is_dir() => {
+                // dev-plan/61: the agent's folder becomes the cwd for its
+                // settings and sessions, but its files are the workspace's.
+                // Set before `Sandbox::init` below reads it.
+                std::env::set_var("THCLAWS_WORKSPACE_ROOT", &cwd);
                 if let Err(e) = std::env::set_current_dir(&dir) {
                     eprintln!("\x1b[31mcannot enter {}: {e}\x1b[0m", dir.display());
                     std::process::exit(1);
@@ -1549,7 +1553,7 @@ async fn run_bots_subcommand(cmd: BotsCmd) -> i32 {
                 Ok(p) => {
                     println!("workspace  {}", p.workspace.display());
                     match &p.status {
-                        migrate::Status::AlreadyV3 => println!("layout     v3 (multiple agents)"),
+                        migrate::Status::AlreadyV3 => println!("layout     multiple agents (v3 or later)"),
                         migrate::Status::Migrate => println!(
                             "layout     v2 (single agent) — `thclaws bots migrate` moves it to v3"
                         ),

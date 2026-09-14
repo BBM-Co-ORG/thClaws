@@ -3709,9 +3709,11 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
 
         // ── Working directory (M6.36 SERVE9d — migrated from gui.rs) ─
         "get_cwd" => {
-            let cwd = std::env::current_dir()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|_| ".".into());
+            // dev-plan/61: the folder the user's files are in, which for an
+            // agent under a workspace host is the workspace, not its own folder.
+            let cwd = crate::workdir::workspace_root()
+                .to_string_lossy()
+                .to_string();
             // Serve mode: cwd is fixed (cloud runner template mounts
             // `/workspace`), so skip the picker modal. Also resolve
             // `guiShell.tabDefault` and pass it through as `initial_tab`
@@ -4433,9 +4435,7 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                 .and_then(|v| v.as_str())
                 .map(str::to_string)
                 .or_else(|| {
-                    std::env::current_dir()
-                        .ok()
-                        .map(|p| p.to_string_lossy().to_string())
+                    Some(crate::workdir::workspace_root()).map(|p| p.to_string_lossy().to_string())
                 });
             let cols = msg.get("cols").and_then(|v| v.as_u64()).unwrap_or(80) as u16;
             let rows = msg.get("rows").and_then(|v| v.as_u64()).unwrap_or(24) as u16;
