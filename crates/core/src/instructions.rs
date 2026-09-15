@@ -14,13 +14,33 @@
 pub fn instructions_path(scope: &str) -> Option<std::path::PathBuf> {
     match scope {
         "global" => crate::util::home_dir().map(|h| h.join(".config/thclaws/AGENTS.md")),
-        _ => std::env::current_dir().ok().map(|d| d.join("AGENTS.md")),
+        // The workspace root, which every agent under a host shares and loads
+        // `AGENTS.md` from; the process cwd when there is no host.
+        _ => Some(crate::workdir::workspace_root().join("AGENTS.md")),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Under a host, Folder instructions edit the workspace's `AGENTS.md`, the
+    /// one every agent loads, not the agent folder's own.
+    #[test]
+    fn folder_scope_is_the_workspace_root_under_a_host() {
+        let _g = crate::kms::test_env_lock();
+        let prev = std::env::var("THCLAWS_WORKSPACE_ROOT").ok();
+        let ws = tempfile::tempdir().unwrap();
+        std::env::set_var("THCLAWS_WORKSPACE_ROOT", ws.path());
+        assert_eq!(
+            instructions_path("folder"),
+            Some(ws.path().join("AGENTS.md"))
+        );
+        match prev {
+            Some(v) => std::env::set_var("THCLAWS_WORKSPACE_ROOT", v),
+            None => std::env::remove_var("THCLAWS_WORKSPACE_ROOT"),
+        }
+    }
 
     #[test]
     fn folder_scope_resolves_to_cwd_agents_md() {

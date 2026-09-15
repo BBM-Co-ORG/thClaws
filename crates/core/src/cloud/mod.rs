@@ -75,6 +75,14 @@ pub fn resolve_cloud_url(cli_override: Option<&str>, config: Option<&CloudConfig
 /// Used by the IPC handler that powers the Settings modal — the modal
 /// only ever shows what's persisted, not anything an in-process flag
 /// might have overridden.
+/// #208: a thClaws.cloud CLI token is minted as `thc_` plus random bytes. A
+/// value without that prefix is a mis-paste (a gateway key, an API key, a stray
+/// line), and saving it would break every cloud call in silence.
+pub fn looks_like_cli_token(token: &str) -> bool {
+    let t = token.trim();
+    t.len() > "thc_".len() && t.starts_with("thc_") && !t.contains(char::is_whitespace)
+}
+
 pub fn persisted_url() -> Option<String> {
     let project_url = crate::config::ProjectConfig::load()
         .and_then(|c| c.cloud)
@@ -177,4 +185,19 @@ fn clear_legacy_file() -> std::io::Result<()> {
         std::fs::remove_file(p)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_token_tests {
+    #[test]
+    fn only_a_thc_token_looks_like_a_cli_token() {
+        use super::looks_like_cli_token as ok;
+        assert!(ok("thc_AbCdEfGhIjKlMnOp"));
+        assert!(ok("  thc_AbCdEf  "), "surrounding whitespace is trimmed");
+        assert!(!ok("thc_"), "prefix alone");
+        assert!(!ok("gw_v1_abc"), "a gateway key");
+        assert!(!ok("sk-ant-api03-xyz"), "a provider key");
+        assert!(!ok("thc_abc def"), "two things pasted together");
+        assert!(!ok(""));
+    }
 }

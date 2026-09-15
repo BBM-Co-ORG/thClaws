@@ -617,16 +617,13 @@ fn spawn_child(bot: &Arc<Bot>, program: &Path) -> Result<Spawned> {
     if let Some(parent) = bot.addr_file.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    // A bot's HOME is its own folder. "User home" is already the wrong model
-    // here — on a hosted runner HOME is the workspace PVC, not an operator's
-    // home — and this makes schedules, gui-shell state, usage aggregates and
-    // the catalogue cache per-bot without touching any `home_dir()` call
-    // site. Credentials are not a casualty: keys arrive through the
-    // environment (inherited from this process) and the OS keychain is keyed
-    // by OS user, not by HOME.
-    let home = bot.dir.join(".home");
-    std::fs::create_dir_all(&home)?;
-    seed_secrets_marker(&home);
+    // #207/#208: an agent keeps the user's HOME. Its own folder is its cwd,
+    // which already keeps its settings, sessions and memory apart. HOME is
+    // where the user-level things live that must NOT split per agent: the
+    // global AGENTS.md, secrets.json and .env, and on macOS the login keychain,
+    // which the OS finds through $HOME. v0.126.0–v0.128.0 pointed HOME at
+    // `<agent>/.home`, and every one of those went missing inside an agent.
+    warn_about_stranded_home(bot);
     let token = mint_token();
     *bot.token.lock().expect("bot token") = token.clone();
 
@@ -647,7 +644,6 @@ fn spawn_child(bot: &Arc<Bot>, program: &Path) -> Result<Spawned> {
         // dev-plan/61: an agent's files are the workspace's. Its own folder
         // stays its cwd, for its settings, sessions and memory.
         .env("THCLAWS_WORKSPACE_ROOT", &bot.workspace_root)
-        .env("HOME", &home)
         // Held open by this process: the child exits when it reads EOF, so a
         // host that dies without reaping does not leave orphans behind.
         .stdin(std::process::Stdio::piped())
@@ -713,23 +709,31 @@ fn clip(line: &str) -> String {
 /// "Where should thClaws store API keys?" modal the user had already
 /// answered for this machine. Copied, never merged, and only when the bot
 /// has none: a bot that has been told something else keeps its answer.
-fn seed_secrets_marker(home: &Path) {
-    let dest = home.join(".config/thclaws/secrets.json");
-    if dest.exists() {
+/// An agent run by v0.126.0–v0.128.0 had its own HOME, and anything saved from
+/// its Settings (an `.env`, a secrets backend choice) landed there. That file is
+/// no longer read, so say so once, where the host logs.
+fn warn_about_stranded_home(bot: &Bot) {
+    let cfg = bot.dir.join(".home/.config/thclaws");
+    let stranded: Vec<&str> = [".env", "secrets.json", "AGENTS.md"]
+        .into_iter()
+        .filter(|f| cfg.join(f).is_file())
+        .collect();
+    if stranded.is_empty() {
         return;
     }
-    let Some(src) = crate::util::home_dir().map(|h| h.join(".config/thclaws/secrets.json")) else {
+    static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let warned = WARNED.get_or_init(Default::default);
+    if !warned.lock().expect("warned set").insert(bot.slug.clone()) {
         return;
-    };
-    let Ok(raw) = std::fs::read(&src) else {
-        return;
-    };
-    if let Some(parent) = dest.parent() {
-        if std::fs::create_dir_all(parent).is_err() {
-            return;
-        }
     }
-    let _ = std::fs::write(&dest, raw);
+    eprintln!(
+        "\x1b[33m[bots] agent '{}' has {} from an earlier version in {} — it is no longer read. \
+         Settings now use ~/.config/thclaws/ for every agent; move anything you still need there.\x1b[0m",
+        bot.slug,
+        stranded.join(", "),
+        cfg.display()
+    );
 }
 
 pub fn mint_token() -> String {
@@ -976,6 +980,55 @@ mod tests {
         settle(&bot, |s| matches!(s, BotState::Restarting { .. })).await;
         sup.shutdown();
         settle(&bot, |s| matches!(s, BotState::Stopped)).await;
+    }
+
+    /// #207/#208: an agent keeps the user's HOME, so the global AGENTS.md,
+    /// secrets.json/.env and the macOS keychain are the user's, not a copy in
+    /// the agent's folder. Its files come from the workspace root.
+    #[tokio::test]
+    async fn an_agent_keeps_the_users_home_and_gets_the_workspace_root() {
+        let out_dir = tempfile::tempdir().unwrap();
+        let out = out_dir.path().join("env.txt");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n%s\\n' \"$HOME\" \"$THCLAWS_WORKSPACE_ROOT\" > '{}'\nsleep 30\n",
+            out.display()
+        );
+        let (dir, program) = fixture(&script);
+        let sup = BotSupervisor::with_policy(dir.path(), &program, fast_policy());
+        let bot = sup
+            .start(&BotDef {
+                slug: "main".into(),
+                name: None,
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !out.is_file()
+            || std::fs::read_to_string(&out)
+                .unwrap_or_default()
+                .lines()
+                .count()
+                < 2
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the stub never wrote its environment"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let seen = std::fs::read_to_string(&out).unwrap();
+        let mut lines = seen.lines();
+        assert_eq!(
+            lines.next(),
+            Some(std::env::var("HOME").unwrap_or_default().as_str()),
+            "HOME is the user's"
+        );
+        assert_eq!(
+            lines.next(),
+            Some(dir.path().to_str().unwrap()),
+            "files are the workspace's"
+        );
+        assert!(!bot.dir.join(".home").exists(), "no per-agent home is made");
+        sup.shutdown();
     }
 
     #[tokio::test]

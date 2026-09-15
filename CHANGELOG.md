@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.129.0] — 2026-09-15
+
+**Your settings work in every agent again.** Global instructions, saved keys and the macOS keychain are the same whichever agent is open.
+
+### Fixed
+- **Inside a workspace with several agents, user-level settings went missing (#207, #208).** Each agent ran with its own home folder, so it never loaded your global `~/.config/thclaws/AGENTS.md`, Settings showed and edited the wrong file, and on macOS saving an API key or CLI token failed with "A default keychain could not be found". Agents now use your real home folder. Anything an earlier version saved into an agent's `.thclaws/bots/<name>/.home/` is no longer read, and the start-up log says so.
+- **Settings → Folder instructions edited the agent's own `AGENTS.md`, not the workspace's.** It now edits `AGENTS.md` at the workspace root, which every agent loads.
+- **Settings accepted any text as a thClaws.cloud CLI token.** A value that does not start with `thc_` is now refused with a message, instead of being saved and breaking cloud calls.
+
 ## [0.128.0] — 2026-09-14
 
 **Your files stay in your workspace.** Every agent in a workspace now reads and writes the same files at the workspace root, the files you see in Finder and drag in yourself.

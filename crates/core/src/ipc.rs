@@ -3998,6 +3998,10 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                 let trimmed = token.trim();
                 let result = if trimmed.is_empty() {
                     crate::cloud::clear_token()
+                } else if !crate::cloud::looks_like_cli_token(trimmed) {
+                    Err(crate::error::Error::Config(
+                        "that is not a thClaws.cloud CLI token — they start with thc_. Copy it again from thclaws.cloud → Settings → CLI tokens.".into(),
+                    ))
                 } else {
                     crate::cloud::set_token(trimmed)
                 };
