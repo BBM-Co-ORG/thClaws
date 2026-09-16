@@ -19,6 +19,42 @@ use std::os::windows::process::CommandExt;
 /// practice a truly broken Windows environment; most of the
 /// path-touching code in thClaws degrades gracefully in that case
 /// rather than panicking.
+/// #210: write a line to stderr, and shrug if it fails.
+///
+/// `eprintln!` panics when the write returns an error. An agent's stderr is a
+/// pipe to the workspace host, so the moment the host goes the next log line
+/// takes the agent down with it. Anything that logs while shutting down uses
+/// this instead.
+pub fn log_line(msg: &str) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(), "{msg}");
+}
+
+/// Is this panic just a failed print? std panics with
+/// `failed printing to stdout/stderr: ...` when the stream is gone (#210).
+pub fn panic_is_print_failure(text: &str) -> bool {
+    text.contains("failed printing to")
+}
+
+/// Keep a panic where a dead stderr cannot swallow it: append it to
+/// `<workspace>/.thclaws/state/logs/panic.log`. Best effort by design — a
+/// panic handler that can itself fail is how #210 became an abort.
+pub fn write_panic_log(text: &str) {
+    use std::io::Write as _;
+    let dir = crate::workdir::workspace_root().join(".thclaws/state/logs");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("panic.log"))
+    else {
+        return;
+    };
+    let _ = writeln!(f, "{} {}", chrono::Utc::now().to_rfc3339(), text);
+}
+
 pub fn home_dir() -> Option<PathBuf> {
     #[cfg(windows)]
     {
@@ -341,6 +377,47 @@ pub(crate) fn shell_invocation() -> (String, String) {
 
 #[cfg(test)]
 mod tests {
+    /// #210: std panics with "failed printing to stderr" when the pipe is
+    /// gone. That panic must be told apart from a real one, or the agent
+    /// aborts while its host is simply shutting down.
+    #[test]
+    fn a_failed_print_is_recognised_and_a_real_panic_is_not() {
+        assert!(panic_is_print_failure(
+            "failed printing to stderr: Broken pipe (os error 32)"
+        ));
+        assert!(panic_is_print_failure("failed printing to stdout: x"));
+        assert!(!panic_is_print_failure("index out of bounds: the len is 3"));
+        assert!(!panic_is_print_failure(""));
+    }
+
+    /// A panic caused by a dead stderr is invisible unless it is written
+    /// somewhere else.
+    #[test]
+    fn a_panic_is_written_under_the_workspace() {
+        let _g = crate::kms::test_env_lock();
+        let prev = std::env::var("THCLAWS_WORKSPACE_ROOT").ok();
+        let ws = tempfile::tempdir().unwrap();
+        std::env::set_var("THCLAWS_WORKSPACE_ROOT", ws.path());
+
+        write_panic_log("panic at src/x.rs:1:1: boom");
+        write_panic_log("panic at src/x.rs:2:2: again");
+        let log = ws.path().join(".thclaws/state/logs/panic.log");
+        let body = std::fs::read_to_string(&log).unwrap();
+        assert!(body.contains("boom") && body.contains("again"), "{body}");
+        assert_eq!(body.lines().count(), 2, "appended, not overwritten");
+
+        match prev {
+            Some(v) => std::env::set_var("THCLAWS_WORKSPACE_ROOT", v),
+            None => std::env::remove_var("THCLAWS_WORKSPACE_ROOT"),
+        }
+    }
+
+    /// Logging must never be the thing that kills the process.
+    #[test]
+    fn log_line_survives_a_stderr_it_cannot_write_to() {
+        log_line("a line that may or may not land");
+    }
+
     use super::*;
 
     #[test]

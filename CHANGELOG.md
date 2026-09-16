@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.130.0] — 2026-09-16
+
+**Quitting is clean again.** Closing the app in a workspace with several agents no longer leaves a crash report behind.
+
+### Fixed
+- **Quitting the desktop app left a crash report behind (#209, #210).** In a workspace with several agents, closing the window tore down the pipes the agents log into while they were still running. Their next log line then killed them, and macOS recorded a crash every time. The app now stops its agents and waits for them before it exits, a failed log write can no longer take an agent down, and a panic is written to `.thclaws/state/logs/panic.log` so one that happens while the logs are gone is still visible.
+
 ## [0.129.0] — 2026-09-15
 
 **Your settings work in every agent again.** Global instructions, saved keys and the macOS keychain are the same whichever agent is open.

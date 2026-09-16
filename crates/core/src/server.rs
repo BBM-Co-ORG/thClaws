@@ -1038,6 +1038,7 @@ pub async fn run_supervisor_on(listener: tokio::net::TcpListener) -> crate::erro
     }
     let cfg = crate::bots::BotsConfig::load(&workspace)?;
     let sup = crate::bots::supervisor::BotSupervisor::new(&workspace)?;
+    let _ = HOST_SUPERVISOR.set(sup.clone());
     spawn_host_heartbeat(sup.clone());
     let cap = crate::bots::supervisor::MAX_LIVE_BOTS;
     if cfg.bots.len() > cap {
@@ -1982,6 +1983,44 @@ async fn sync_bearer_gate(
 /// Workspace root, captured at serve startup so `serve_health` (no `State`) can
 /// probe for detached background jobs. Set once in `run_with_engine`.
 static SERVE_WORKSPACE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// The running host, for the desktop's quit path (#209).
+static HOST_SUPERVISOR: std::sync::OnceLock<Arc<crate::bots::supervisor::BotSupervisor>> =
+    std::sync::OnceLock::new();
+
+/// #209/#210: stop every agent and wait for it, from a plain thread.
+///
+/// The desktop window closes on the GUI thread, which is the async runtime's
+/// own thread — it cannot await. It also must not simply leave: an agent's
+/// stderr is a pipe into this process, so exiting first kills the pipe under
+/// the agent and its next log line aborts it. Signalling is async-free, and
+/// the wait is a poll, so the supervisor's tasks keep running while this
+/// blocks. `true` when every agent stopped inside `timeout`.
+pub fn stop_host_agents(timeout: Duration) -> bool {
+    match HOST_SUPERVISOR.get() {
+        Some(sup) => stop_and_wait(sup, timeout),
+        None => true,
+    }
+}
+
+fn stop_and_wait(sup: &crate::bots::supervisor::BotSupervisor, timeout: Duration) -> bool {
+    use crate::bots::supervisor::BotState;
+    sup.shutdown();
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let settled = sup
+            .list()
+            .iter()
+            .all(|b| matches!(b.state(), BotState::Stopped | BotState::CrashLooped { .. }));
+        if settled {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
 
 /// True if a detached background job is still running in the workspace. Any
 /// agent that spawns one drops a `<dir>/.jobs/<id>.json` carrying a live `pid`
@@ -3398,6 +3437,38 @@ mod tests {
     /// `/healthz` open for a parent probe, everything else behind the bearer.
     /// `/file-asset` is forwarded to a bot; `/workspace/sync/*` is the host's
     /// own, over the whole workspace.
+    /// #209/#210: the desktop's quit path stops agents from the GUI thread,
+    /// which cannot await. Signal, then wait by polling, so the host's pipes
+    /// outlive the children that log into them.
+    #[tokio::test]
+    async fn stopping_the_host_waits_for_its_agents() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(crate::bots::bot_dir(dir.path(), "main")).unwrap();
+        let program = dir.path().join("stub-engine");
+        std::fs::write(&program, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let sup = crate::bots::supervisor::BotSupervisor::with_program(dir.path(), &program);
+        let bot = sup
+            .start(&crate::bots::BotDef {
+                slug: "main".into(),
+                name: None,
+            })
+            .unwrap();
+
+        let sup2 = sup.clone();
+        let stopped =
+            tokio::task::spawn_blocking(move || stop_and_wait(&sup2, Duration::from_secs(10)))
+                .await
+                .unwrap();
+        assert!(stopped, "every agent should stop inside the timeout");
+        assert!(matches!(
+            bot.state(),
+            crate::bots::supervisor::BotState::Stopped
+        ));
+    }
+
     #[tokio::test]
     async fn supervisor_router_gates_everything_but_healthz() {
         use tower::ServiceExt as _;

@@ -812,7 +812,9 @@ pub async fn stdin_closed() {
                 Ok(_) => {}
             }
         }
-        eprintln!("\x1b[33m[serve] supervisor closed stdin — shutting down\x1b[0m");
+        // Not `eprintln!`: this is the host's pipe, and by now the host may
+        // already be gone — a failed print here is what aborted the agent (#210).
+        crate::util::log_line("\x1b[33m[serve] supervisor closed stdin — shutting down\x1b[0m");
         let _ = tx.send(());
     });
     let _ = rx.await;

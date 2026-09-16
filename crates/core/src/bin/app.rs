@@ -689,8 +689,31 @@ enum ScheduleCmd {
 fn install_serve_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        let where_ = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown location".into());
+        let text = format!("panic at {where_}: {payload}");
+        // Kept where a dead stderr cannot swallow it (#210).
+        thclaws_core::util::write_panic_log(&text);
+        if thclaws_core::util::panic_is_print_failure(&payload) {
+            // Our own log write failed, which means the host's pipe is gone.
+            // Reporting it would write to that same pipe and panic again —
+            // a panic inside a panic is an abort, and that is the crash report
+            // users saw on every quit. Leave quietly instead; this agent's work
+            // is done the moment its host is.
+            std::process::exit(0);
+        }
         default_hook(info);
-        eprintln!("\x1b[31m[--serve] panic — aborting so the port is released\x1b[0m");
+        thclaws_core::util::log_line(
+            "\x1b[31m[--serve] panic — aborting so the port is released\x1b[0m",
+        );
         std::process::abort();
     }));
 }

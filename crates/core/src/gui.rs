@@ -657,6 +657,15 @@ fn request_gui_shutdown(
     // playwright-mcp CDP attach ("Browser context management is not
     // supported").
     crate::browser_cdp::shutdown();
+    // #209/#210: agents are child processes logging into this process's pipes.
+    // Leaving first kills those pipes under them, and their next log line takes
+    // them down with an abort. Stop them and wait; a host that is not running
+    // any is a no-op.
+    if !crate::server::stop_host_agents(std::time::Duration::from_secs(5)) {
+        crate::util::log_line(
+            "\x1b[33m[host] agents did not stop within 5s — leaving anyway\x1b[0m",
+        );
+    }
     *control_flow = ControlFlow::Exit;
 }
 /// Window size and zoom: the user's stored values, else a default picked from
