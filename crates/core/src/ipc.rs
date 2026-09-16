@@ -3731,7 +3731,8 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
             let payload = serde_json::json!({
                 "type": "current_cwd",
                 "path": cwd,
-                "needs_modal": !ctx.is_serve_mode,
+                // #211: and not again after a pick re-execed the app.
+                "needs_modal": !ctx.is_serve_mode && !crate::util::picker_answered(),
                 "recent_dirs": crate::recent_dirs::load_recent_dirs(),
                 "initial_tab": initial_tab,
             });
@@ -3751,6 +3752,13 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                 let p = std::path::Path::new(path);
                 if p.is_dir() {
                     let _ = std::env::set_current_dir(p);
+                    // A folder is chosen now, so the writes start-up held back
+                    // belong here — in this folder, not whichever one the OS
+                    // started the app in. The marker outlives a re-exec, so a
+                    // pick that restarts instead bootstraps at start-up.
+                    crate::util::mark_picker_answered();
+                    crate::config::ProjectConfig::migrate_workspace_if_needed();
+                    crate::config::ProjectConfig::ensure_default_exists();
                     let _ = crate::sandbox::Sandbox::init();
                     crate::recent_dirs::save_recent_dir(path);
                     // Tell the worker to reload project settings + swap

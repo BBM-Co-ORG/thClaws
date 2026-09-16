@@ -1213,17 +1213,11 @@ impl ProjectConfig {
         }
     }
 
-    /// [`ensure_default_exists`] for a project folder other than the cwd —
-    /// a bot created empty on a workspace shelf gets the same first-run file a
-    /// new folder opened in the app does.
-    pub fn ensure_default_exists_in(dir: &std::path::Path) -> bool {
-        let path = dir.join(".thclaws").join("settings.json");
-        if path.exists() {
-            return false;
-        }
-        if dir.join(".claude/settings.json").exists() {
-            return false;
-        }
+    /// The body of the first-run settings file: the documented template, with
+    /// the gateway default applied when a credential is present. One source
+    /// for both the create path and [`Self::backfill_defaults_in`], so an
+    /// agent that arrived by migration cannot drift from one created new.
+    fn default_settings_body() -> String {
         // Hand-rolled JSON enumerating every ProjectConfig field at
         // its default value so users discover available knobs by
         // opening the file rather than consulting the manual. Unknown
@@ -1249,6 +1243,7 @@ impl ProjectConfig {
   "skillsListingStrategy": "full",
   "teamEnabled": false,
   "shellTabEnabled": false,
+  "imageToolsEnabled": false,
   "browserEnabled": false,
   "halEnabled": false,
   "showRawResponse": false,
@@ -1275,11 +1270,25 @@ impl ProjectConfig {
         // same gate the GUI uses to enable the proxy checkbox (cloud token /
         // gateway key — not network-validated here). Skipped under tests
         // (keychain/env-dependent → would be nondeterministic).
-        let body = if !cfg!(test) && crate::providers::thclaws_gateway::has_access_key() {
+        if !cfg!(test) && crate::providers::thclaws_gateway::has_access_key() {
             Self::inject_default_gateway_proxy(template)
         } else {
             template.to_string()
-        };
+        }
+    }
+
+    /// [`ensure_default_exists`] for a project folder other than the cwd —
+    /// a bot created empty on a workspace shelf gets the same first-run file a
+    /// new folder opened in the app does.
+    pub fn ensure_default_exists_in(dir: &std::path::Path) -> bool {
+        let path = dir.join(".thclaws").join("settings.json");
+        if path.exists() {
+            return false;
+        }
+        if dir.join(".claude/settings.json").exists() {
+            return false;
+        }
+        let body = Self::default_settings_body();
         if let Some(parent) = path.parent() {
             if std::fs::create_dir_all(parent).is_err() {
                 return false;
@@ -1287,6 +1296,54 @@ impl ProjectConfig {
             Self::ensure_state_scaffold(parent);
         }
         std::fs::write(&path, body).is_ok()
+    }
+
+    /// Add the template's missing keys to a settings file that already exists,
+    /// and return the names added.
+    ///
+    /// A workspace migrated into an agent keeps whatever `settings.json` it
+    /// had — often two keys — while an agent created new gets the full
+    /// documented template. `ensure_default_exists_in` cannot close that gap:
+    /// it returns early precisely because the file exists. So this fills the
+    /// holes instead, and only the holes — a key the file already carries is
+    /// left alone, an explicit `null` included, so a deliberate choice is
+    /// never overwritten by a default.
+    pub fn backfill_defaults_in(dir: &std::path::Path) -> Vec<String> {
+        let none = Vec::new();
+        let path = dir.join(".thclaws").join("settings.json");
+        let Ok(raw) = std::fs::read(&path) else {
+            return none;
+        };
+        let Ok(mut current) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+            // Unparseable: leave it alone rather than rewrite over whatever
+            // the user has in there. `parse_or_warn` already reports it.
+            return none;
+        };
+        let Ok(defaults) =
+            serde_json::from_str::<serde_json::Value>(&Self::default_settings_body())
+        else {
+            return none;
+        };
+        let (Some(obj), Some(defaults)) = (current.as_object_mut(), defaults.as_object()) else {
+            return none;
+        };
+        let mut added = Vec::new();
+        for (k, v) in defaults {
+            if !obj.contains_key(k) {
+                obj.insert(k.clone(), v.clone());
+                added.push(k.clone());
+            }
+        }
+        if added.is_empty() {
+            return added;
+        }
+        let Ok(body) = serde_json::to_string_pretty(obj) else {
+            return none;
+        };
+        if std::fs::write(&path, body).is_err() {
+            return none;
+        }
+        added
     }
 
     /// Insert `"gatewayProxy": true` into the first-run settings template.

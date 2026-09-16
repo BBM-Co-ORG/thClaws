@@ -19,6 +19,92 @@ use std::os::windows::process::CommandExt;
 /// practice a truly broken Windows environment; most of the
 /// path-touching code in thClaws degrades gracefully in that case
 /// rather than panicking.
+/// The desktop's startup folder picker, answered.
+///
+/// Picking a folder outside the current one re-execs the app there, and the
+/// "already asked" flag lives in memory, so the new process asked again and
+/// the answer re-execed again: an endless picker (#211). The answer travels
+/// in the environment, which both `exec` (unix) and a spawned child (Windows)
+/// inherit.
+const PICKER_ANSWERED: &str = "THCLAWS_PICKER_ANSWERED";
+
+/// Did this process chain already get an answer to the folder picker?
+pub fn picker_answered() -> bool {
+    std::env::var(PICKER_ANSWERED).ok().as_deref() == Some("1")
+}
+
+/// Record the answer so the re-exec does not ask again.
+pub fn mark_picker_answered() {
+    std::env::set_var(PICKER_ANSWERED, "1");
+}
+
+/// Whether a launch still has to be told which folder it is for, and so must
+/// write nothing into the one it happens to be standing in. True only for a
+/// desktop launch whose picker is unanswered — the single case where the cwd
+/// is the OS's choice rather than the user's (an icon launch starts in
+/// Documents on Windows). Every other surface — `--cli`, `-p`, `--serve` —
+/// reached its folder by `cd`-ing there, which is the user choosing it.
+pub fn folder_undecided(opens_desktop: bool) -> bool {
+    opens_desktop && !picker_answered()
+}
+
+/// Is `candidate` the same folder as `root`, or inside it?
+///
+/// Both sides are resolved the same way before comparing, which is the whole
+/// point: the folder picker decides "open in place" or "restart there" from
+/// this answer (#211), and a mismatch of *form* between two paths that name the
+/// same place sent picks down the restart branch.
+///
+/// Two forms bite. Windows `canonicalize` returns a verbatim path
+/// (`\\?\C:\dir`), while a path it cannot canonicalize keeps `C:\dir`. And a
+/// folder that does not exist yet — one typed into the picker — cannot be
+/// canonicalized at all, while its root can, so on macOS the root resolves
+/// through the `/var` → `/private/var` symlink and the child does not. So:
+/// canonicalize the deepest ancestor that exists, put the rest back, and strip
+/// the verbatim prefix.
+pub fn is_inside(root: &std::path::Path, candidate: &std::path::Path) -> bool {
+    fn resolved(p: &std::path::Path) -> PathBuf {
+        let mut missing: Vec<std::ffi::OsString> = Vec::new();
+        let mut cur = p.to_path_buf();
+        loop {
+            if let Ok(c) = cur.canonicalize() {
+                let mut out = PathBuf::from(strip_verbatim_prefix(&c.to_string_lossy()));
+                for part in missing.iter().rev() {
+                    out.push(part);
+                }
+                return out;
+            }
+            let Some(name) = cur.file_name().map(|n| n.to_os_string()) else {
+                // Nothing on this path exists (a Windows path on unix, say);
+                // compare the forms as given, minus the verbatim prefix.
+                return PathBuf::from(strip_verbatim_prefix(&p.to_string_lossy()));
+            };
+            missing.push(name);
+            if !cur.pop() {
+                return PathBuf::from(strip_verbatim_prefix(&p.to_string_lossy()));
+            }
+        }
+    }
+    // Compared as normalised strings, not `Path::starts_with`: on unix a
+    // Windows path is a single component (nothing splits on `\`), so the
+    // component-wise compare answers "outside" for a path plainly inside — and
+    // the Windows forms this exists for could then only be tested on Windows,
+    // which is the one platform we cannot test before releasing.
+    fn norm(p: &std::path::Path) -> String {
+        let s = resolved(p).to_string_lossy().replace('\\', "/");
+        let trimmed = s.trim_end_matches('/');
+        let out = if trimmed.is_empty() { "/" } else { trimmed };
+        // Windows path comparison is case-insensitive, drive letters included.
+        if cfg!(windows) {
+            out.to_lowercase()
+        } else {
+            out.to_string()
+        }
+    }
+    let (root, candidate) = (norm(root), norm(candidate));
+    candidate == root || candidate.starts_with(&format!("{root}/"))
+}
+
 /// #210: write a line to stderr, and shrug if it fails.
 ///
 /// `eprintln!` panics when the write returns an error. An agent's stderr is a
@@ -313,18 +399,31 @@ pub fn reexec_self() -> std::io::Error {
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
 
+    // #211: the chosen folder rides on the working directory, so state it
+    // rather than leaning on inheritance — on Windows this is a fresh spawn,
+    // not an `exec`.
+    let cwd = std::env::current_dir().ok();
+
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         let mut c = std::process::Command::new(&exe);
         c.args(&args);
+        if let Some(dir) = &cwd {
+            c.current_dir(dir);
+        }
         // exec() only returns on failure; on success the current
         // process image is replaced.
         c.exec()
     }
     #[cfg(not(unix))]
     {
-        let res = std::process::Command::new(&exe).args(&args).spawn();
+        let mut c = std::process::Command::new(&exe);
+        c.args(&args);
+        if let Some(dir) = &cwd {
+            c.current_dir(dir);
+        }
+        let res = c.spawn();
         match res {
             Ok(_) => {
                 std::process::exit(0);
@@ -377,6 +476,83 @@ pub(crate) fn shell_invocation() -> (String, String) {
 
 #[cfg(test)]
 mod tests {
+    /// #211: the answer to the startup folder picker has to survive the
+    /// re-exec that opening another folder performs, or the new process asks
+    /// again and every answer restarts the app.
+    ///
+    /// The same answer gates every first-run write. A desktop opened from an
+    /// icon starts in a folder the OS chose — Documents on Windows — and
+    /// writing `.thclaws/` there makes `looks_like_v2_agent` true, so the next
+    /// launch offers to upgrade the user's Documents. Both live on one flag,
+    /// so they are pinned in one test rather than two racing over the env var.
+    #[test]
+    fn the_picker_answer_survives_a_restart() {
+        let _g = crate::kms::test_env_lock();
+        let prev = std::env::var("THCLAWS_PICKER_ANSWERED").ok();
+
+        std::env::remove_var("THCLAWS_PICKER_ANSWERED");
+        assert!(!picker_answered(), "a fresh launch asks");
+        assert!(
+            folder_undecided(true),
+            "a desktop launch writes nothing until the picker is answered"
+        );
+        assert!(
+            !folder_undecided(false),
+            "--cli / -p / --serve chose their folder by cd-ing into it"
+        );
+        mark_picker_answered();
+        assert!(picker_answered(), "and the restart does not");
+        assert!(
+            !folder_undecided(true),
+            "an answered picker releases the first-run writes"
+        );
+        std::env::set_var("THCLAWS_PICKER_ANSWERED", "0");
+        assert!(!picker_answered(), "only \"1\" counts");
+        assert!(folder_undecided(true), "and holds them again");
+
+        match prev {
+            Some(v) => std::env::set_var("THCLAWS_PICKER_ANSWERED", v),
+            None => std::env::remove_var("THCLAWS_PICKER_ANSWERED"),
+        }
+    }
+
+    /// A folder inside the workspace opens in place; one outside restarts the
+    /// app there. Windows canonicalizes to a verbatim path, so the two sides
+    /// of that comparison can arrive in different forms (#211).
+    #[test]
+    fn inside_survives_windows_verbatim_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("sub");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert!(is_inside(root.path(), &nested));
+        assert!(is_inside(root.path(), root.path()));
+
+        let outside = tempfile::tempdir().unwrap();
+        assert!(!is_inside(root.path(), outside.path()));
+
+        // A sibling whose name merely starts with the root's name is outside.
+        let sibling = root.path().with_file_name(format!(
+            "{}-more",
+            root.path().file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(&sibling).unwrap();
+        assert!(!is_inside(root.path(), &sibling));
+        let _ = std::fs::remove_dir_all(&sibling);
+
+        // A folder that does not exist cannot be canonicalized; it must still
+        // compare against a canonicalized root rather than reading as outside.
+        assert!(is_inside(root.path(), &root.path().join("not-yet")));
+
+        // The verbatim forms Windows produces, compared with plain ones.
+        let verbatim = std::path::Path::new("\\\\?\\C:\\projects\\book");
+        let plain_root = std::path::Path::new("C:\\projects");
+        let plain_other = std::path::Path::new("C:\\other");
+        assert!(is_inside(plain_root, verbatim));
+        assert!(!is_inside(plain_other, verbatim));
+        let unc = std::path::Path::new("\\\\?\\UNC\\server\\share\\dir");
+        assert!(is_inside(std::path::Path::new("\\\\server\\share"), unc));
+    }
+
     /// #210: std panics with "failed printing to stderr" when the pipe is
     /// gone. That panic must be told apart from a real one, or the agent
     /// aborts while its host is simply shutting down.

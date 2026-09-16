@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.131.0] — 2026-09-16
+
+**Nothing is written into a folder you did not choose.** Opening the app from its icon no longer leaves a workspace behind in whatever folder the system started it in, the start-up folder picker stops asking again on Windows, and an agent created by upgrading a workspace gets the same complete settings file as one you add by hand.
+
+### Fixed
+- **An agent created by upgrading a workspace was missing most of its settings.** When a workspace became multi-agent, its agent kept whatever `.thclaws/settings.json` the workspace had — often only a line or two — while an agent you add yourself gets the full file with every option listed at its default. Upgrading now fills in whatever that file is missing, and leaves everything you had already set exactly as it was. The options list itself was also missing `imageToolsEnabled`, so nothing mentioned the media tools.
+- **Opening the app from its icon left a `.thclaws/` folder wherever it started.** The desktop wrote a workspace's settings the moment it opened, and an app opened from the Start menu or from Finder starts in whatever folder the system gives it — your Documents folder on Windows. That folder then looked like a workspace, so a later launch would offer to upgrade it and move your files into it. Nothing is written now until you pick a folder, and the folder you pick is the one that gets the settings. The window size is no longer saved when no folder has been chosen either, since saving it created the folder too.
+- **A schedule whose folder no longer exists failed over and over.** The run was rejected because the folder was missing, but that happened before the attempt was recorded — so the schedule still looked like it had not run since the last time it succeeded. Every start-up then replayed every missed run, one failure per tick, and the backlog grew by one a day. Such a schedule is now skipped with a single message naming the folder, until you point it somewhere that exists or remove it.
+- **On Windows, picking a workspace folder at start-up asked again, forever.** Choosing a folder outside the one the app launched in restarts the app there, and the restarted app had no memory that you had already answered, so it showed the picker again. The answer now survives the restart. Windows hit this every time because the Start-menu shortcut launches the app in your Documents folder, so every pick is outside it; launching the app from Finder on macOS could loop the same way. Also fixed: a folder inside the workspace could be misread as outside on Windows, because the two paths were compared in different forms.
+
 ## [0.130.0] — 2026-09-16
 
 **Quitting is clean again.** Closing the app in a workspace with several agents no longer leaves a crash report behind.

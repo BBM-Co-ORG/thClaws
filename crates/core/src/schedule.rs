@@ -671,6 +671,9 @@ pub struct InProcessScheduler {
     /// `None` means the default user-level store. Tests pass `Some`
     /// to redirect to a tempdir.
     store_path: Option<PathBuf>,
+    /// Ids already warned about for a missing cwd, so the warning is
+    /// once per process rather than once per tick.
+    warned_missing_cwd: HashSet<String>,
 }
 
 impl InProcessScheduler {
@@ -680,6 +683,7 @@ impl InProcessScheduler {
             running: Arc::new(Mutex::new(HashSet::new())),
             binary,
             store_path: None,
+            warned_missing_cwd: HashSet::new(),
         }
     }
 
@@ -692,6 +696,7 @@ impl InProcessScheduler {
             running: Arc::new(Mutex::new(HashSet::new())),
             binary,
             store_path: Some(store_path),
+            warned_missing_cwd: HashSet::new(),
         }
     }
 
@@ -728,6 +733,23 @@ impl InProcessScheduler {
                 continue;
             };
             if next > now {
+                continue;
+            }
+
+            // A schedule whose cwd is gone can never run, and `run_once_with`
+            // rejects it before recording the attempt — so `lastRun` stays
+            // frozen and the backlog is replayed in full by every process that
+            // starts, one failed fire per tick, growing by one per day. Park
+            // the cursor at `now` instead: no walk, and nothing to replay.
+            if !schedule.cwd.exists() {
+                if self.warned_missing_cwd.insert(schedule.id.clone()) {
+                    eprintln!(
+                        "\x1b[33m[schedule] '{}': cwd does not exist, skipping: {}\x1b[0m",
+                        schedule.id,
+                        schedule.cwd.display()
+                    );
+                }
+                self.cursors.insert(schedule.id.clone(), now);
                 continue;
             }
 
@@ -2364,6 +2386,71 @@ mod tests {
     fn display_last_run_handles_absent_and_invalid_values() {
         assert_eq!(display_last_run(None), "never");
         assert_eq!(display_last_run(Some("bad-timestamp")), "bad-timestamp");
+    }
+
+    /// A schedule whose cwd is gone must be skipped outright, never
+    /// walked: `run_once_with` rejects it before recording the attempt,
+    /// so its `lastRun` never advances and the whole backlog replays on
+    /// every start. Uses an explicit store path so the test never
+    /// touches `~/.config/thclaws/schedules.json`.
+    #[cfg(unix)]
+    #[test]
+    fn tick_skips_a_schedule_whose_cwd_is_gone() {
+        let bin_dir = tempfile::tempdir().unwrap();
+        let fake = bin_dir.path().join("fake-thclaws");
+        write_fake_executable(&fake, "#!/bin/sh\nexit 0");
+
+        let store_dir = tempfile::tempdir().unwrap();
+        let store_path = store_dir.path().join("schedules.json");
+
+        // A cwd that existed when the schedule was added and is gone now.
+        let gone = tempfile::tempdir().unwrap();
+        let gone_path = gone.path().to_path_buf();
+        drop(gone);
+
+        // A week of missed daily fires. `run_once_with` rejects each one on
+        // the cwd check before it can stamp lastRun, so without the skip the
+        // cursor walks the backlog a fire per tick — and every restart walks
+        // it again from the same frozen timestamp.
+        let week_ago = (Utc::now() - chrono::Duration::days(7)).to_rfc3339();
+        let id = format!("gone-{}", uuid::Uuid::new_v4());
+        let mut store = ScheduleStore::default();
+        store
+            .add(Schedule {
+                id: id.clone(),
+                cron: "0 6 * * *".into(),
+                cwd: gone_path,
+                prompt: "p".into(),
+                model: None,
+                resume_session: None,
+                max_iterations: None,
+                timeout_secs: Some(5),
+                enabled: true,
+                watch_workspace: false,
+                last_run: Some(week_ago),
+                last_exit: None,
+                run_at: None,
+            })
+            .unwrap();
+        store.save_to(&store_path).unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut sched = InProcessScheduler::with_store_path(fake.clone(), store_path.clone());
+            for _ in 0..3 {
+                assert!(
+                    sched.tick(Utc::now()).is_empty(),
+                    "a schedule whose cwd is gone must never fire"
+                );
+            }
+        });
+
+        // And it stayed untouched on disk: no attempt was recorded.
+        let after = ScheduleStore::load_from(&store_path).unwrap();
+        assert_eq!(after.get(&id).unwrap().last_exit, None);
     }
 
     /// Tick logic end-to-end: covers catch-up skipping (fresh

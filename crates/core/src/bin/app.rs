@@ -974,6 +974,22 @@ async fn main() {
         || cli.messenger
         || cli.workflow.is_some()
         || cli.team_agent.is_some();
+    // Whether this process still has to be told which folder it is for. A
+    // desktop opened from an icon starts wherever the OS put it — Documents on
+    // Windows, where the Start-menu shortcut sets
+    // `WorkingDirectory="PersonalFolder"`. Nothing may write into that folder
+    // until the picker is answered: `.thclaws/state` alone makes
+    // `looks_like_v2_agent` true, so a bootstrap there turns the user's
+    // Documents into a workspace that the next launch offers to upgrade —
+    // and `is_never_a_workspace` does not cover it, because it guards home
+    // itself, not the folders inside it. A pick carries the answer across a
+    // re-exec in THCLAWS_PICKER_ANSWERED; a CLI / `-p` / `--serve` run chose
+    // its folder by `cd`-ing into it.
+    #[cfg(feature = "gui")]
+    let folder_undecided =
+        thclaws_core::util::folder_undecided(!use_cli && (!cli.serve || cli.gui));
+    #[cfg(not(feature = "gui"))]
+    let folder_undecided = false;
     // dev-plan/59 §7.8: opening a v2 workspace in the app upgrades it. The
     // desktop and `--serve` are the surfaces a person is looking at, so the
     // banner below is seen; `-p` and the adapters are left alone, because a
@@ -984,7 +1000,16 @@ async fn main() {
     {
         let opens_desktop = !use_cli && (!cli.serve || cli.gui);
         let auto_allowed = thclaws_core::bots::migrate::auto_migrate_allowed();
-        if auto_allowed && !use_cli && !cli.multi_tenant && (cli.serve || opens_desktop) {
+        // `!folder_undecided`: upgrading a folder is the most destructive
+        // thing a launch does, so it waits for the picker like every other
+        // write. A v2 folder that is picked opens as a host, which re-execs,
+        // and the restarted process — marker set — upgrades it then.
+        if auto_allowed
+            && !use_cli
+            && !cli.multi_tenant
+            && !folder_undecided
+            && (cli.serve || opens_desktop)
+        {
             if let Ok(cwd) = std::env::current_dir() {
                 use thclaws_core::bots::migrate::AutoOutcome;
                 match thclaws_core::bots::migrate::auto_migrate_if_v2(&cwd) {
@@ -1058,19 +1083,23 @@ async fn main() {
     // the doomed parent. See `respawn_detached_for_gui_if_needed`.
     respawn_detached_for_gui_if_needed(&cli);
 
-    // Workspace layout migration (v1 flat → v2 `state/`): relocate any
-    // legacy runtime dirs under `.thclaws/state/` and seed authored
-    // workflows. Runs BEFORE the default-settings bootstrap so a legacy
-    // workspace (runtime dirs, no settings.json) is detected as legacy
-    // rather than freshly stamped v2. No-op on already-migrated or
-    // multiuser workspaces.
-    thclaws_core::config::ProjectConfig::migrate_workspace_if_needed();
+    // Held back until a folder is chosen — see `folder_undecided` above.
+    // `set_cwd` runs both of these against the folder the user picks.
+    if !folder_undecided {
+        // Workspace layout migration (v1 flat → v2 `state/`): relocate any
+        // legacy runtime dirs under `.thclaws/state/` and seed authored
+        // workflows. Runs BEFORE the default-settings bootstrap so a legacy
+        // workspace (runtime dirs, no settings.json) is detected as legacy
+        // rather than freshly stamped v2. No-op on already-migrated or
+        // multiuser workspaces.
+        thclaws_core::config::ProjectConfig::migrate_workspace_if_needed();
 
-    // First-run bootstrap: drop a `.thclaws/settings.json` with model +
-    // permissions defaults into the project so users get a working
-    // config the first time they `cd` in. Skipped if a config already
-    // exists or if a Claude Code `.claude/settings.json` is present.
-    thclaws_core::config::ProjectConfig::ensure_default_exists();
+        // First-run bootstrap: drop a `.thclaws/settings.json` with model +
+        // permissions defaults into the project so users get a working
+        // config the first time they `cd` in. Skipped if a config already
+        // exists or if a Claude Code `.claude/settings.json` is present.
+        thclaws_core::config::ProjectConfig::ensure_default_exists();
+    }
 
     // Wire up `--set-model` / `--model` before any AppConfig::load runs.
     // `--set-model` persists to `.thclaws/settings.json` (refusing to

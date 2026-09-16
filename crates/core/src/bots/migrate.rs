@@ -17,9 +17,14 @@
 //! half-migrated workspace holds the user's entire tree, so being resumable
 //! is not optional.
 //!
-//! This is NOT armed. Nothing calls it on open: until the desktop and cloud
-//! startup paths run as hosts, a migrated workspace would open as the host
-//! tree with no agent in it. `thclaws bots migrate` is the only caller.
+//! This IS armed, and has been since the desktop learned to run as a host.
+//! `bin/app.rs` calls [`auto_migrate_if_v2`] when the desktop or `--serve`
+//! opens a v2 folder, so opening one upgrades it in place. Two things hold it
+//! back: [`auto_migrate_allowed`], which keeps a container from deciding on
+//! its own unless `THCLAWS_AUTO_MIGRATE=1` opts it in, and — dev-plan/63 —
+//! the folder picker, since a desktop started from an icon is standing in
+//! whatever folder the OS chose and must not upgrade it. `thclaws bots
+//! migrate` is the manual caller.
 
 use super::{bot_dir, BotDef, BotsConfig};
 use crate::error::{Error, Result};
@@ -500,6 +505,12 @@ fn apply_locked(plan: &Plan) -> Result<Report> {
     write_phase(ws, Phase::Finalise)?;
     install_host_files(ws)?;
     report.minted_identity = mint_identity(ws)?;
+    // The agent arrives with the `settings.json` the workspace had, which is
+    // often two keys, while an agent added by hand gets the full documented
+    // template. `ensure_default_exists_in` cannot close that gap — it returns
+    // early because the file exists — so fill in what it is missing. Runs
+    // after `mint_identity`, which writes the file even when there was none.
+    let _ = crate::config::ProjectConfig::backfill_defaults_in(&bot_dir(ws, MAIN_SLUG));
     report.rewritten_schedules = rewrite_schedules(ws)?;
     let _ = std::fs::remove_file(marker_path(ws));
     Ok(report)
@@ -1128,6 +1139,48 @@ mod tests {
                 None => std::env::remove_var(k),
             }
         }
+    }
+
+    /// An upgraded agent must end up with the same first-run file as one added
+    /// by hand. It arrives with whatever the workspace had — two keys is
+    /// normal — and `ensure_default_exists_in` will not fill it, because that
+    /// returns early precisely when the file exists.
+    ///
+    /// `gatewayProxy` is deliberately not asserted: the credential check that
+    /// adds it is skipped under `cfg!(test)`, so it appears in a real run with
+    /// a cloud token, never here.
+    #[test]
+    fn a_migrated_agent_gets_the_first_run_settings_a_new_one_gets() {
+        let (_root, ws) = v2_workspace("filled");
+        // A value the user chose, which the backfill must leave alone.
+        std::fs::write(
+            ws.join(".thclaws/settings.json"),
+            r#"{"workspaceVersion":2,"maxTokens":999}"#,
+        )
+        .unwrap();
+        apply(&plan(&ws).unwrap()).unwrap();
+
+        let settings: serde_json::Value =
+            serde_json::from_str(&read(&ws.join(".thclaws/bots/main/.thclaws/settings.json")))
+                .unwrap();
+        for key in [
+            "teamEnabled",
+            "shellTabEnabled",
+            "imageToolsEnabled",
+            "halEnabled",
+            "browserEnabled",
+            "model",
+            "permissions",
+            "maxIterations",
+        ] {
+            assert!(settings.get(key).is_some(), "backfill missed {key}");
+        }
+        assert_eq!(settings["maxTokens"], 999, "a value the user set is kept");
+        assert_eq!(settings["workspaceVersion"], 2);
+        assert!(
+            settings["agent"]["id"].is_string(),
+            "the identity is still minted"
+        );
     }
 
     #[test]

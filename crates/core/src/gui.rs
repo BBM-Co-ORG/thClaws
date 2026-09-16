@@ -628,6 +628,13 @@ fn is_macos_close_shortcut(event: &tao::event::KeyEvent, modifiers: ModifiersSta
 // no-op rewrite that would touch the file's mtime. Shared by the normal
 // close path and `/reload` (which re-execs and must save first).
 fn persist_window_size(latest_window_size: Option<(f64, f64)>) {
+    // No folder has been chosen yet — an icon launch whose picker is still
+    // unanswered. `save()` creates `.thclaws/` before it writes, so saving a
+    // window size here would leave a workspace in whatever folder the OS
+    // started us in. A size is not worth that; drop it.
+    if !crate::util::picker_answered() {
+        return;
+    }
     if let Some((w, h)) = latest_window_size {
         let mut project = crate::config::ProjectConfig::load().unwrap_or_default();
         if project.window_width != Some(w) || project.window_height != Some(h) {
@@ -833,7 +840,11 @@ fn run_gui_inner(
         .map(|_| std::env::current_dir().unwrap_or_default());
     // The picker is offered once per window, not once per bot: every bot's
     // tree asks `get_cwd` when it is first shown.
-    let picker_offered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // #211: seeded from the answer this process chain already has, so a pick
+    // that re-execs the app does not ask again on the other side.
+    let picker_offered = Arc::new(std::sync::atomic::AtomicBool::new(
+        crate::util::picker_answered(),
+    ));
     let picker_offered_for_ipc = picker_offered.clone();
     let host_for_ipc = host_conn;
     let proxy_for_bots = proxy.clone();
@@ -1247,15 +1258,17 @@ fn run_gui_inner(
                         .unwrap_or_default()
                         .to_string();
                     let target = std::path::Path::new(&path);
-                    let inside = host_root_for_ipc.as_ref().is_some_and(|root| {
-                        let canon = |p: &std::path::Path| {
-                            p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
-                        };
-                        canon(target).starts_with(canon(root))
-                    });
+                    let inside = host_root_for_ipc
+                        .as_ref()
+                        .is_some_and(|root| crate::util::is_inside(root, target));
                     let reply = if inside {
                         // Answered: other bots' trees open without it now.
                         picker_offered_for_ipc.store(true, std::sync::atomic::Ordering::SeqCst);
+                        // This pick keeps the cwd, so it never re-execs and
+                        // the marker would otherwise stay unset for the life
+                        // of the process — which is what lets the window size
+                        // be saved and the bootstrap run.
+                        crate::util::mark_picker_answered();
                         serde_json::json!({ "type": "cwd_changed", "path": path, "ok": true })
                     } else if target.is_dir() {
                         crate::recent_dirs::save_recent_dir(&path);
@@ -1912,9 +1925,10 @@ fn run_gui_inner(
                 request_gui_shutdown(&shared_for_events, control_flow, latest_window_size);
             }
             Event::UserEvent(UserEvent::ReloadRequested) => {
-                // Save the live window size first (the re-exec bypasses the
-                // close path), then re-exec off-thread after a beat so the
-                // "[reload]…" line paints before the process image is replaced.
+                // #211: a restart keeps its working directory, so the folder is
+                // already decided — it must never re-open the startup picker.
+                // Marking here covers `/reload` too, not just a folder pick.
+                crate::util::mark_picker_answered();
                 persist_window_size(latest_window_size);
                 std::thread::spawn(|| {
                     std::thread::sleep(std::time::Duration::from_millis(400));
