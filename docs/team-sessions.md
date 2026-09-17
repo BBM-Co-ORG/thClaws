@@ -76,3 +76,29 @@ logs and completed tasks. It rejects members that still own unfinished tasks.
 Previously used session-bound names cannot be reused through this panel.
 The lead belongs to the bot and cannot be removed here; manage bots in the
 left rail. The management actions currently support single-user bot workspaces.
+
+## Team Control GUI Shell
+
+Choose **UI → Team Control** in the shell picker. The shell shows the current
+bot's lead and configured teammates, including members not started yet. Create
+or edit the team, add/edit members, and explicitly Start each worker. Select an
+agent to send instructions, stop its current turn, request shutdown, or remove
+its stopped membership. The existing backend still enforces unfinished-task
+and history-preservation rules. This uses native Agent Teams, not parallel
+`run()` calls through the GUI Shell's shared lead executor.
+
+Activity displays recent worker logs plus lead progress. **Load history** reads
+saved completed turns without activating that conversation; use Chat / Team's
+Open session for live conversation replay. Changing the selected agent changes
+only the view. Messages queue for the target's next turn; Stop targets only that
+agent's current session. A stale card (removed member, restarted session, or
+stopped worker) cannot send commands to a replacement. One team per bot and
+single-user bot workspaces are currently supported.
+
+The bridge exposes `thclaws.team.snapshot()`, `manage(operation)`,
+`message(agent, sessionId, text)`, `stop(agent, sessionId)` and
+`history(agent, sessionId)`. Permissions are respectively `team.read`,
+`team.manage`, `team.message`, `team.control`, and `team.read`. Manage operations
+use the same action payloads as the native Team tab. Replies carry the shell ID
+to avoid resolving another shell's requests with an overlapping numeric ID.
+The Team Control manifest deliberately does not request `agent.run`.
