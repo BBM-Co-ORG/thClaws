@@ -83,26 +83,26 @@ fn ipc_session_store(ctx: &IpcContext) -> Option<crate::session::SessionStore> {
 }
 
 fn ipc_team_mailbox(ctx: &IpcContext) -> crate::team::Mailbox {
-    let cwd = ctx
-        .shared
-        .session_roots
-        .as_ref()
-        .and_then(|r| r.workspace_root.clone())
-        .unwrap_or_else(crate::workdir::current_workdir);
-    let default = crate::team::Mailbox::default_dir();
-    let mut dir = cwd.join(&default);
-    if !dir.join("config.json").exists() {
-        if let Ok(entries) = std::fs::read_dir(&cwd) {
-            for entry in entries.flatten() {
-                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
-                    && entry.path().join(&default).join("config.json").exists()
-                {
-                    dir = entry.path().join(&default);
-                    break;
-                }
-            }
-        }
-    }
+    team_mailbox_for_workspace(
+        ctx.shared
+            .session_roots
+            .as_ref()
+            .and_then(|r| r.workspace_root.as_deref()),
+        crate::team::resolved_team_dir,
+    )
+}
+
+fn team_mailbox_for_workspace(
+    isolated_workspace: Option<&std::path::Path>,
+    lead_team_dir: impl FnOnce() -> std::path::PathBuf,
+) -> crate::team::Mailbox {
+    // Hosted bots share a working directory for user files, but keep team
+    // state in their own bot directory. Use the lead's pinned mailbox, not
+    // current_workdir() or a guessed child folder. Explicit per-user roots
+    // still take precedence so multiuser requests cannot reach the owner.
+    let dir = isolated_workspace
+        .map(|root| root.join(crate::team::Mailbox::default_dir()))
+        .unwrap_or_else(lead_team_dir);
     crate::team::Mailbox::new(dir)
 }
 
@@ -7223,6 +7223,39 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn team_mailbox_routes_hosted_bot_status_and_messages_without_config() {
+        let host = tempfile::tempdir().unwrap();
+        let bot_team = host.path().join(".thclaws/bots/main/.thclaws/state/team");
+        let worker = crate::team::Mailbox::new(bot_team.clone());
+        worker.write_status("lead", "active", None).unwrap();
+        worker.write_status("researcher", "working", None).unwrap();
+        // A lead must appear even before TeamCreate writes config.json.
+        assert!(!bot_team.join("config.json").exists());
+        let ipc = team_mailbox_for_workspace(None, || bot_team.clone());
+        assert_eq!(ipc.all_status().unwrap().len(), 2);
+        ipc.write_to_mailbox("lead", crate::team::TeamMessage::new("user", "hello"))
+            .unwrap();
+        assert_eq!(worker.read_unread("lead").unwrap()[0].content(), "hello");
+        assert!(!host
+            .path()
+            .join(crate::team::Mailbox::default_dir())
+            .exists());
+    }
+
+    #[test]
+    fn team_mailbox_keeps_isolated_users_out_of_the_lead_workspace() {
+        let user = tempfile::tempdir().unwrap();
+        let ipc = team_mailbox_for_workspace(Some(user.path()), || {
+            panic!("isolated requests must not resolve the process lead mailbox")
+        });
+        assert_eq!(
+            ipc.team_dir,
+            user.path().join(crate::team::Mailbox::default_dir())
+        );
+        assert!(ipc.all_status().unwrap().is_empty());
+    }
 
     /// IpcContext can be constructed with stub closures for tests.
     /// Pin the type signature so future refactors that break Send +
