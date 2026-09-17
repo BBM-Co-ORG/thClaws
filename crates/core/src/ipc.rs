@@ -6097,6 +6097,25 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
             }
         }
 
+        "team_manage" => {
+            let mailbox = Arc::new(ipc_team_mailbox(ctx));
+            let dispatch = ctx.dispatch.clone();
+            let cwd = crate::workdir::current_workdir();
+            let request_id = msg["request_id"].clone();
+            let isolated = ctx.shared.session_roots.is_some();
+            tokio::spawn(async move {
+                let result = if isolated {
+                    Err(crate::error::Error::Tool("Team management is currently available in single-user bot workspaces only.".into()))
+                } else {
+                    crate::team::management::manage(mailbox, msg, cwd).await
+                };
+                let (ok, text) = match result {
+                    Ok(text) => (true, text),
+                    Err(e) => (false, e.to_string()),
+                };
+                dispatch(serde_json::json!({"type":"team_manage_result","request_id":request_id,"ok":ok,"text":text}).to_string());
+            });
+        }
         "team_list" => {
             let mailbox = ipc_team_mailbox(ctx);
             let agents: Vec<serde_json::Value> = mailbox
@@ -6129,10 +6148,21 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                     })
                 })
                 .collect();
-            let has_team = mailbox.team_dir.join("config.json").exists();
+            let config = crate::team::TeamConfig::load(&mailbox.team_dir.join("config.json")).ok();
+            let has_team = config.is_some();
+            let agents: Vec<_> = agents
+                .into_iter()
+                .filter(|a| {
+                    a["name"] == "lead"
+                        || config
+                            .as_ref()
+                            .is_none_or(|c| c.members.iter().any(|m| a["name"] == m.name))
+                })
+                .collect();
             let payload = serde_json::json!({
                 "type": "team_status",
                 "has_team": has_team,
+                "team": config,
                 "agents": agents,
             });
             (ctx.dispatch)(payload.to_string());

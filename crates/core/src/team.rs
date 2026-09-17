@@ -21,6 +21,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+pub mod management;
+
 pub const POLL_INTERVAL_MS: u64 = 1000;
 
 /// A teammate rewrites its status (heartbeat) every poll (~1s) even when
