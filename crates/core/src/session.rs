@@ -1318,10 +1318,15 @@ impl SessionStore {
     }
 
     pub fn load(&self, id: &str) -> Result<Session> {
-        Self::validate_id(id)?;
-        let s = Session::load_from(&self.path_for(id))?;
+        let s = self.read(id)?;
         crate::audit::set_session(&s.id);
         Ok(s)
+    }
+
+    /// Read history without changing the running agent's audit context.
+    pub fn read(&self, id: &str) -> Result<Session> {
+        Self::validate_id(id)?;
+        Session::load_from(&self.path_for(id))
     }
 
     /// Resolve a user-supplied identifier to a session id. Tries id match

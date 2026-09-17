@@ -6097,6 +6097,63 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
             }
         }
 
+        "gui_shell_team" => {
+            let request_id = msg["id"].as_u64().unwrap_or(0);
+            let shell_id = msg["shellId"].as_str().unwrap_or("").to_string();
+            let action = msg["action"].as_str().unwrap_or("").to_string();
+            let allowed = crate::gui_shell::team::permission(&action)
+                .is_some_and(|permission| shell_has_permission(&shell_id, permission));
+            let dispatch = ctx.dispatch.clone();
+            let shared = ctx.shared.clone();
+            let mailbox = Arc::new(ipc_team_mailbox(ctx));
+            let store = ipc_session_store(ctx);
+            let cwd = crate::workdir::current_workdir();
+            tokio::spawn(async move {
+                let result: crate::error::Result<Value> = async {
+                    if !allowed {
+                        return Err(crate::error::Error::Tool("Shell lacks the required team permission, or action is unknown.".into()));
+                    }
+                    if shared.session_roots.is_some() {
+                        return Err(crate::error::Error::Tool("Team shell is currently available in single-user bot workspaces only.".into()));
+                    }
+                    let execution = shared.execution_session_id.lock().unwrap().clone();
+                    if action == "snapshot" {
+                        return Ok(crate::gui_shell::team::snapshot(&mailbox, &execution, crate::agent_activity::busy_meta().as_ref()));
+                    }
+                    if action == "manage" {
+                        let text = crate::team::management::manage(mailbox.clone(), msg["operation"].clone(), cwd).await?;
+                        return Ok(serde_json::json!({"text":text}));
+                    }
+                    let name = msg["agent"].as_str().unwrap_or("");
+                    let id = msg["targetSession"].as_str().unwrap_or("");
+                    crate::gui_shell::team::validate_target(&mailbox, name, id, &execution, action != "history")?;
+                    match action.as_str() {
+                        "history" => {
+                            let store = store.ok_or_else(|| crate::error::Error::Tool("No session store".into()))?;
+                            let session = store.read(id)?;
+                            Ok(serde_json::json!({"agent":name,"session_id":id,"messages":serialize_shell_history_with_usage(&session)}))
+                        }
+                        "message" => {
+                            crate::gui_shell::team::send_message(&mailbox, name, msg["text"].as_str().unwrap_or(""))?;
+                            Ok(serde_json::json!({"text":format!("Message queued for {name}; it will be read at the next turn.")}))
+                        }
+                        "stop" => {
+                            if name == "lead" { shared.request_cancel(); }
+                            else { crate::gui_shell::team::stop_teammate(&mailbox, name)?; }
+                            Ok(serde_json::json!({"text":format!("Stop requested for {name} only.")}))
+                        }
+                        _ => unreachable!(),
+                    }
+                }.await;
+                let body = match result {
+                    Ok(value) => serde_json::json!({"result":value}),
+                    Err(error) => serde_json::json!({"error":error.to_string()}),
+                };
+                let mut reply: Value = serde_json::from_str(&shell_reply(request_id, body)).unwrap();
+                reply["shellId"] = Value::String(shell_id);
+                dispatch(reply.to_string());
+            });
+        }
         "team_manage" => {
             let mailbox = Arc::new(ipc_team_mailbox(ctx));
             let dispatch = ctx.dispatch.clone();
