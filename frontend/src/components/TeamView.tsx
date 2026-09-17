@@ -186,8 +186,12 @@ export function TeamView() {
   const cols = agents.length <= 1 ? 1 : agents.length <= 4 ? 2 : 3;
 
   return (
+    <div className="h-full flex flex-col min-h-0">
+      <div className="px-3 py-2 text-xs" style={{ color: "var(--text-secondary)" }}>
+        Agents in this bot · Lead and teammates · {agents.length} members
+      </div>
     <div
-      className="h-full w-full grid gap-px overflow-hidden"
+      className="flex-1 min-h-0 w-full grid gap-px overflow-hidden"
       style={{
         gridTemplateColumns: `repeat(${cols}, 1fr)`,
         gridTemplateRows: `repeat(${Math.ceil(agents.length / cols)}, 1fr)`,
@@ -197,6 +201,7 @@ export function TeamView() {
       {agents.map((agent) => (
         <AgentPane key={agent.name} agent={agent} />
       ))}
+    </div>
     </div>
   );
 }

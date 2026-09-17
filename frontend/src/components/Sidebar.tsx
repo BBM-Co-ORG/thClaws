@@ -7,7 +7,10 @@ import { CtxMenuItem } from "./CtxMenuItem";
 
 type SessionInfo = { id: string; model: string; messages: number; title?: string | null; owner_agent?: string | null };
 function sessionLabel(session: SessionInfo): string {
-  return session.title?.trim() || session.owner_agent?.trim() || `Session ${session.id.slice(-6)}`;
+  const owner = session.owner_agent?.trim();
+  const title = session.title?.trim();
+  if (!owner || owner === "lead") return `Lead · ${title || `Session ${session.id.slice(-6)}`}`;
+  return title ? `${owner} · ${title}` : owner;
 }
 
 type KmsInfo = { name: string; scope: "user" | "project"; active: boolean };
@@ -551,7 +554,7 @@ export function Sidebar({ onBrowseKms }: SidebarProps = {}) {
         action={
           <button
             className="p-0.5 rounded hover:bg-white/10"
-            title="New session (keeps active task running)"
+            title="New lead session (keeps active task running)"
             onClick={() => {
               send({ type: "new_session" });
             }}
