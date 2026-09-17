@@ -528,7 +528,10 @@ fn rel_slide_pngs(workspace: &std::path::Path, pdf: &std::path::Path) -> Vec<Str
 
 pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
     let ty = msg.get("type").and_then(|t| t.as_str()).unwrap_or("");
-    let target = msg.get("session_id").and_then(Value::as_str);
+    let target = msg
+        .get("session_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty());
     let busy = crate::agent_activity::busy_meta();
     let execution = ctx.shared.execution_session_id.lock().unwrap().clone();
     let active = busy
@@ -663,6 +666,19 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
             // its initial snapshot. The wry path's send_event arm
             // synthesises the same JSON via gui.rs's event-loop.
             ctx.shared.ready_gate.signal();
+            // The worker may have activated before this client subscribed.
+            // Replay its identity and busy state on every handshake.
+            let id = ctx.shared.execution_session_id.lock().unwrap().clone();
+            if !id.is_empty() {
+                (ctx.dispatch)(
+                    serde_json::json!({"type":"session_execution","session_id":id}).to_string(),
+                );
+            }
+            for frame in crate::event_render::render_chat_dispatches(
+                &crate::shared_session::ViewEvent::BusyChanged(crate::agent_activity::busy_meta()),
+            ) {
+                (ctx.dispatch)(frame);
+            }
             (ctx.on_send_initial_state)();
         }
 

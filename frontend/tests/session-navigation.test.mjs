@@ -325,3 +325,36 @@ test("reopening the selected teammate switches to Chat without reloading its tra
     { type: "session_view_selected", session_id: "S", team_agent: "coder" },
   ]);
 });
+
+test("first connection never sends an empty session target from a sidebar refresh", () => {
+  const sent = [],
+    received = [];
+  const nav = new SessionNavigation(
+    (f) => received.push(f),
+    (f) => sent.push(f),
+  );
+  nav.receive({ type: "initial_state", sessions: [], agent_busy: false });
+  nav.receive({
+    type: "sessions_list",
+    current_id: "",
+    sessions: [{ id: "A" }],
+  });
+  nav.receive({ type: "session_execution", session_id: "" });
+  nav.send({ type: "shell_input", text: "first prompt" });
+  assert.deepEqual(sent.at(-1), { type: "shell_input", text: "first prompt" });
+  assert.equal(nav.execution, null);
+  nav.receive({ type: "session_execution", session_id: "A" });
+  nav.receive({ type: "gui_busy_changed", busy: false });
+  nav.receive({ type: "initial_state", sessions: [{ id: "A" }] });
+  assert.equal(sent.at(-1).type, "session_load");
+  assert.equal(sent.at(-1).id, "A");
+  nav.receive({
+    type: "session_view",
+    session_id: "A",
+    request_id: sent.at(-1).view_request,
+    sequence: 0,
+    events: [],
+  });
+  nav.send({ type: "shell_input", text: "second prompt" });
+  assert.equal(sent.at(-1).session_id, "A");
+});

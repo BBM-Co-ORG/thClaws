@@ -2967,7 +2967,8 @@ mod tests {
         // Slash command — produces SlashOutput events without needing
         // any LLM provider configured (no API keys in CI).
         ws.send(WsMessage::text(
-            serde_json::json!({"type": "shell_input", "text": "/help"}).to_string(),
+            serde_json::json!({"type": "shell_input", "session_id": "", "text": "/help"})
+                .to_string(),
         ))
         .await
         .expect("ws send shell_input");
@@ -3021,8 +3022,29 @@ mod tests {
             "missing chat_done (turn termination); saw: {seen:?}"
         );
 
-        // Clean shutdown.
+        // Reconnect after activation: the original activation broadcast is
+        // gone, but the new frontend must learn a nonempty execution ID.
         let _ = ws.send(WsMessage::Close(None)).await;
+        let (mut reconnected, _) = connect_async(&url).await.unwrap();
+        reconnected
+            .send(WsMessage::text(
+                serde_json::json!({"type":"frontend_ready"}).to_string(),
+            ))
+            .await
+            .unwrap();
+        let identity = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(Ok(WsMessage::Text(text))) = reconnected.next().await {
+                let frame: serde_json::Value = serde_json::from_str(text.as_str()).unwrap();
+                if frame["type"] == "session_execution" {
+                    return frame["session_id"].as_str().unwrap().to_string();
+                }
+            }
+            panic!("connection closed without execution identity")
+        })
+        .await
+        .expect("reconnect must replay execution identity");
+        assert!(!identity.is_empty());
+        let _ = reconnected.send(WsMessage::Close(None)).await;
         server_handle.abort();
     }
 

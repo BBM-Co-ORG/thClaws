@@ -145,7 +145,8 @@ export class SessionNavigation {
       }
       if (frame.type === "ask_user_response" && this.viewed)
         this.asks.delete(this.viewed);
-      this.transmit({ ...frame, session_id: this.viewed ?? this.execution });
+      const target = this.viewed || this.execution;
+      this.transmit({ ...frame, ...(target ? { session_id: target } : {}) });
       return true;
     }
     this.transmit(frame);
@@ -207,6 +208,7 @@ export class SessionNavigation {
       }
     }
     if (frame.type === "session_execution") {
+      if (typeof frame.session_id !== "string" || !frame.session_id) return;
       const previous = this.execution;
       this.execution = String(frame.session_id);
       if (!this.request && (!this.viewed || this.viewed === previous)) {
@@ -320,7 +322,11 @@ export class SessionNavigation {
       }
     }
     if (frame.type === "sessions_list" || frame.type === "initial_state") {
-      if (typeof frame.current_id === "string" && !this.execution)
+      if (
+        typeof frame.current_id === "string" &&
+        frame.current_id &&
+        !this.execution
+      )
         this.execution = frame.current_id;
       frame = {
         ...frame,
