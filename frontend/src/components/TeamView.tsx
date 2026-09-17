@@ -120,6 +120,7 @@ function ansiToHtml(text: string, palette: Record<number, string>): string {
 
 interface AgentInfo {
   name: string;
+  sessionId: string | null;
   status: string;
   task: string | null;
   output: string[];
@@ -135,6 +136,7 @@ export function TeamView() {
         setAgents(
           msg.agents.map((a: Record<string, unknown>): AgentInfo => ({
             name: String(a.name || a.agent || "?"),
+            sessionId: typeof a.session_id === "string" && a.session_id ? a.session_id : null,
             status: String(a.status || "unknown"),
             task: a.task ? String(a.task) : a.current_task ? String(a.current_task) : null,
             output: Array.isArray(a.output) ? a.output as string[] : [],
@@ -242,6 +244,7 @@ function AgentPane({ agent }: { agent: AgentInfo }) {
         }}
       >
         <span style={{ color: "var(--accent)" }}>{agent.name}</span>
+        {agent.sessionId && <button className="px-2 py-1 rounded hover:bg-white/10" onClick={() => send({type:"session_load",id:agent.sessionId,...(agent.name === "lead" ? {} : {team_agent:agent.name})})}>Open session</button>}
         <span style={{ color: statusColor }}>
           {statusLabel}
           {agent.task ? ` · ${agent.task}` : ""}

@@ -709,6 +709,10 @@ export default function App() {
   // current_cwd when `guiShell.tabDefault` is set in settings.json so
   // the workspace lands on the GUI shell instead.
   const [activeTab, setActiveTab] = useState<Tab>("chat");
+  useEffect(() => subscribe((msg) => {
+    if (msg.type === "session_view_selected" && msg.team_agent) setActiveTab("chat");
+  }), []);
+
   // Full-screen UI mode — hides tab strip, sidebar, status bar so the
   // GUI shell fills the viewport (the cloud equivalent of running
   // `thclaws --serve --gui-shell <id>`). Auto-enters when the backend

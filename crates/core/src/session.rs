@@ -88,6 +88,8 @@ struct SessionHeader {
     /// remain readable — only opt-in shell sessions get this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     shell: Option<ShellMeta>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner_agent: Option<String>,
 }
 
 /// Per-session shell binding written into the session header.
@@ -247,6 +249,8 @@ pub struct Session {
     /// `gui_shell_event` dispatches instead of `chat_*`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell: Option<ShellMeta>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_agent: Option<String>,
     /// Per-turn cost/latency footers, in the order they were produced.
     /// The chat surfaces render one under each completed turn; without
     /// persisting them, reopening a session showed the conversation
@@ -290,9 +294,16 @@ pub struct SessionMeta {
 
 impl Session {
     pub fn new(model: impl Into<String>, cwd: impl Into<String>) -> Self {
+        let session = Self::new_detached(model, cwd);
+        crate::audit::set_session(&session.id);
+        session
+    }
+
+    /// Create a record for background viewing without moving the executing
+    /// agent's audit context.
+    pub fn new_detached(model: impl Into<String>, cwd: impl Into<String>) -> Self {
         let now = now_secs();
         let id = generate_id();
-        crate::audit::set_session(&id);
         Self {
             id,
             created_at: now,
@@ -307,6 +318,7 @@ impl Session {
             goal: None,
             provider_session_id: None,
             shell: None,
+            owner_agent: None,
         }
     }
 
@@ -368,6 +380,7 @@ impl Session {
             cwd: self.cwd.clone(),
             created_at: self.created_at,
             shell: self.shell.clone(),
+            owner_agent: self.owner_agent.clone(),
         };
         let line = serde_json::to_string(&header)?;
         append_locked(path, |file| {
@@ -400,6 +413,7 @@ impl Session {
                 cwd: self.cwd.clone(),
                 created_at: self.created_at,
                 shell: self.shell.clone(),
+                owner_agent: self.owner_agent.clone(),
             };
             Some(serde_json::to_string(&header)?)
         } else {
@@ -693,6 +707,7 @@ impl Session {
                 cwd: String::new(),
                 created_at,
                 shell: None,
+                owner_agent: None,
             }
         });
 
@@ -1015,6 +1030,7 @@ impl Session {
                     cwd: String::new(),
                     created_at,
                     shell: None,
+                    owner_agent: None,
                 }
             }
         };
@@ -1037,6 +1053,7 @@ impl Session {
             goal,
             provider_session_id,
             shell: h.shell,
+            owner_agent: h.owner_agent,
             turn_usage,
         })
     }
@@ -1448,7 +1465,7 @@ impl SessionStore {
     /// still lands on a clean session rather than resuming a real chat).
     pub fn reuse_empty_latest(&self) -> Result<Option<Session>> {
         match self.latest()? {
-            Some(s) if s.messages.is_empty() => Ok(Some(s)),
+            Some(s) if s.messages.is_empty() && s.owner_agent.is_none() => Ok(Some(s)),
             _ => Ok(None),
         }
     }
