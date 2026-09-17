@@ -59,3 +59,20 @@ the live GUI event journal.
   select researcher, send a message, and click Stop. The browser console records
   the exact outbound IPC targets under `[team-fixture]`. It is a UI fixture, not
   a substitute for a live provider/process integration test.
+
+## Manage team
+
+The Team tab's **Manage team** panel edits the current bot's native team (one
+team per bot). Create/edit its name and goal, then add teammates with a unique
+name, role and initial instructions. **Save** only registers the member;
+**Start** launches a real teammate using the existing SpawnTeammate path and
+its configured model. New members share the bot's workspace.
+
+**Stop turn** interrupts the current turn, leaving the teammate available.
+**Request shutdown** asks it to exit; it can refuse while it has unfinished
+work. Wait for its actual stopped status before editing or removing it.
+**Remove member** removes membership only, preserving sessions, event journals,
+logs and completed tasks. It rejects members that still own unfinished tasks.
+Previously used session-bound names cannot be reused through this panel.
+The lead belongs to the bot and cannot be removed here; manage bots in the
+left rail. The management actions currently support single-user bot workspaces.

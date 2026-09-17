@@ -1,3 +1,4 @@
+import { TeamManager } from "./TeamManager";
 import { useEffect, useRef, useState } from "react";
 import { subscribe, send } from "../hooks/useIPC";
 import { useTheme, type ResolvedTheme } from "../hooks/useTheme";
@@ -169,16 +170,19 @@ export function TeamView() {
 
   if (agents.length === 0) {
     return (
+      <div className="h-full flex flex-col min-h-0">
+        <TeamManager />
       <div
-        className="flex items-center justify-center h-full"
+        className="flex-1 flex items-center justify-center"
         style={{ color: "var(--text-secondary)" }}
       >
         <div className="text-center">
           <p className="text-sm">No team agents running</p>
           <p className="text-xs mt-2">
-            Ask the agent to create a team — teammates will appear here
+            Use Manage team to create a team and add teammates
           </p>
         </div>
+      </div>
       </div>
     );
   }
@@ -187,6 +191,7 @@ export function TeamView() {
 
   return (
     <div className="h-full flex flex-col min-h-0">
+      <TeamManager />
       <div className="px-3 py-2 text-xs" style={{ color: "var(--text-secondary)" }}>
         Agents in this bot · Lead and teammates · {agents.length} members
       </div>
