@@ -2251,52 +2251,74 @@ fn now_string() -> String {
 /// here, only a lifetime: an hour without, three days with. That
 /// asymmetry is the whole design — "show someone this page" has to work
 /// the moment the agent finishes writing it, not after a signup.
+/// The publish itself, as structured data.
+///
+/// Split out from [`publish_app_lines`] because the two surfaces want
+/// different things from one upload: the CLI wants a block of text, the
+/// chat wants the fields so it can build a real message with a markdown
+/// link. Sandbox and file validation live here once instead of being
+/// copied into a second caller and drifting.
+pub async fn publish_app_result(
+    path: &str,
+    cloud_url: Option<&str>,
+    cloud_cfg: Option<&CloudConfig>,
+) -> Result<crate::cloud::client::PublishedApp, String> {
+    let p = std::path::Path::new(path);
+    // Read through the sandbox so /publish can't be talked into
+    // uploading a file outside the workspace — this command sends bytes
+    // to a public URL, which makes an arbitrary-read a data leak.
+    let resolved = crate::sandbox::Sandbox::check(path)
+        .map_err(|e| format!("cannot read {}: {e}", p.display()))?;
+    let body =
+        std::fs::read(&resolved).map_err(|e| format!("cannot read {}: {e}", resolved.display()))?;
+    // Advisory, not enforced: the server accepts any UTF-8 text. Saying
+    // so early beats a confusing render later.
+    if !path.to_ascii_lowercase().ends_with(".html") && !path.to_ascii_lowercase().ends_with(".htm")
+    {
+        return Err(format!(
+            "{} doesn't look like an HTML file. /publish serves whatever it \
+             uploads as text/html, so a non-HTML file will render as markup.",
+            p.display()
+        ));
+    }
+
+    let url = resolve_cloud_url(cloud_url, cloud_cfg);
+    let client = Client::new(&url, crate::cloud::token());
+    client
+        .publish_app(body)
+        .await
+        .map_err(|e| format!("publish failed: {e}"))
+}
+
+/// The one line of facts about a published app, shared by the CLI block
+/// and the chat message so the two cannot drift apart.
+pub fn publish_detail_line(app: &crate::cloud::client::PublishedApp) -> String {
+    format!(
+        "{}  ·  {:.0} KB  ·  expires {}",
+        app.title.as_deref().unwrap_or("(untitled)"),
+        app.size_bytes as f64 / 1024.0,
+        app.expires_at,
+    )
+}
+
 pub async fn publish_app_lines(
     path: &str,
     cloud_url: Option<&str>,
     cloud_cfg: Option<&CloudConfig>,
 ) -> Vec<String> {
-    let p = std::path::Path::new(path);
-    // Read through the sandbox so /publish can't be talked into
-    // uploading a file outside the workspace — this command sends bytes
-    // to a public URL, which makes an arbitrary-read a data leak.
-    let resolved = match crate::sandbox::Sandbox::check(path) {
-        Ok(r) => r,
-        Err(e) => return vec![format!("cannot read {}: {e}", p.display())],
-    };
-    let body = match std::fs::read(&resolved) {
-        Ok(b) => b,
-        Err(e) => return vec![format!("cannot read {}: {e}", resolved.display())],
-    };
-    // Advisory, not enforced: the server accepts any UTF-8 text. Saying
-    // so early beats a confusing render later.
-    if !path.to_ascii_lowercase().ends_with(".html") && !path.to_ascii_lowercase().ends_with(".htm")
-    {
-        return vec![format!(
-            "{} doesn't look like an HTML file. /publish serves whatever it \
-             uploads as text/html, so a non-HTML file will render as markup.",
-            p.display()
-        )];
-    }
-
-    let url = resolve_cloud_url(cloud_url, cloud_cfg);
-    let token = crate::cloud::token();
-    let anonymous = token.is_none();
-    let client = Client::new(&url, token);
-
-    match client.publish_app(body).await {
+    match publish_app_result(path, cloud_url, cloud_cfg).await {
+        Err(e) => vec![e],
         Ok(app) => {
             let mut lines = vec![
                 app.url.clone(),
                 String::new(),
-                format!(
-                    "  {}  ·  {:.0} KB  ·  expires {}",
-                    app.title.as_deref().unwrap_or("(untitled)"),
-                    app.size_bytes as f64 / 1024.0,
-                    app.expires_at,
-                ),
+                format!("  {}", publish_detail_line(&app)),
             ];
-            if anonymous {
+            // `app.anonymous` rather than a local `token.is_none()`:
+            // same fact, but read from the response that actually
+            // decided the expiry, so the sentence below cannot contradict
+            // the `expires` above it.
+            if app.anonymous {
                 // Only reachable once the server opens the anonymous
                 // tier — until then a token-less publish is refused with
                 // its own message. Told here, at the moment it matters,
@@ -2310,6 +2332,5 @@ pub async fn publish_app_lines(
             }
             lines
         }
-        Err(e) => vec![format!("publish failed: {e}")],
     }
 }

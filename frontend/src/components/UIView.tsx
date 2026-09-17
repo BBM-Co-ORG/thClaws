@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { botQuery, send, subscribe } from "../hooks/useIPC";
 import { useTheme } from "../hooks/useTheme";
 
@@ -38,6 +38,15 @@ const PARENT_ONLY_TYPES = new Set(["ready", "hotkey", "ui"]);
 
 export function UIView({ active, shellId, fullscreen = false }: UIViewProps) {
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
+  // Bumped by the reload button. Used as BOTH the iframe `key` and a
+  // query param: the key remounts the element, and the changed URL stops
+  // any cache layer between here and disk from answering with the copy
+  // it already has. FilesView needed the same pair for the same reason.
+  //
+  // An on-disk shell is read fresh on every request (`ShellRef::OnDisk`
+  // calls `std::fs::read`), so the stale content is always the webview's,
+  // never the engine's — which is why this is a frontend-only fix.
+  const [reloadNonce, setReloadNonce] = useState(0);
   // Resolved theme ("light" | "dark") of the main UI. Pushed into the
   // shell so it can match the app theme instead of hardcoding colors
   // (the bridge mirrors it onto the shell document's data-theme).
@@ -169,19 +178,48 @@ export function UIView({ active, shellId, fullscreen = false }: UIViewProps) {
     (window.location.protocol === "http:" || window.location.protocol === "https:");
   // Under a workspace host the `bot=` picks whose shell this is; the
   // shell's own sub-assets inherit it through the Referer.
+  // `r` only ever changes when the reload button is pressed, so a normal
+  // render keeps the URL byte-identical and the shell is not disturbed.
+  const bust = reloadNonce > 0 ? `&r=${reloadNonce}` : "";
   const src = isHttp
-    ? `gui-shell/${encodeURIComponent(shellId)}/?session=${encodeURIComponent(TIER1_SESSION_ID)}${botQuery().replace(/^\?/, "&")}`
+    ? `gui-shell/${encodeURIComponent(shellId)}/?session=${encodeURIComponent(TIER1_SESSION_ID)}${botQuery().replace(/^\?/, "&")}${bust}`
     : `thclaws://localhost/gui-shell/${encodeURIComponent(shellId)}/index.html` +
-      `?session=${encodeURIComponent(TIER1_SESSION_ID)}`;
+      `?session=${encodeURIComponent(TIER1_SESSION_ID)}${bust}`;
 
   return (
-    <iframe
-      ref={iframeRef}
-      src={src}
-      title={`GUI Shell: ${shellId}`}
-      sandbox="allow-scripts allow-same-origin"
-      className="w-full h-full border-0"
-      style={{ display: "block", background: "transparent" }}
-    />
+    <div className="relative w-full h-full">
+      <iframe
+        // Remount on reload. Deliberate, and the reason this is a button
+        // rather than something automatic: a remount re-runs the shell's
+        // initial agent prompt, which is exactly why the iframe is
+        // otherwise left mounted across tab switches (see above). That is
+        // wanted when someone asks for a reload, and unwanted every other
+        // time.
+        key={reloadNonce}
+        ref={iframeRef}
+        src={src}
+        title={`GUI Shell: ${shellId}`}
+        sandbox="allow-scripts allow-same-origin"
+        className="w-full h-full border-0"
+        style={{ display: "block", background: "transparent" }}
+      />
+      <button
+        type="button"
+        onClick={() => setReloadNonce((n) => n + 1)}
+        title="Reload this shell from disk"
+        aria-label="Reload this shell from disk"
+        // Faint until pointed at: this is a development affordance sitting
+        // on top of someone's finished UI, so it should not compete with
+        // the shell's own controls.
+        className="absolute top-2 right-2 z-10 rounded px-2 py-1 text-xs opacity-25 hover:opacity-100 transition-opacity"
+        style={{
+          background: "var(--bg-secondary)",
+          color: "var(--text-primary)",
+          border: "1px solid var(--border)",
+        }}
+      >
+        ⟳
+      </button>
+    </div>
   );
 }

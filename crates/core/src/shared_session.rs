@@ -116,6 +116,30 @@ pub enum ShellInput {
     /// to teammate notifications in GUI mode (the CLI REPL has its
     /// own poller loop; this is GUI parity).
     TeamMessages(Vec<crate::team::TeamMessage>),
+    /// A `/publish` upload finished — put the link in the agent's
+    /// history as a real assistant message.
+    ///
+    /// Slash commands answer with `SlashOutput`, which is deliberately
+    /// not persisted (see the `!bang` note further down) and renders as
+    /// a `system` bubble. That costs the two things users hit first with
+    /// `/publish`: only assistant bubbles go through react-markdown, so
+    /// the URL is unclickable text; and `serialize_shell_history` drops
+    /// every role but User/Assistant, so the link is simply gone after a
+    /// reload — the one message people come back for.
+    ///
+    /// The upload runs on a spawned task that cannot hold
+    /// `&mut WorkerState` across an await, so it hands the result back
+    /// through this channel instead.
+    PublishedApp {
+        url: String,
+        detail: String,
+        /// The path as the user typed it. Carried because the slash
+        /// command itself is not persisted, so a reader scrolling back
+        /// would otherwise see a link with nothing saying what it was
+        /// made from — and `detail`'s title comes from the file's
+        /// `<title>`, which need not resemble its filename.
+        file: String,
+    },
     /// A background task finished spawning an MCP server — register
     /// its tools into the live tool registry and rebuild the agent so
     /// the next turn sees them. This lets the worker start accepting
@@ -2411,6 +2435,39 @@ async fn run_worker(
             ShellInput::TeamMessages(msgs) => {
                 cancel.reset();
                 handle_team_messages(msgs, &mut state, &events_tx, &cancel).await;
+            }
+            ShellInput::PublishedApp { url, detail, file } => {
+                // Markdown, because this renders as an assistant bubble
+                // and that is the only bubble react-markdown touches.
+                //
+                // The filename goes in a code span, so a backtick in a
+                // path would break out of it. react-markdown here runs
+                // without raw-HTML pass-through, so the worst case is
+                // mangled formatting rather than injection — strip them
+                // anyway rather than rely on that staying true.
+                let shown = file.replace('`', "");
+                let text = format!("Published `{shown}`\n\n[{url}]({url})\n\n{detail}");
+                state
+                    .agent
+                    .append_message(crate::types::Message::assistant(text));
+                // Into the JSONL by the same path as a turn, so it is
+                // still there on reload.
+                save_history(&state.agent, &mut state.session, &state.session_store);
+                // Re-render from canonical history rather than streaming
+                // a delta: `AssistantTextDelta` appends to whatever
+                // assistant bubble is currently open, so a publish that
+                // lands mid-turn would splice this link into the middle
+                // of the model's sentence.
+                //
+                // `from_session`, not `from_messages`: the per-turn usage
+                // footers live on the session, not in the agent's history,
+                // so rebuilding from messages alone would silently strip
+                // every token/cost line from the whole conversation each
+                // time someone publishes. Runs after `save_history` above,
+                // which has already synced the session from the agent.
+                let _ = events_tx.send(ViewEvent::HistoryReplaced(DisplayMessage::from_session(
+                    &state.session,
+                )));
             }
             ShellInput::McpReady {
                 server_name,

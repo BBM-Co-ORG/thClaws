@@ -144,6 +144,7 @@ pub mod tokens;
 pub mod tool_display;
 pub mod tools;
 pub mod types;
+pub mod update_check;
 pub mod uploads;
 pub mod usage;
 pub mod util;

@@ -758,6 +758,75 @@ fn pin_webview2_data_folder() {
     }
 }
 
+/// The frame that tells the page a newer release exists.
+fn update_frame(up: &crate::update_check::Update) -> String {
+    serde_json::json!({
+        "type": "update_available",
+        "version": up.version,
+        "url": up.url,
+    })
+    .to_string()
+}
+
+/// Tell the page about a newer release.
+///
+/// Called from BOTH modes' "the page is listening now" signal, because they
+/// are not the same signal. In the classic window that is
+/// `UserEvent::SendInitialState`; in host mode it never fires at all, since
+/// the frame that would trigger it is forwarded straight to the bot — so the
+/// host watches for the page's own `frontend_ready` instead.
+///
+/// **Sent on every ready, not once per launch.** `BotShell` renders one
+/// `<App/>` while the bot list is still loading and then a different set —
+/// one per bot — when it arrives, so React unmounts the first App and mounts
+/// others in its place. A notice delivered once goes to the App that is about
+/// to be thrown away, and the replacements never learn about it. Firing per
+/// ready is also what `ipc.rs` already does with the initial-state snapshot,
+/// for exactly this reason.
+///
+/// The cached read is a file read, so the window is never waiting on the
+/// network to appear; the refresh behind it has its own once-a-day gate.
+fn dispatch_update_notice(proxy: &EventLoopProxy<UserEvent>) {
+    // Whether this fired, and what it decided, is otherwise invisible: a
+    // notice that never reaches the page looks exactly like no new release.
+    // Three launches were spent guessing between those two.
+    let debug = std::env::var("THCLAWS_UPDATE_DEBUG").ok().as_deref() == Some("1");
+    match crate::update_check::cached() {
+        Some(up) => {
+            if debug {
+                eprintln!("[update] dispatching notice for {}", up.version);
+            }
+            let _ = proxy.send_event(UserEvent::Dispatch(update_frame(&up)));
+        }
+        None if debug => eprintln!(
+            "[update] nothing cached to announce (enabled={})",
+            crate::update_check::enabled()
+        ),
+        None => {}
+    }
+    let proxy_update = proxy.clone();
+    tokio::spawn(async move {
+        if let Some(up) = crate::update_check::refresh().await {
+            let _ = proxy_update.send_event(UserEvent::Dispatch(update_frame(&up)));
+        }
+    });
+}
+
+/// Whether a bridge frame's top-level `type` is exactly `want`.
+///
+/// Structural on purpose. The frames arriving from a bot have been through
+/// `desktop::tag`, which stamps `_bot` in front of every key, so their text is
+/// `{"_bot":"main","type":…}` and no fixed string compares equal to them. A
+/// `contains` test would compare equal to a chat envelope quoting the type in
+/// the user's own text, which on this path means "anyone who types the right
+/// words restarts the host".
+fn frame_type_is(frame: &str, want: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(frame)
+        .ok()
+        .and_then(|v| v.get("type")?.as_str().map(|t| t == want))
+        .unwrap_or(false)
+}
+
 fn run_gui_inner(
     serve: Option<crate::server::ServeConfig>,
     // dev-plan/59: `Some((host addr, token, bot slug))` points the IPC bridge
@@ -806,6 +875,25 @@ fn run_gui_inner(
             token.clone(),
             slug,
             move |frame| {
+                // A bot cannot restart the host. `/reload` typed in chat is
+                // dispatched in the bot process, which has no event loop, so
+                // its ReloadRequested went nowhere. The bot marks it on the
+                // bridge and the host — the only process that can re-exec —
+                // does the work.
+                //
+                // Decided on the parsed `type`, never on a substring: every
+                // other frame is a chat envelope carrying user text, and a
+                // `contains` test would let anyone restart the host by typing
+                // the magic word. The substring is only a cheap gate so the
+                // parse stays off the hot path — `desktop::tag` has already
+                // stamped `_bot` into every frame by the time it gets here, so
+                // an exact string compare can never match.
+                if frame.contains(crate::event_render::HOST_RELOAD_FRAME_TYPE)
+                    && frame_type_is(&frame, crate::event_render::HOST_RELOAD_FRAME_TYPE)
+                {
+                    let _ = proxy_for_bot.send_event(UserEvent::ReloadRequested);
+                    return;
+                }
                 let _ = proxy_for_bot.send_event(UserEvent::Dispatch(frame));
             },
         ));
@@ -1200,6 +1288,21 @@ fn run_gui_inner(
                 // which on a release build with a GUI shell took longer than
                 // that, so the window opened on "couldn't reach its backend".
                 // The window knows the answer, so it gives it at once.
+                // Host mode's stand-in for `SendInitialState`, which never
+                // fires here. Observed on its way past, not consumed — the
+                // bot wants this frame too.
+                //
+                // `frontend_ready` and NOT `get_cwd`, even though get_cwd is
+                // the earlier frame and the host answers it directly: the
+                // page sends get_cwd from its bootstrap, before the component
+                // holding the update subscriber exists, and
+                // `dispatchToSubscribers` has no buffer — a frame that early
+                // is dropped and never seen again. The ready beacon is
+                // mounted only once the startup modals are gone, by which
+                // point someone is listening.
+                if kind == "frontend_ready" {
+                    dispatch_update_notice(&proxy_for_ipc);
+                }
                 if kind == "get_cwd" {
                     let slug = bridge_for_ipc
                         .lock()
@@ -1868,6 +1971,9 @@ fn run_gui_inner(
                 ));
             }
             Event::UserEvent(UserEvent::SendInitialState) => {
+                // The classic window's "the page is listening" signal. Host
+                // mode has its own — see `dispatch_update_notice`.
+                dispatch_update_notice(&proxy);
                 let config = AppConfig::load().unwrap_or_default();
                 // No auto-switch here. This used to rewrite settings.json to
                 // a local runtime whenever the active provider had no key —
@@ -1930,6 +2036,26 @@ fn run_gui_inner(
                 // Marking here covers `/reload` too, not just a folder pick.
                 crate::util::mark_picker_answered();
                 persist_window_size(latest_window_size);
+                // A reload IS a restart, so it owes everything a quit does.
+                // Without this the re-exec left the engine-managed Chromium
+                // and this session's tmux teammates orphaned — and
+                // `request_gui_shutdown` notes that a surviving Chromium
+                // breaks the next launch's CDP attach. Flush the session
+                // first, so "on-disk sessions survive" is actually true.
+                let _ = shared_for_events.input_tx.send(ShellInput::SaveAndQuit);
+                crate::team::kill_my_teammates();
+                crate::audit::shutdown();
+                crate::browser_cdp::shutdown();
+                // #209/#210: agents log into this process's pipes, and an
+                // exec pulls those out from under them. Stop and wait BEFORE
+                // arming the exec below — not in parallel with it, or the
+                // 400ms timer fires while agents are still being stopped and
+                // we reproduce the crash that fix removed.
+                if !crate::server::stop_host_agents(std::time::Duration::from_secs(5)) {
+                    crate::util::log_line(
+                        "\x1b[33m[reload] agents did not stop within 5s — re-execing anyway\x1b[0m",
+                    );
+                }
                 std::thread::spawn(|| {
                     std::thread::sleep(std::time::Duration::from_millis(400));
                     let err = crate::util::reexec_self();
@@ -2115,5 +2241,40 @@ mod tool_coalesce_tests {
             envelope["input"]["note"],
             "Authorization: Bearer <redacted>"
         );
+    }
+}
+
+#[cfg(test)]
+mod host_frame_tests {
+    use super::frame_type_is;
+    use crate::bots::desktop::tag;
+    use crate::event_render::HOST_RELOAD_FRAME_TYPE;
+
+    /// The regression: the host used to compare the reload frame against a
+    /// fixed string, but every frame reaches it through `tag`, which stamps
+    /// `_bot` in front of the object. Nothing ever matched, so `/reload` in
+    /// host mode printed its message and did nothing. Built with the real
+    /// `tag` rather than a hand-written copy of its output — writing that
+    /// copy from memory is what produced the bug.
+    #[test]
+    fn a_tagged_reload_frame_is_recognised() {
+        let raw = serde_json::json!({ "type": HOST_RELOAD_FRAME_TYPE }).to_string();
+        assert!(frame_type_is(&raw, HOST_RELOAD_FRAME_TYPE));
+        assert!(frame_type_is(&tag("main", &raw), HOST_RELOAD_FRAME_TYPE));
+    }
+
+    /// And the reason it is decided on the parsed `type`: a bot streams the
+    /// user's own words back as chat envelopes, so a substring test would
+    /// hand every user a way to restart the host by typing the frame name.
+    #[test]
+    fn user_text_quoting_the_frame_name_is_not_a_reload() {
+        let chat = serde_json::json!({
+            "type": "chat_text_delta",
+            "text": r#"{"type":"host_reload_requested"}"#,
+        })
+        .to_string();
+        assert!(chat.contains(HOST_RELOAD_FRAME_TYPE));
+        assert!(!frame_type_is(&chat, HOST_RELOAD_FRAME_TYPE));
+        assert!(!frame_type_is(&tag("main", &chat), HOST_RELOAD_FRAME_TYPE));
     }
 }

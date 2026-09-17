@@ -25,6 +25,13 @@
 use crate::shared_session::ViewEvent;
 use base64::Engine;
 
+/// The one frame a bot sends that is addressed to the host window rather than
+/// to the page. Named here, next to the renderer that emits it, because the
+/// host matches on it (`gui.rs`) and a drifting literal between the two ends
+/// fails silently — the frame just falls through to the frontend, which does
+/// not know the type, and `/reload` prints its message and does nothing.
+pub const HOST_RELOAD_FRAME_TYPE: &str = "host_reload_requested";
+
 // ── Chat-shaped translator ─────────────────────────────────────────
 
 /// Build chat-shaped JSON message(s) for a single ViewEvent. Most
@@ -200,7 +207,16 @@ pub fn render_chat_dispatches(ev: &ViewEvent) -> Vec<String> {
         // function is called — see the early-return in
         // `gui::spawn_event_translator` / the equivalent web hook.
         ViewEvent::QuitRequested => vec![],
-        ViewEvent::ReloadRequested => vec![],
+        // Host mode: `/reload` is dispatched inside the BOT process, which
+        // has no tao event loop and therefore cannot re-exec anything — the
+        // event fell on the floor here as `vec![]` while the user watched the
+        // "re-executing…" line print and nothing happen. Render it as a frame
+        // the host recognises on the bridge and turns back into a real reload.
+        // Plain GUI mode intercepts this event before rendering, so this only
+        // ever travels bot → host.
+        ViewEvent::ReloadRequested => {
+            vec![serde_json::json!({ "type": HOST_RELOAD_FRAME_TYPE }).to_string()]
+        }
         ViewEvent::PlanUpdate(plan) => {
             let payload = serde_json::json!({
                 "type": "chat_plan_update",

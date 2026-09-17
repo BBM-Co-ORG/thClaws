@@ -759,6 +759,32 @@ export default function App() {
   } | null>(null);
   const closeModelPicker = useCallback(() => setModelPicker(null), []);
 
+  // A newer release exists. The backend decides that — it compares versions
+  // numerically and stays quiet inside our container images — so this only
+  // renders what it is told. Dismissed per version, so saying "later" once
+  // doesn't hide the next release too.
+  const [update, setUpdate] = useState<{ version: string; url: string } | null>(
+    null,
+  );
+  useEffect(() => {
+    const unsub = subscribe((msg) => {
+      if (msg.type !== "update_available") return;
+      const version = typeof msg.version === "string" ? msg.version : "";
+      const url = typeof msg.url === "string" ? msg.url : "";
+      if (!version || !url) return;
+      let dismissed = "";
+      try {
+        dismissed = localStorage.getItem("thclaws.update.dismissed") ?? "";
+      } catch {
+        // Private window / blocked storage: show the notice rather than
+        // swallow it.
+      }
+      if (dismissed === version) return;
+      setUpdate({ version, url });
+    });
+    return unsub;
+  }, []);
+
   useEffect(() => {
     const unsub = subscribe((msg) => {
       if (msg.type !== "model_picker_open") return;
@@ -1284,6 +1310,46 @@ export default function App() {
       <AgentEditorModal />
       <MarketplaceModal />
       <ContextWarningBanner />
+      {update && (
+        <div
+          className="fixed bottom-4 right-4 z-50 flex items-center gap-3 rounded-lg border px-4 py-3 text-sm shadow-lg"
+          style={{
+            background: "var(--bg-secondary)",
+            borderColor: "var(--border)",
+            color: "var(--text-primary)",
+          }}
+        >
+          <span>
+            thClaws <strong>{update.version}</strong> is available
+          </span>
+          <button
+            type="button"
+            className="rounded px-2 py-1 text-xs underline"
+            // Opened through the vetted `open_external` IPC, not an <a href>:
+            // a plain link navigates the webview itself, replacing the app
+            // with a web page and stranding the user.
+            onClick={() => send({ type: "open_external", url: update.url })}
+          >
+            What's new
+          </button>
+          <button
+            type="button"
+            className="rounded px-2 py-1 text-xs opacity-60 hover:opacity-100"
+            aria-label="Dismiss update notice"
+            onClick={() => {
+              try {
+                localStorage.setItem("thclaws.update.dismissed", update.version);
+              } catch {
+                // Storage blocked — the notice still goes away for this run,
+                // it just comes back next launch. Better than not closing.
+              }
+              setUpdate(null);
+            }}
+          >
+            Later
+          </button>
+        </div>
+      )}
       {modelPicker && (
         <ModelPickerModal
           provider={modelPicker.provider}

@@ -1111,6 +1111,18 @@ impl Agent {
         *h = messages;
     }
 
+    /// Append one message to the agent's history.
+    ///
+    /// Without this a caller adding a single entry has to emulate it as
+    /// `history_snapshot()` → push → `set_history()`, which is a
+    /// read-modify-write over a lock it releases in between: anything a
+    /// running turn appends in that window is silently thrown away. The
+    /// `/publish` result arrives from a spawned task and can land
+    /// mid-turn, which is exactly that race. One lock, one push.
+    pub fn append_message(&self, message: Message) {
+        self.history.lock().expect("history lock").push(message);
+    }
+
     /// Run one user turn. The returned stream drives the full provider↔tools
     /// loop and appends to the agent's internal history.
     pub fn run_turn(

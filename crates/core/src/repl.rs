@@ -6520,6 +6520,15 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
         );
     } else {
         println!("{COLOR_DIM}Type /help for commands, /quit to exit.{COLOR_RESET}");
+        // Yesterday's answer, read from a file — startup never waits on the
+        // network for this. The refresh below is for the next launch.
+        if let Some(up) = crate::update_check::cached() {
+            println!(
+                "{COLOR_DIM}A newer {} is out: {} → {}  ({}){COLOR_RESET}",
+                brand.name, v.version, up.version, up.url
+            );
+        }
+        tokio::spawn(async { crate::update_check::refresh().await });
     }
 
     // ── Team agent mode: inject rules + poll inbox ────────────────────

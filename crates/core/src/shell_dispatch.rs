@@ -3931,13 +3931,33 @@ pub async fn dispatch(
         SlashCommand::PublishApp { path } => {
             let cloud_cfg = crate::config::ProjectConfig::load().and_then(|c| c.cloud.clone());
             let events_tx_clone = events_tx.clone();
+            let input_tx_clone = input_tx.clone();
             // Spawned: the upload is network-bound and the chat tab must
             // stay responsive, same as every other cloud command here.
             tokio::spawn(async move {
-                for line in
-                    crate::cloud::cmd::publish_app_lines(&path, None, cloud_cfg.as_ref()).await
-                {
-                    let _ = events_tx_clone.send(ViewEvent::SlashOutput(line));
+                match crate::cloud::cmd::publish_app_result(&path, None, cloud_cfg.as_ref()).await {
+                    Ok(app) => {
+                        // Back to the worker loop rather than out as
+                        // `SlashOutput`: the link belongs in the agent's
+                        // history, where it renders as markdown and
+                        // survives a reload. This task cannot reach
+                        // `WorkerState` itself — see `ShellInput::PublishedApp`.
+                        let _ =
+                            input_tx_clone.send(crate::shared_session::ShellInput::PublishedApp {
+                                detail: crate::cloud::cmd::publish_detail_line(&app),
+                                url: app.url,
+                                // As typed, not the sandbox-resolved
+                                // absolute path: the reader recognises
+                                // what they asked for, not where it
+                                // happened to live on disk.
+                                file: path,
+                            });
+                    }
+                    // A refusal is not something to keep in the
+                    // conversation — it says nothing a day later.
+                    Err(e) => {
+                        let _ = events_tx_clone.send(ViewEvent::SlashOutput(e));
+                    }
                 }
             });
         }

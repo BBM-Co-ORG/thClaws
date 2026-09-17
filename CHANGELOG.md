@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.132.0] — 2026-09-17
+
+**The app now tells you when a newer release is out.** Web search gains an optional Serply backend, cloud adds a first-time trial and a name-first workspace flow, GUI shells get a working reload button, and a page can be reported through a form.
+
+### Added
+- **An optional Serply backend for web search.** Web search can now run through Serply as an alternative provider ([#211](https://github.com/thClaws/thClaws/issues/211)).
+- **A notice when a newer release is out.** The app checks for a newer version and delivers the notice where the page can hear it.
+- **A first-time cloud trial.** New users get one workspace for three days, plus $3.
+- **A name-first cloud workspace flow.** You are asked for a workspace name, and its slug is derived from it.
+- **A reload button in the shell tab, and a `/reload` that restarts.** GUI shells get a reload button, and the `/reload` command now restarts the host instead of doing nothing.
+- **`/publish` answers in the conversation.** Publishing now replies in the conversation, naming the file it wrote.
+- **Report a page with a form.** A page is reported through a form in the app rather than a published address, and the reporter's own text stays out of the mail subject.
+
+### Changed
+- **The model catalogue was refreshed.** Models and prices were updated to their current values.
+
+### Fixed
+- **Resuming a workspace never showed its status.** Resuming has always returned a status, but the interface never said so. It does now.
+
 ## [0.131.0] — 2026-09-16
 
 **Nothing is written into a folder you did not choose.** Opening the app from its icon no longer leaves a workspace behind in whatever folder the system started it in, the start-up folder picker stops asking again on Windows, and an agent created by upgrading a workspace gets the same complete settings file as one you add by hand.

@@ -149,7 +149,7 @@ async fn open_socket(
 /// new bot's tree as if it were its own. Inserted textually — every frame is
 /// a JSON object from serde, and parsing each one just to add a key would be
 /// the only cost on this path.
-fn tag(slug: &str, frame: &str) -> String {
+pub(crate) fn tag(slug: &str, frame: &str) -> String {
     match frame.strip_prefix('{') {
         Some(rest) => format!(
             "{{\"_bot\":{},{rest}",

@@ -2619,6 +2619,25 @@ async fn handle_socket(socket: WebSocket, state: ServeState, shared: Arc<SharedS
             if let Some(hist) = build_gui_shell_history_payload(sessions_dir) {
                 let _ = initial_dispatch(hist);
             }
+            // A newer release, when the last check found one. Same shape as
+            // the desktop's: the cached answer is a file read, so nothing on
+            // the path to a usable page waits on github.com, and the refresh
+            // behind it only has to land before the next connect.
+            //
+            // `update_check::enabled()` is false inside our container images,
+            // so a hosted workspace — whose engine is ours and not the user's
+            // to upgrade — stays quiet without a check here.
+            if let Some(up) = crate::update_check::cached() {
+                let _ = initial_dispatch(
+                    serde_json::json!({
+                        "type": "update_available",
+                        "version": up.version,
+                        "url": up.url,
+                    })
+                    .to_string(),
+                );
+            }
+            tokio::spawn(async { crate::update_check::refresh().await });
         }),
         on_zoom: Arc::new(|_scale| {
             // Browser handles its own zoom (Cmd-+/-); no server-side
