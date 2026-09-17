@@ -1156,7 +1156,21 @@ export function Sidebar({ onBrowseKms }: SidebarProps = {}) {
               }}
             >
               <div className="px-4 py-3">
+                <label className="block mb-3 text-xs" style={{ color: "var(--text-secondary)" }}>
+                  Original session ID (unchanged)
+                  <input
+                    readOnly
+                    value={renameTarget.id}
+                    onFocus={(e) => e.currentTarget.select()}
+                    className="mt-1 w-full rounded border px-2 py-1 font-mono text-xs"
+                    style={{ background: "var(--bg-secondary)", borderColor: "var(--border)", color: "var(--text-primary)" }}
+                  />
+                </label>
+                <label htmlFor="session-rename-title" className="block mb-1 text-xs">
+                  Display name
+                </label>
                 <input
+                  id="session-rename-title"
                   ref={renameInputRef}
                   type="text"
                   defaultValue={renameTarget.current}
