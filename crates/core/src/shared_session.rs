@@ -4055,6 +4055,7 @@ pub(crate) fn build_session_list(store: &Option<SessionStore>, current_id: &str)
                 "model": s.model,
                 "messages": s.message_count,
                 "title": s.title,
+                "owner_agent": s.owner_agent,
             })
         })
         .collect();

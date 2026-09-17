@@ -5,7 +5,11 @@ import { ModelPickerDropdown } from "./ModelPickerDropdown";
 import { KmsCreateModal, type KmsCreateMode } from "./KmsCreateModal";
 import { CtxMenuItem } from "./CtxMenuItem";
 
-type SessionInfo = { id: string; model: string; messages: number; title?: string | null };
+type SessionInfo = { id: string; model: string; messages: number; title?: string | null; owner_agent?: string | null };
+function sessionLabel(session: SessionInfo): string {
+  return session.title?.trim() || session.owner_agent?.trim() || `Session ${session.id.slice(-6)}`;
+}
+
 type KmsInfo = { name: string; scope: "user" | "project"; active: boolean };
 type LineStatus = {
   state: "connected" | "disconnected";
@@ -566,7 +570,8 @@ export function Sidebar({ onBrowseKms }: SidebarProps = {}) {
             ? sessions.slice(0, 10)
             : sessions
                 .filter((s) =>
-                  (s.title?.toLowerCase().includes(q) ?? false) ||
+                  sessionLabel(s).toLowerCase().includes(q) ||
+                  (s.owner_agent?.toLowerCase().includes(q) ?? false) ||
                   s.id.toLowerCase().includes(q),
                 )
                 .slice(0, 50);
@@ -593,9 +598,10 @@ export function Sidebar({ onBrowseKms }: SidebarProps = {}) {
                 </div>
               ) : (
                 filtered.map((s) => {
-            const label = s.title && s.title.trim().length > 0
-              ? s.title
-              : s.id;
+            const name = sessionLabel(s);
+            const label = sessions.filter((other) => sessionLabel(other) === name).length > 1
+              ? `${name} · ${s.id.slice(-6)}`
+              : name;
             const isCurrent = s.id === currentSessionId;
             return (
               <div
@@ -630,11 +636,10 @@ export function Sidebar({ onBrowseKms }: SidebarProps = {}) {
                     if (isCurrent) return;
                     send({ type: "session_load", id: s.id });
                   }}
-                  title={s.title ? `${s.title} (${s.id}) — ${s.messages} msg${isCurrent ? " — current" : ""}` : `${s.id} — ${s.messages} msg${isCurrent ? " — current" : ""}`}
+                  title={`${label} (${s.id})${s.owner_agent ? ` — Agent: ${s.owner_agent}` : ""} — ${s.messages} msg${isCurrent ? " — current" : ""}`}
                 >
                   <span
-                    className={s.title ? "" : "font-mono"}
-                    style={{ fontSize: s.title ? "12px" : "10px" }}
+                    style={{ fontSize: "12px" }}
                   >
                     {label}
                   </span>
@@ -787,7 +792,7 @@ export function Sidebar({ onBrowseKms }: SidebarProps = {}) {
               // loop — otherwise the menu stays visible *behind* the
               // OS dialog on macOS (NSAlert pauses the whole app).
               await new Promise((r) => requestAnimationFrame(() => r(undefined)));
-              const label = s.title && s.title.trim().length > 0 ? s.title : s.id;
+              const label = sessionLabel(s);
               const ok = await platformConfirm({
                 title: "Delete session",
                 message: `Delete session "${label}"? This removes it from disk and can't be undone.`,

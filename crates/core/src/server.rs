@@ -2791,6 +2791,7 @@ fn build_initial_state_payload(sessions_dir: Option<std::path::PathBuf>) -> Stri
                 "model": s.model,
                 "messages": s.message_count,
                 "title": s.title,
+                "owner_agent": s.owner_agent,
             })
         })
         .collect();

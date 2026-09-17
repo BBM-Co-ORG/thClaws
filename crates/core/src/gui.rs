@@ -1980,6 +1980,7 @@ fn run_gui_inner(
                         "model": s.model,
                         "messages": s.message_count,
                         "title": s.title,
+                        "owner_agent": s.owner_agent,
                     }))
                     .collect();
                 let kms_update = build_kms_update_payload();

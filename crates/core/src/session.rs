@@ -285,6 +285,7 @@ impl PartialEq for Session {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionMeta {
+    pub owner_agent: Option<String>,
     pub id: String,
     pub updated_at: u64,
     pub model: String,
@@ -712,6 +713,7 @@ impl Session {
         });
 
         Ok(SessionMeta {
+            owner_agent: h.owner_agent,
             id: h.id,
             updated_at: if last_timestamp > 0 {
                 last_timestamp
@@ -1801,7 +1803,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                r#"{"type":"header","id":"sess-meta","model":"claude-sonnet-4-5","cwd":"/tmp","created_at":1000}"#,
+                r#"{"type":"header","id":"sess-meta","owner_agent":"writer","model":"claude-sonnet-4-5","cwd":"/tmp","created_at":1000}"#,
                 "\n",
                 r#"{"type":"user","content":[{"type":"text","text":"q1"}],"timestamp":1100}"#,
                 "\n",
@@ -1819,6 +1821,7 @@ mod tests {
 
         let full = Session::load_from(&path).unwrap();
         let full_meta = SessionMeta {
+            owner_agent: full.owner_agent.clone(),
             id: full.id.clone(),
             updated_at: full.updated_at,
             model: full.model.clone(),
@@ -1830,6 +1833,7 @@ mod tests {
 
         assert_eq!(streamed, full_meta, "streamed meta must match full load");
         assert_eq!(streamed.id, "sess-meta");
+        assert_eq!(streamed.owner_agent.as_deref(), Some("writer"));
         assert_eq!(streamed.model, "claude-sonnet-4-5");
         assert_eq!(streamed.message_count, 3);
         assert_eq!(streamed.title.as_deref(), Some("my session"));
