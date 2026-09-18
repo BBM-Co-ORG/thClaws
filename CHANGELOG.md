@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.133.0] — 2026-09-18
+
+**A bugfix release.** The provider list now shows only providers that can actually be reached, xAI's thinking is no longer dropped, and GUI shells resolve their agent from their own files.
+
+### Fixed
+- **Only reachable providers are listed.** The provider list now shows only providers that can actually be reached, instead of every known one.
+- **xAI's thinking is no longer dropped.** The thinking output from xAI models now survives instead of being discarded.
+- **A GUI shell resolves its agent from disk.** A shell's own assets say which agent it belongs to, rather than trusting a request header.
+
 ## [0.132.0] — 2026-09-17
 
 **The app now tells you when a newer release is out.** Web search gains an optional Serply backend, cloud adds a first-time trial and a name-first workspace flow, GUI shells get a working reload button, and a page can be reported through a form.

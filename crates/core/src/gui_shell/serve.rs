@@ -122,12 +122,21 @@ pub fn serve_shell_index(shell: &ShellRef, ws_url: &str) -> Response<Body> {
             header::CACHE_CONTROL,
             HeaderValue::from_static("no-store, must-revalidate"),
         )
-        // Strip Referer so the per-shell token in the URL doesn't
-        // leak when the shell links to an external page (Risk 14 in
-        // dev-plan/33).
+        // Keep the per-shell token in the URL from leaking when the shell
+        // links to an external page (Risk 14 in dev-plan/33) — but only to
+        // external pages.
+        //
+        // `same-origin`, not `no-referrer`: under a workspace host the shell's
+        // own `style.css` / `main.js` are same-origin requests carrying no
+        // `?bot=` of their own, and `supervisor_forward` reads the Referer to
+        // learn which agent they belong to. `no-referrer` withheld it there
+        // too, so every sub-asset was routed to whichever agent happened to be
+        // first and 404'd — the shell rendered unstyled, with no error to
+        // explain it. Desktop never saw this: `thclaws://` serves assets
+        // directly and never reaches the supervisor.
         .header(
             header::REFERRER_POLICY,
-            HeaderValue::from_static("no-referrer"),
+            HeaderValue::from_static("same-origin"),
         )
         .body(Body::from(injected))
         .expect("build mode-b index response")
@@ -335,9 +344,12 @@ pub fn serve_shell_index_inline(shell: &ShellRef) -> Response<Body> {
             header::CACHE_CONTROL,
             HeaderValue::from_static("no-store, must-revalidate"),
         )
+        // See the mode-B response above: `same-origin` still withholds the
+        // per-shell token from external pages, while leaving the Referer that
+        // routes this shell's own sub-assets to the right agent.
         .header(
             header::REFERRER_POLICY,
-            HeaderValue::from_static("no-referrer"),
+            HeaderValue::from_static("same-origin"),
         )
         .body(Body::from(injected))
         .expect("build mode-c index response")
@@ -471,6 +483,39 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shell's own `style.css` and `main.js` are same-origin requests
+    /// that carry no `?bot=`, and under a workspace host
+    /// `server::supervisor_forward` reads the Referer to learn which agent
+    /// they belong to. `no-referrer` — which this header was once set to,
+    /// to keep the per-shell token out of external links — withheld it from
+    /// those requests too, so every sub-asset was routed to whichever agent
+    /// came first and 404'd: the shell rendered unstyled with nothing in the
+    /// log to say why.
+    ///
+    /// `same-origin` keeps the original protection (nothing is sent
+    /// cross-origin) and restores the routing. Do not "harden" this back.
+    #[test]
+    fn the_shell_index_keeps_its_same_origin_referer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("index.html"), b"<html></html>").unwrap();
+        let manifest: crate::gui_shell::manifest::ShellManifest = serde_json::from_str(
+            r#"{"id":"deskx","name":"Desk X","version":"1.0.0",
+                "description":"t","entry":"index.html"}"#,
+        )
+        .expect("manifest parses");
+        let shell = ShellRef::OnDisk {
+            manifest,
+            root: tmp.path().to_path_buf(),
+            source: crate::gui_shell::registry::ShellSource::Project,
+        };
+        let resp = serve_shell_index_inline(&shell);
+        let policy = resp
+            .headers()
+            .get(header::REFERRER_POLICY)
+            .expect("shell index sets a referrer policy");
+        assert_eq!(policy, "same-origin");
+    }
     use std::net::SocketAddr;
 
     fn dummy_token(val: &str) -> ShellToken {

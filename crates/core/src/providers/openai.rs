@@ -1496,6 +1496,21 @@ pub(crate) fn apply_thinking(body: &mut Value, model: &str, base_url: &str, budg
                 body["thinking_budget"] = json!(level.to_budget());
             }
         }
+    } else if grok_takes_reasoning_effort(&m) {
+        // xAI is OpenAI-shaped but selective: only some Grok models accept
+        // `reasoning_effort`, and the rest answer
+        //   400 "Model <id> does not support parameter reasoningEffort."
+        // so this has to be an allowlist, not "anything with grok in the name".
+        // Verified against the live API 2026-09-18 — 4.3/4.5/4.6 take all four
+        // values including `minimal`; every `grok-4.20-*` and `grok-build-0.1`
+        // refuses the parameter outright.
+        let effort = match level {
+            L::Off => "minimal",
+            L::Low => "low",
+            L::Medium => "medium",
+            L::High => "high",
+        };
+        body["reasoning_effort"] = json!(effort);
     } else if m.starts_with("o1")
         || m.starts_with("o3")
         || m.starts_with("o4")
@@ -1514,7 +1529,49 @@ pub(crate) fn apply_thinking(body: &mut Value, model: &str, base_url: &str, budg
             L::High => "high",
         };
         body["reasoning_effort"] = json!(effort);
+    } else {
+        // No knob we know of for this family — xAI/Grok is the live example.
+        // Staying silent is deliberate (an unrecognised field is a 400 here,
+        // see the doc comment), but saying nothing at all meant the user set a
+        // thinking level, nothing happened, and there was no way to find out
+        // why. Guessing a mapping instead would break every request to the
+        // provider, which is worse than not applying a preference.
+        //
+        // Once per model per process: this runs on every request.
+        warn_thinking_unsupported(model);
     }
+}
+
+/// Which Grok models accept `reasoning_effort`, as an allowlist.
+///
+/// An allowlist and not "does the id say grok" because four of the seven
+/// models we list refuse the parameter with a 400. Getting it wrong this way
+/// means a preference is ignored — and `warn_thinking_unsupported` then says
+/// so; getting it wrong the other way breaks every request to that model.
+///
+/// The `_` guard keeps a future `grok-4.30` from matching `grok-4.3`.
+fn grok_takes_reasoning_effort(model_lower: &str) -> bool {
+    ["grok-4.3", "grok-4.5", "grok-4.6"].iter().any(|v| {
+        model_lower
+            .split_once(v)
+            .is_some_and(|(_, rest)| !rest.starts_with(|c: char| c.is_ascii_digit()))
+    })
+}
+
+/// Tell the user once that their thinking preference does not reach `model`.
+fn warn_thinking_unsupported(model: &str) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    let Ok(mut set) = seen.lock() else { return };
+    if !set.insert(model.to_string()) {
+        return;
+    }
+    eprintln!(
+        "\x1b[33m[thinking] '{model}' has no reasoning control thClaws knows about — \
+         the level you set is not being sent. Ask for support for this family if you need it.\x1b[0m"
+    );
 }
 
 /// is what the upstream provider sees, so e.g. `deepseek/deepseek-v4-flash`
@@ -1544,6 +1601,57 @@ pub fn model_uses_reasoning_content(model: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// Pins what the live xAI API actually answered on 2026-09-18, because the
+    /// split is not guessable from the ids: `grok-4.3/4.5/4.6` take
+    /// `reasoning_effort`, while every `grok-4.20-*` and `grok-build-0.1`
+    /// replies 400 "does not support parameter reasoningEffort".
+    ///
+    /// Before this, no branch matched xAI at all and the user's thinking level
+    /// was dropped in silence.
+    #[test]
+    fn only_the_grok_models_that_accept_reasoning_effort_are_sent_it() {
+        for ok in ["xai/grok-4.3", "xai/grok-4.5", "xai/grok-4.6"] {
+            let mut body = serde_json::json!({});
+            super::apply_thinking(&mut body, ok, "https://api.x.ai/v1", Some(32_000));
+            assert_eq!(
+                body["reasoning_effort"], "high",
+                "{ok} accepts the parameter and must receive it"
+            );
+        }
+
+        // These 400 on the real API — sending the field would break the call,
+        // which is worse than the preference going unapplied.
+        for refused in [
+            "xai/grok-4.20-0309-reasoning",
+            "xai/grok-4.20-0309-non-reasoning",
+            "xai/grok-4.20-multi-agent-0309",
+            "xai/grok-build-0.1",
+        ] {
+            let mut body = serde_json::json!({});
+            super::apply_thinking(&mut body, refused, "https://api.x.ai/v1", Some(32_000));
+            assert!(
+                body.get("reasoning_effort").is_none(),
+                "{refused} refuses the parameter and must not be sent it"
+            );
+        }
+
+        // A version that merely starts with an accepted one is not accepted:
+        // `grok-4.30` is a different model from `grok-4.3`.
+        assert!(!super::grok_takes_reasoning_effort("xai/grok-4.30"));
+
+        // Every level maps to a value the API took.
+        for (budget, want) in [(0u32, "minimal"), (2_048, "low"), (10_000, "medium")] {
+            let mut body = serde_json::json!({});
+            super::apply_thinking(
+                &mut body,
+                "xai/grok-4.6",
+                "https://api.x.ai/v1",
+                Some(budget),
+            );
+            assert_eq!(body["reasoning_effort"], want, "budget {budget}");
+        }
+    }
     /// `/model` onto a user-hosted backend has to learn the real context
     /// somewhere — the shipped catalogue can't know a private vLLM box.
     /// Both published shapes are parsed off the same JSON the servers send.
