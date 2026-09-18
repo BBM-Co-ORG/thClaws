@@ -6149,7 +6149,8 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                     Ok(value) => serde_json::json!({"result":value}),
                     Err(error) => serde_json::json!({"error":error.to_string()}),
                 };
-                let mut reply: Value = serde_json::from_str(&shell_reply(request_id, body)).unwrap();
+                let mut reply: Value =
+                    serde_json::from_str(&shell_reply(request_id, body)).unwrap();
                 reply["shellId"] = Value::String(shell_id);
                 dispatch(reply.to_string());
             });
