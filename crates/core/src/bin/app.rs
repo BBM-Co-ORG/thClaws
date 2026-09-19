@@ -2457,7 +2457,7 @@ async fn run_shell_subcommand(cmd: ShellCmd) -> i32 {
                         shell_cli::Severity::Error => "\x1b[31m",
                         shell_cli::Severity::Warning => "\x1b[33m",
                     };
-                    eprintln!("{}{:8}{}\x1b[0m {msg}", color, sev.label(), "");
+                    eprintln!("{}{:8}\x1b[0m {msg}", color, sev.label());
                     if *sev == shell_cli::Severity::Error {
                         errors += 1;
                     }

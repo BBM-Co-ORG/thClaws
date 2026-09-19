@@ -158,7 +158,7 @@ impl Tool for PdfReadTool {
         // to trust).
         render_pages_as_image_blocks(&validated, first, last)
             .await
-            .map(|blocks| ToolResultContent::Blocks(blocks))
+            .map(ToolResultContent::Blocks)
     }
 }
 

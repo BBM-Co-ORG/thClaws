@@ -152,14 +152,43 @@ pub fn service_env_var(name: &str) -> Option<&'static str> {
         .map(|(_, env)| *env)
 }
 
-fn entry(provider: &str) -> Result<keyring::Entry> {
-    keyring::Entry::new(SERVICE, provider)
-        .map_err(|e| Error::Config(format!("keychain open failed: {e}")))
+#[cfg(not(test))]
+type KeychainEntry = keyring::Entry;
+#[cfg(test)]
+type KeychainEntry = std::sync::Arc<keyring::Entry>;
+
+#[cfg(not(test))]
+fn keychain_entry(account: &str) -> keyring::Result<KeychainEntry> {
+    keyring::Entry::new(SERVICE, account)
 }
 
-fn bundle_entry() -> Result<keyring::Entry> {
-    keyring::Entry::new(SERVICE, BUNDLE_ACCOUNT)
-        .map_err(|e| Error::Config(format!("keychain open failed: {e}")))
+// Unit tests must never prompt for, read, or overwrite the host's credentials.
+// Keep mock entries by account so separate lookups retain write/read/delete
+// semantics, unlike a fresh keyring mock on every lookup.
+#[cfg(test)]
+fn keychain_entry(account: &str) -> keyring::Result<KeychainEntry> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static ENTRIES: OnceLock<Mutex<HashMap<String, KeychainEntry>>> = OnceLock::new();
+    let mut entries = ENTRIES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap();
+    if let Some(entry) = entries.get(account) {
+        return Ok(entry.clone());
+    }
+    let credential = keyring::mock::default_credential_builder().build(None, SERVICE, account)?;
+    let entry = Arc::new(keyring::Entry::new_with_credential(credential));
+    entries.insert(account.to_string(), entry.clone());
+    Ok(entry)
+}
+
+fn entry(provider: &str) -> Result<KeychainEntry> {
+    keychain_entry(provider).map_err(|e| Error::Config(format!("keychain open failed: {e}")))
+}
+
+fn bundle_entry() -> Result<KeychainEntry> {
+    keychain_entry(BUNDLE_ACCOUNT).map_err(|e| Error::Config(format!("keychain open failed: {e}")))
 }
 
 /// In-memory cache of the bundle contents for the lifetime of this
@@ -225,7 +254,7 @@ fn write_bundle(map: &std::collections::HashMap<String, String>) -> Result<()> {
 /// account name (typically a hash, so the entry doesn't leak
 /// what's inside).
 pub fn keychain_set_raw(account: &str, value: &str) -> Result<()> {
-    keyring::Entry::new(SERVICE, account)
+    keychain_entry(account)
         .map_err(|e| Error::Config(format!("keychain open failed: {e}")))?
         .set_password(value)
         .map_err(|e| Error::Config(format!("keychain write failed: {e}")))
@@ -264,7 +293,7 @@ pub fn keychain_get_raw(account: &str) -> Option<String> {
     if keychain_disabled() {
         return None;
     }
-    keyring::Entry::new(SERVICE, account)
+    keychain_entry(account)
         .ok()
         .and_then(|e| e.get_password().ok())
 }
@@ -272,8 +301,8 @@ pub fn keychain_get_raw(account: &str) -> Option<String> {
 /// Direct keychain delete. Used by SSO logout to clear stored
 /// sessions on Dotenv-preferring installs.
 pub fn keychain_clear_raw(account: &str) -> Result<()> {
-    let entry = keyring::Entry::new(SERVICE, account)
-        .map_err(|e| Error::Config(format!("keychain open failed: {e}")))?;
+    let entry =
+        keychain_entry(account).map_err(|e| Error::Config(format!("keychain open failed: {e}")))?;
     // `delete_credential` errors when the entry is absent — fine,
     // treat as a no-op so logout is idempotent.
     let _ = entry.delete_credential();
@@ -541,6 +570,21 @@ mod tests {
         }
     }
     use super::*;
+
+    #[test]
+    fn raw_keychain_roundtrip_preserves_account_isolation() {
+        let _env = crate::providers::test_support::CredentialEnv::new();
+        std::env::set_var("THCLAWS_DISABLE_KEYCHAIN", "0");
+        let account = format!("unit-test-{}", uuid::Uuid::new_v4());
+        let other = format!("unit-test-{}", uuid::Uuid::new_v4());
+        assert!(keychain_get_raw(&account).is_none());
+        keychain_set_raw(&account, "fake-token").unwrap();
+        assert_eq!(keychain_get_raw(&account).as_deref(), Some("fake-token"));
+        assert!(keychain_get_raw(&other).is_none());
+        keychain_clear_raw(&account).unwrap();
+        assert!(keychain_get_raw(&account).is_none());
+        keychain_clear_raw(&account).unwrap();
+    }
 
     #[test]
     fn status_lists_known_providers() {

@@ -45,7 +45,7 @@ enum WireFormat {
     /// Reserved for opencode.ai's qwen3.5/3.6-plus models. The
     /// upstream currently accepts them through the standard
     /// `/chat/completions` OpenAI-compat endpoint, so request shape
-    /// + endpoint + auth are byte-identical to `OpenAI` today — the
+    /// \+ endpoint + auth are byte-identical to `OpenAI` today — the
     /// variant exists as a forward-looking placeholder for the day
     /// opencode.ai switches qwen routing to DashScope's native
     /// `/services/aigc/text-generation/generation` shape. If you're
@@ -132,8 +132,8 @@ impl OpencodeGoProvider {
             let mut text_parts: Vec<String> = Vec::new();
             let mut thinking_parts: Vec<String> = Vec::new();
             let mut tool_calls: Vec<Value> = Vec::new();
-            let mut trailing_tool_results: Vec<(String, String, Vec<(String, String)>)> =
-                Vec::new();
+            type ToolResultWithImages = (String, String, Vec<(String, String)>);
+            let mut trailing_tool_results: Vec<ToolResultWithImages> = Vec::new();
             let mut inline_user_images: Vec<(String, String)> = Vec::new();
 
             for block in &m.content {
@@ -704,7 +704,7 @@ impl OpencodeGoProvider {
 
         if v.get("choices")
             .and_then(Value::as_array)
-            .map_or(true, |c| c.is_empty())
+            .is_none_or(|c| c.is_empty())
             && v.get("usage").is_some()
             && state.seen_message_start
         {

@@ -149,16 +149,16 @@ fn spawn_event_translator(handle: &SharedSessionHandle, proxy: EventLoopProxy<Us
 // csv_table_tests moved to crate::file_preview::tests in M6.36 SERVE9k
 // alongside the function they exercise.
 
-/// Convert a markdown string to a full standalone HTML document so the
-/// Files-tab iframe can render it without any client-side markdown
-/// library. GFM extensions are enabled (tables, task lists,
-/// strikethrough, autolinks); raw HTML in the source is stripped
-/// (`render.unsafe_ = false`) so `<script>` in a `.md` file we're
-/// previewing can't escape the iframe sandbox.
-/// Convert a CSV string to a GFM markdown pipe-table so the comrak
-/// renderer (which has the `table` extension on) emits a proper grid.
-/// First row is treated as the header. Pipe characters in cells are
-/// escaped (`\|`) so they don't break the row structure. Empty input
+// Convert a markdown string to a full standalone HTML document so the
+// Files-tab iframe can render it without any client-side markdown
+// library. GFM extensions are enabled (tables, task lists,
+// strikethrough, autolinks); raw HTML in the source is stripped
+// (`render.unsafe_ = false`) so `<script>` in a `.md` file we're
+// previewing can't escape the iframe sandbox.
+// Convert a CSV string to a GFM markdown pipe-table so the comrak
+// renderer (which has the `table` extension on) emits a proper grid.
+// First row is treated as the header. Pipe characters in cells are
+// escaped (`\|`) so they don't break the row structure. Empty input
 // csv_to_markdown_table + render_markdown_to_html + ospath migrated
 // to crate::file_preview (M6.36 SERVE9i); their gui.rs arms (file_*)
 // now live in crate::ipc::handle_ipc, so the re-imports here became
@@ -274,9 +274,9 @@ fn pick_directory_native(start_dir: &str, title: &str) -> Option<String> {
 // handle_ipc; the SendInitialState builder uses provider_has_credentials.
 use crate::providers::provider_has_credentials;
 
-/// Resolve the AGENTS.md path for the Settings → Instructions editor.
-/// `scope="global"` → `~/.config/thclaws/AGENTS.md`, `scope="folder"` →
-/// `./AGENTS.md` in the current working directory.
+// Resolve the AGENTS.md path for the Settings → Instructions editor.
+// `scope="global"` → `~/.config/thclaws/AGENTS.md`, `scope="folder"` →
+// `./AGENTS.md` in the current working directory.
 // instructions_path moved to crate::instructions in M6.36 SERVE9d.
 // instructions_path migrated; arms removed in SERVE9k.
 
@@ -581,21 +581,21 @@ fn is_macos_close_shortcut(event: &tao::event::KeyEvent, modifiers: ModifiersSta
     }
 }
 
-/// Whitelist external URLs to `http://` / `https://` only. Tool output is
-/// untrusted, so this rejects `file://`, `javascript:`, custom schemes,
-/// and anything that doesn't parse as a real URL — preventing a hostile
-/// MCP server from getting the user to launch arbitrary local handlers
-/// just because they clicked a link in chat.
+// Whitelist external URLs to `http://` / `https://` only. Tool output is
+// untrusted, so this rejects `file://`, `javascript:`, custom schemes,
+// and anything that doesn't parse as a real URL — preventing a hostile
+// MCP server from getting the user to launch arbitrary local handlers
+// just because they clicked a link in chat.
 // is_safe_external_url + open_external_url moved to crate::external_url
 // in M6.36 SERVE9h.
 // external_url helpers migrated; open_external arm removed in SERVE9k.
 
-/// Assemble the cross-provider model list payload for the sidebar's
-/// inline picker dropdown (#49). Catalogue rows for every known
-/// provider, plus a live Ollama probe so models added via `ollama pull`
-/// after launch are visible without restart. The Ollama probe uses a
-/// short timeout — failure just falls back to whatever rows are in the
-/// baseline catalogue.
+// Assemble the cross-provider model list payload for the sidebar's
+// inline picker dropdown (#49). Catalogue rows for every known
+// provider, plus a live Ollama probe so models added via `ollama pull`
+// after launch are visible without restart. The Ollama probe uses a
+// short timeout — failure just falls back to whatever rows are in the
+// baseline catalogue.
 // build_all_models_payload moved to crate::providers in M6.36 SERVE9g
 // so the WS transport's request_all_models IPC arm can call it from
 // the always-on dispatch table.

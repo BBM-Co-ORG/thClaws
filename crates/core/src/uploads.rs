@@ -81,10 +81,7 @@ pub fn unique_path(dir: &Path, filename: &str) -> PathBuf {
 fn sanitize_filename(raw: &str) -> String {
     // Take only the trailing component so `a/b/c.txt` and
     // `..\..\evil.txt` both collapse to `c.txt` / `evil.txt`.
-    let trailing = raw
-        .rsplit(|c: char| c == '/' || c == '\\')
-        .next()
-        .unwrap_or("");
+    let trailing = raw.rsplit(['/', '\\']).next().unwrap_or("");
     let cleaned: String = trailing
         .chars()
         .filter(|c| !c.is_control() && *c != '\0')

@@ -138,7 +138,7 @@ fn render_html(chunk: &str) -> String {
     let segments: Vec<&str> = chunk.split("```").collect();
     // n fences → n+1 segments. Balanced pairs ⇒ even fences ⇒ odd
     // segment count. Anything else is unbalanced.
-    if segments.len() % 2 == 0 {
+    if segments.len().is_multiple_of(2) {
         return escape_html(chunk);
     }
     let mut out = String::with_capacity(chunk.len() + 16);

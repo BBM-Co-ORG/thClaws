@@ -163,7 +163,7 @@ impl MeteringSink for NoopMeteringSink {
 
 /// Bootstrap-time sink selector. Reads `THCLAWS_METERING_ENDPOINT`:
 ///   - URL ("https://…")              → HttpMeteringSink (requires
-///                                       THCLAWS_METERING_BEARER too)
+///     THCLAWS_METERING_BEARER too)
 ///   - "stdout"                        → StdoutMeteringSink
 ///   - unset / empty / anything else   → NoopMeteringSink
 ///

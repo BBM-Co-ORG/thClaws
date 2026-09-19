@@ -399,8 +399,7 @@ pub fn render_index_block(kref: &KmsRef, max_entries: usize) -> String {
          `KmsSearch(scope: \"sources\")`.\n\n",
     );
     let citations = citation_map(kref);
-    let mut shown = 0usize;
-    for src in &on_disk {
+    for (shown, src) in on_disk.iter().enumerate() {
         if shown >= max_entries {
             out.push_str(&format!(
                 "\n_… {} more source(s) not listed_\n",
@@ -436,7 +435,6 @@ pub fn render_index_block(kref: &KmsRef, max_entries: usize) -> String {
             "- [{title}](sources/{file}) — {}{origin}{cited}\n",
             human_bytes(src.bytes)
         ));
-        shown += 1;
     }
     out
 }

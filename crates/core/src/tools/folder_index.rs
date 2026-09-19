@@ -472,7 +472,7 @@ fn folder_digest(entries: &[&Entry], live: &HashMap<String, String>) -> String {
 }
 
 /// Immediate subfolders, in name order, each with everything beneath it.
-fn subfolders<'a>(entries: &'a [Entry]) -> Vec<(String, Vec<&'a Entry>)> {
+fn subfolders(entries: &[Entry]) -> Vec<(String, Vec<&Entry>)> {
     let mut names: Vec<&str> = entries
         .iter()
         .map(|e| top_level(&e.dir))

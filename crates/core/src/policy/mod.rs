@@ -34,7 +34,7 @@ pub mod error;
 pub mod verify;
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 pub use allowlist::{check_url, AllowDecision};
@@ -476,11 +476,11 @@ pub fn load_or_refuse() -> Result<bool, PolicyError> {
 /// e.g. `gateway.enabled: true` with `gateway.url` empty. Returns
 /// `Err(PolicyError::InvalidConfig)` so the binary refuses to start
 /// with a clear message naming the bad field.
-fn validate_policies(policy: &Policy, path: &PathBuf) -> Result<(), PolicyError> {
+fn validate_policies(policy: &Policy, path: &Path) -> Result<(), PolicyError> {
     if let Some(g) = &policy.policies.gateway {
         if g.enabled && g.url.trim().is_empty() {
             return Err(PolicyError::InvalidConfig {
-                path: path.clone(),
+                path: path.to_path_buf(),
                 message: "gateway.enabled but gateway.url is empty — would fail open at provider construction".into(),
             });
         }
@@ -489,14 +489,14 @@ fn validate_policies(policy: &Policy, path: &PathBuf) -> Result<(), PolicyError>
         if s.enabled {
             if s.issuer_url.trim().is_empty() {
                 return Err(PolicyError::InvalidConfig {
-                    path: path.clone(),
+                    path: path.to_path_buf(),
                     message: "sso.enabled but sso.issuer_url is empty — OIDC discovery requires it"
                         .into(),
                 });
             }
             if s.client_id.trim().is_empty() {
                 return Err(PolicyError::InvalidConfig {
-                    path: path.clone(),
+                    path: path.to_path_buf(),
                     message: "sso.enabled but sso.client_id is empty — OIDC requires it".into(),
                 });
             }
@@ -506,7 +506,7 @@ fn validate_policies(policy: &Policy, path: &PathBuf) -> Result<(), PolicyError>
         if a.enabled {
             if a.sinks.is_empty() {
                 return Err(PolicyError::InvalidConfig {
-                    path: path.clone(),
+                    path: path.to_path_buf(),
                     message: "audit.enabled but audit.sinks is empty — nothing would record".into(),
                 });
             }
@@ -514,7 +514,7 @@ fn validate_policies(policy: &Policy, path: &PathBuf) -> Result<(), PolicyError>
                 if let AuditSinkConfig::Http { url, .. } = s {
                     if url.trim().is_empty() {
                         return Err(PolicyError::InvalidConfig {
-                            path: path.clone(),
+                            path: path.to_path_buf(),
                             message: "audit http sink has an empty url".into(),
                         });
                     }

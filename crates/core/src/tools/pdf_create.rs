@@ -185,18 +185,18 @@ impl Tool for PdfCreateTool {
 
         let path_clone = validated.clone();
         let pages = tokio::task::spawn_blocking(move || -> Result<usize> {
-            render_pdf(
-                &path_clone,
-                &title,
-                &content,
-                font_size,
+            render_pdf(PdfRenderOptions {
+                path: &path_clone,
+                title: &title,
+                content: &content,
+                body_pt: font_size,
                 page_w_mm,
                 page_h_mm,
                 page_break_h1,
                 outline_depth,
-                &image_base,
+                image_base: &image_base,
                 family,
-            )
+            })
         })
         .await
         .map_err(|e| Error::Tool(format!("PDF worker join failed: {e}")))??;
@@ -1182,7 +1182,7 @@ impl PdfRenderer {
             let is_header = ri == 0;
             // Wrap every cell; row height = tallest cell.
             let mut cell_lines: Vec<Vec<Vec<Cluster>>> = Vec::with_capacity(cols);
-            for ci in 0..cols {
+            for (ci, width) in widths.iter().enumerate().take(cols) {
                 let bolded: Vec<Span>;
                 let spans: &[Span] = match row.get(ci) {
                     Some(cell) if is_header => {
@@ -1202,7 +1202,7 @@ impl PdfRenderer {
                     None => &[],
                 };
                 let clusters = clusterize(spans, pt);
-                let max = widths[ci] - 2.0 * pad;
+                let max = width - 2.0 * pad;
                 cell_lines.push(break_lines(&clusters, max, max));
             }
             let row_lines = cell_lines.iter().map(|c| c.len().max(1)).max().unwrap_or(1);
@@ -1292,18 +1292,32 @@ fn normalize_path(p: &Path) -> PathBuf {
     out.iter().collect()
 }
 
-fn render_pdf(
-    path: &Path,
-    title: &str,
-    content: &str,
+struct PdfRenderOptions<'a> {
+    path: &'a Path,
+    title: &'a str,
+    content: &'a str,
     body_pt: f32,
     page_w_mm: f32,
     page_h_mm: f32,
     page_break_h1: bool,
     outline_depth: u8,
-    image_base: &Path,
+    image_base: &'a Path,
     family: Family,
-) -> Result<usize> {
+}
+
+fn render_pdf(context: PdfRenderOptions<'_>) -> Result<usize> {
+    let PdfRenderOptions {
+        path,
+        title,
+        content,
+        body_pt,
+        page_w_mm,
+        page_h_mm,
+        page_break_h1,
+        outline_depth,
+        image_base,
+        family,
+    } = context;
     // Set the ambient family BEFORE any faces()/shaping call below so
     // metrics, shaping and embedding all use the same typeface.
     RENDER_FAMILY.with(|c| c.set(family));

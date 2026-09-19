@@ -851,7 +851,7 @@ pub fn effective_context_window_with(
         return (n, ContextSource::Catalogue);
     }
     let provider_name = crate::providers::ProviderKind::detect(model)
-        .map(|k| provider_kind_name(k))
+        .map(provider_kind_name)
         .unwrap_or("");
     if !provider_name.is_empty() {
         if let Some(n) = cat.provider_default(provider_name) {

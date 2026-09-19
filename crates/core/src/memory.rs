@@ -113,6 +113,7 @@ impl MemoryStore {
     ///   * 200 lines (line-truncated at a natural newline boundary).
     ///   * 25 KB (byte-truncated at the last newline under cap after the line
     ///     pass).
+    ///
     /// When either fires, a one-line notice is appended so the user sees
     /// *why* older entries stopped reaching the model.
     pub fn index(&self) -> Option<String> {

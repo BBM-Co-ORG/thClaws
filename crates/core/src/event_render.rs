@@ -573,7 +573,7 @@ pub fn render_terminal_ansi(state: &mut TerminalRenderState, ev: &ViewEvent) -> 
             // next to the ✓ when the tool emits a `Source: <engine>`
             // line. Independent of whether the model surfaces it.
             let src_suffix = crate::tools::extract_tool_source(output)
-                .map(|s| crate::tool_display::sanitize_label_field(s))
+                .map(crate::tool_display::sanitize_label_field)
                 .map(|s| format!(" \x1b[2m(via {s})\x1b[0m"))
                 .unwrap_or_default();
             if state.merging {

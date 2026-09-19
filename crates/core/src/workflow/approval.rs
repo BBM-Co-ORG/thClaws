@@ -86,6 +86,7 @@ impl WorkflowApprover {
 ///   - "approve" / "a" / "yes" / "y" / "ok"
 ///   - "cancel" / "c" / "no" / "n" / "abort"
 ///   - "rework: <note>" / "r: <note>" / "rework <note>" / "r <note>"
+///
 /// Returns `None` for anything else — the caller emits a hint instead
 /// of forwarding the text to the agent.
 pub fn parse_chat_decision(text: &str) -> Option<WorkflowDecision> {

@@ -179,13 +179,11 @@ fn parse_markdown_slides(content: &str) -> Vec<Slide> {
             // silently empty.
             Event::Start(Tag::Image {
                 dest_url, title, ..
-            }) => {
-                if in_heading || in_item {
-                    text_buf.push_str(&format!(
+            }) if (in_heading || in_item) => {
+                text_buf.push_str(&format!(
                         "[image: {} — embed via DocxCreate or PdfCreate; pptx native image support coming]",
                         if !title.is_empty() { &*title } else { &*dest_url }
                     ));
-                }
             }
             _ => {}
         }

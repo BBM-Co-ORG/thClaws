@@ -19,6 +19,7 @@ use crate::error::{Error, Result};
 /// real document has more fields; we ignore them with serde defaults.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct DiscoveryDoc {
     pub issuer: String,
     pub authorization_endpoint: String,
@@ -31,21 +32,6 @@ pub struct DiscoveryDoc {
     /// Scopes the IdP claims to support. We care about `openid` (mandatory)
     /// + `email` + `profile` for displayable identity.
     pub scopes_supported: Vec<String>,
-}
-
-impl Default for DiscoveryDoc {
-    fn default() -> Self {
-        Self {
-            issuer: String::new(),
-            authorization_endpoint: String::new(),
-            token_endpoint: String::new(),
-            userinfo_endpoint: None,
-            jwks_uri: String::new(),
-            end_session_endpoint: None,
-            code_challenge_methods_supported: Vec::new(),
-            scopes_supported: Vec::new(),
-        }
-    }
 }
 
 /// Fetch the discovery doc for `issuer_url`. The well-known path is

@@ -89,6 +89,7 @@ pub enum PolicyError {
     ///     fail open at provider construction.
     ///   - `sso.enabled: true` but `sso.issuer_url` is empty → no way
     ///     to do OIDC discovery.
+    ///
     /// We refuse to start rather than silently bypass.
     #[error("policy file at {path:?} has invalid config: {message}")]
     InvalidConfig { path: PathBuf, message: String },

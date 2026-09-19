@@ -54,7 +54,7 @@ pub type QuitFn = Arc<dyn Fn() + Send + Sync>;
 /// Transport-specific bridge fired when the frontend signals it's
 /// ready (`{"type": "frontend_ready"}`). Triggers the heavyweight
 /// initial-state build (provider + model + KMS list + recent sessions
-/// + …) and pushes it to the frontend. Wry's impl synthesizes the
+/// \+ …) and pushes it to the frontend. Wry's impl synthesizes the
 /// JSON inline in the event-loop arm; the WS layer's impl will send a
 /// snapshot frame.
 pub type SendInitialStateFn = Arc<dyn Fn() + Send + Sync>;
@@ -421,7 +421,7 @@ fn shell_reply(request_id: u64, body: serde_json::Value) -> String {
 /// `tools.invoke:<tool>` permission — then only the declared tools (or
 /// the `tools.invoke:*` wildcard) are allowed. A shell that declares NO
 /// `tools.invoke:*` permission runs in legacy/unfettered mode (built-in
-/// + hand-installed dev shells that predate the scheme), and an
+/// \+ hand-installed dev shells that predate the scheme), and an
 /// unresolvable shell id is left unchanged too — so this is additive and
 /// never breaks existing shells. Marketplace shells are pushed to declare
 /// at publish time, not here.
@@ -5873,9 +5873,11 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                 let provider = crate::repl::build_provider(&cfg)
                     .map_err(|e| format!("provider unavailable: {e}"))?;
                 let model = cfg.model.clone();
-                let mut rcfg = crate::research::JobConfig::default();
-                rcfg.kms_target = Some(kms.clone());
-                rcfg.topic_slug = Some(slug.clone());
+                let mut rcfg = crate::research::JobConfig {
+                    kms_target: Some(kms.clone()),
+                    topic_slug: Some(slug.clone()),
+                    ..Default::default()
+                };
                 if !atomic {
                     rcfg.max_notes = 1;
                     rcfg.max_iter = rcfg.max_iter.min(2);
@@ -6149,7 +6151,8 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                     Ok(value) => serde_json::json!({"result":value}),
                     Err(error) => serde_json::json!({"error":error.to_string()}),
                 };
-                let mut reply: Value = serde_json::from_str(&shell_reply(request_id, body)).unwrap();
+                let mut reply: Value =
+                    serde_json::from_str(&shell_reply(request_id, body)).unwrap();
                 reply["shellId"] = Value::String(shell_id);
                 dispatch(reply.to_string());
             });

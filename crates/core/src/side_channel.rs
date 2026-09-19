@@ -117,7 +117,6 @@ pub async fn spawn_side_channel(
             .split('-')
             .next()
             .unwrap_or("anon")
-            .to_string()
     );
 
     // Independent cancel — main's Cmd-C does NOT kill this. User

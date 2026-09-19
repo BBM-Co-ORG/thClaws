@@ -194,21 +194,33 @@ pub async fn extract_subtopics(
     Ok(topics)
 }
 
+pub struct SubtopicRequest<'a> {
+    pub provider: &'a dyn Provider,
+    pub model: &'a str,
+    pub query: &'a str,
+    pub sources: &'a [ResearchSource],
+    pub eval_notes: &'a str,
+    pub n: u32,
+    pub timeout: Duration,
+    pub cancel: &'a CancelToken,
+}
+
 /// Generate next-round subtopics targeting gaps named in `eval_notes`.
 /// Same shape as [`extract_subtopics`] but conditioned on accumulated
 /// research + the LLM's prior evaluation. Returns empty list when the
 /// LLM can't think of anything more — pipeline takes that as a
 /// natural stop signal.
-pub async fn extract_next_subtopics(
-    provider: &dyn Provider,
-    model: &str,
-    query: &str,
-    sources: &[ResearchSource],
-    eval_notes: &str,
-    n: u32,
-    timeout: Duration,
-    cancel: &CancelToken,
-) -> Result<Vec<String>> {
+pub async fn extract_next_subtopics(context: SubtopicRequest<'_>) -> Result<Vec<String>> {
+    let SubtopicRequest {
+        provider,
+        model,
+        query,
+        sources,
+        eval_notes,
+        n,
+        timeout,
+        cancel,
+    } = context;
     let prompt = build_extract_next_subtopics_prompt(query, sources, eval_notes, n);
     let raw = oneshot(provider, model, prompt, timeout, cancel).await?;
     let mut topics = parse_bulleted_list(&raw);
@@ -275,21 +287,33 @@ pub async fn plan_pages(
     }
 }
 
+pub struct PageRequest<'a> {
+    pub provider: &'a dyn Provider,
+    pub model: &'a str,
+    pub query: &'a str,
+    pub this_page: &'a PagePlan,
+    pub all_pages: &'a [PagePlan],
+    pub sources: &'a [ResearchSource],
+    pub timeout: Duration,
+    pub cancel: &'a CancelToken,
+}
+
 /// Synthesize one page from a multi-page plan. The LLM is told what
 /// other pages exist (so it can cross-link with `[[slug]]` syntax),
 /// what this page covers, and which sources to draw on. Returns the
 /// markdown body verbatim — the pipeline post-processes cross-links
 /// before writing to disk.
-pub async fn write_research_page(
-    provider: &dyn Provider,
-    model: &str,
-    query: &str,
-    this_page: &PagePlan,
-    all_pages: &[PagePlan],
-    sources: &[ResearchSource],
-    timeout: Duration,
-    cancel: &CancelToken,
-) -> Result<String> {
+pub async fn write_research_page(context: PageRequest<'_>) -> Result<String> {
+    let PageRequest {
+        provider,
+        model,
+        query,
+        this_page,
+        all_pages,
+        sources,
+        timeout,
+        cancel,
+    } = context;
     let prompt = build_write_research_page_prompt(query, this_page, all_pages, sources);
     let raw = oneshot(provider, model, prompt, timeout, cancel).await?;
     Ok(raw.trim().to_string())
@@ -800,7 +824,7 @@ fn parse_bulleted_list(text: &str) -> Vec<String> {
             continue;
         }
         let stripped = strip_list_marker(line);
-        let cleaned = stripped.trim_end_matches(|c: char| c == '.' || c == ',' || c == ';');
+        let cleaned = stripped.trim_end_matches(['.', ',', ';']);
         if !cleaned.is_empty() {
             out.push(cleaned.to_string());
         }

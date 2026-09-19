@@ -23,16 +23,28 @@ const SEED_FETCH: usize = 5;
 const SEED_FETCH_RECENT: usize = 3;
 const HITS_PER_GAP_QUERY: u32 = 5;
 
-pub async fn run_with_tools(
-    job_id: &str,
-    query: String,
-    config: JobConfig,
-    provider: Arc<dyn Provider>,
-    model: String,
-    cancel: CancelToken,
-    tools: Arc<dyn ResearchTools>,
-    digest: Option<(Arc<dyn Provider>, String)>,
-) -> Result<String> {
+pub struct PipelineRequest<'a> {
+    pub job_id: &'a str,
+    pub query: String,
+    pub config: JobConfig,
+    pub provider: Arc<dyn Provider>,
+    pub model: String,
+    pub cancel: CancelToken,
+    pub tools: Arc<dyn ResearchTools>,
+    pub digest: Option<(Arc<dyn Provider>, String)>,
+}
+
+pub async fn run_with_tools(context: PipelineRequest<'_>) -> Result<String> {
+    let PipelineRequest {
+        job_id,
+        query,
+        config,
+        provider,
+        model,
+        cancel,
+        tools,
+        digest,
+    } = context;
     let mgr = manager();
     let (dprov, dmodel): (Arc<dyn Provider>, String) = match digest {
         Some((p, m)) => (p, m),
@@ -154,18 +166,18 @@ pub async fn run_with_tools(
             })
             .collect();
         let t = std::time::Instant::now();
-        let parts = digest::digest_many(
-            dprov.clone(),
-            &dmodel,
-            &query,
-            &win_sources,
-            &known_slugs,
-            &kref,
-            &today,
-            config.llm_timeout,
-            &cancel,
-            &config.language,
-        )
+        let parts = digest::digest_many(digest::DigestBatch {
+            provider: dprov.clone(),
+            model: &dmodel,
+            query: &query,
+            sources: &win_sources,
+            known_slugs: &known_slugs,
+            kref: &kref,
+            today: &today,
+            timeout: config.llm_timeout,
+            cancel: &cancel,
+            language: &config.language,
+        })
         .await;
         let merged = merge_digests(parts, index, &url, &title, &today);
         let (new, total, ratio) = novelty.absorb(std::slice::from_ref(&merged));
@@ -280,16 +292,16 @@ pub async fn run_with_tools(
             }
             alive(&format!("round {round}/{}: finding gaps", config.max_iter))?;
             let tables = plan::build_tables(&digests);
-            let gaps = plan::gap_queries(
-                dprov.as_ref(),
-                &dmodel,
-                &query,
-                &tables,
-                &queries_run,
-                config.subtopics_per_iter,
-                config.llm_timeout,
-                &cancel,
-            )
+            let gaps = plan::gap_queries(plan::GapQueryRequest {
+                provider: dprov.as_ref(),
+                model: &dmodel,
+                query: &query,
+                tables: &tables,
+                prior: &queries_run,
+                n: config.subtopics_per_iter,
+                timeout: config.llm_timeout,
+                cancel: &cancel,
+            })
             .await
             .unwrap_or_default();
             if gaps.is_empty() {
@@ -393,20 +405,20 @@ pub async fn run_with_tools(
         notes: plan_notes,
         warnings: mut plan_warnings,
         raw: plan_raw,
-    } = plan::plan_notes(
-        dprov.as_ref(),
-        &dmodel,
-        &query,
-        &tables,
-        &known,
-        &topic_slug,
-        &topic_title,
-        config.max_notes,
-        config.llm_timeout,
-        &cancel,
-        &config.language,
-        config.refresh_slug.as_deref(),
-    )
+    } = plan::plan_notes(plan::PlanningRequest {
+        provider: dprov.as_ref(),
+        model: &dmodel,
+        query: &query,
+        tables: &tables,
+        known: &known,
+        topic_slug: &topic_slug,
+        topic_title: &topic_title,
+        max_notes: config.max_notes,
+        timeout: config.llm_timeout,
+        cancel: &cancel,
+        language: &config.language,
+        anchor: config.refresh_slug.as_deref(),
+    })
     .await?;
 
     {
@@ -529,17 +541,17 @@ pub async fn run_with_tools(
         let rewritten = write::unbold_links(&rewritten);
         parent_overview = Some(opening_of(&rewritten, write::PARENT_OVERVIEW_CHARS));
         let conf = mean_confidence(n, &claim_by_id);
-        let w = write::persist_note(
-            &kref,
-            n,
-            &rewritten,
-            &cited,
-            n.claim_ids.len(),
-            conf,
-            &today,
-            false,
-            &sources_meta,
-        )?;
+        let w = write::persist_note(write::NoteToPersist {
+            kref: &kref,
+            note: n,
+            body: &rewritten,
+            cited: &cited,
+            claim_count: n.claim_ids.len(),
+            confidence: conf,
+            today: &today,
+            append: false,
+            sources_meta: &sources_meta,
+        })?;
         all_cited.extend(cited.iter().copied());
         written.push(w);
     }
@@ -615,17 +627,17 @@ pub async fn run_with_tools(
         );
         let rewritten = write::unbold_links(&rewritten);
         let conf = mean_confidence(n, &claim_by_id);
-        let w = write::persist_note(
-            &kref,
-            n,
-            &rewritten,
-            &cited,
-            n.claim_ids.len(),
-            conf,
-            &today,
-            config.append,
-            &sources_meta,
-        )?;
+        let w = write::persist_note(write::NoteToPersist {
+            kref: &kref,
+            note: n,
+            body: &rewritten,
+            cited: &cited,
+            claim_count: n.claim_ids.len(),
+            confidence: conf,
+            today: &today,
+            append: config.append,
+            sources_meta: &sources_meta,
+        })?;
         all_cited.extend(cited.iter().copied());
         written.push(w);
     }
@@ -735,18 +747,18 @@ async fn digest_round(
             *cached_hits += 1;
         }
     }
-    digest::digest_many(
-        provider.clone(),
+    digest::digest_many(digest::DigestBatch {
+        provider: provider.clone(),
         model,
         query,
-        new_sources,
+        sources: new_sources,
         known_slugs,
         kref,
         today,
-        config.llm_timeout,
+        timeout: config.llm_timeout,
         cancel,
-        &config.language,
-    )
+        language: &config.language,
+    })
     .await
 }
 
@@ -876,7 +888,7 @@ fn opening_of(body: &str, max_chars: usize) -> String {
         return head.to_string();
     }
     let mut out: String = head.chars().take(max_chars).collect();
-    if let Some(i) = out.rfind(|c: char| c == '.' || c == '\n') {
+    if let Some(i) = out.rfind(['.', '\n']) {
         out.truncate(i + 1);
     }
     out
@@ -1083,16 +1095,16 @@ mod tests {
             max_iter: 4,
             ..JobConfig::default()
         };
-        let result = run_with_tools(
-            &id,
-            "กฎหมายแรงงานไทย".into(),
-            cfg,
-            provider.clone(),
-            "mock".into(),
+        let result = run_with_tools(PipelineRequest {
+            job_id: &id,
+            query: "กฎหมายแรงงานไทย".into(),
+            config: cfg,
+            provider: provider.clone(),
+            model: "mock".into(),
             cancel,
-            Arc::new(Tools),
-            None,
-        )
+            tools: Arc::new(Tools),
+            digest: None,
+        })
         .await
         .unwrap();
         assert_eq!(result, "thai-labour-law/thai-labour-law.md");
@@ -1143,16 +1155,16 @@ mod tests {
             dry_run: true,
             ..JobConfig::default()
         };
-        let result = run_with_tools(
-            &id,
-            "กฎหมายแรงงานไทย".into(),
-            cfg,
-            provider.clone(),
-            "mock".into(),
+        let result = run_with_tools(PipelineRequest {
+            job_id: &id,
+            query: "กฎหมายแรงงานไทย".into(),
+            config: cfg,
+            provider: provider.clone(),
+            model: "mock".into(),
             cancel,
-            Arc::new(Tools),
-            None,
-        )
+            tools: Arc::new(Tools),
+            digest: None,
+        })
         .await
         .unwrap();
         assert!(result.starts_with("thai-labour-law/runs/"), "{result}");
@@ -1191,16 +1203,16 @@ mod tests {
                 kms_target: Some("labour-kb".into()),
                 ..JobConfig::default()
             };
-            run_with_tools(
-                &id,
-                "กฎหมายแรงงานไทย".into(),
-                cfg,
-                provider.clone(),
-                "mock".into(),
+            run_with_tools(PipelineRequest {
+                job_id: &id,
+                query: "กฎหมายแรงงานไทย".into(),
+                config: cfg,
+                provider: provider.clone(),
+                model: "mock".into(),
                 cancel,
-                Arc::new(Tools),
-                None,
-            )
+                tools: Arc::new(Tools),
+                digest: None,
+            })
             .await
             .unwrap();
         }
@@ -1247,32 +1259,32 @@ mod tests {
             kms_target: Some("labour-kb".into()),
             ..JobConfig::default()
         };
-        run_with_tools(
-            &id,
-            "กฎหมายแรงงานไทย".into(),
-            cfg,
-            provider.clone(),
-            "mock".into(),
+        run_with_tools(PipelineRequest {
+            job_id: &id,
+            query: "กฎหมายแรงงานไทย".into(),
+            config: cfg,
+            provider: provider.clone(),
+            model: "mock".into(),
             cancel,
-            Arc::new(Tools),
-            None,
-        )
+            tools: Arc::new(Tools),
+            digest: None,
+        })
         .await
         .unwrap();
         let kref = crate::kms::resolve("labour-kb").unwrap();
         let pages_before = kref.root.join("pages").read_dir().unwrap().count();
         let before = std::fs::read_to_string(kref.root.join("pages/overtime-pay.md")).unwrap();
 
-        let ids = crate::research::start_refresh(
-            "labour-kb".into(),
-            vec!["overtime-pay".into()],
-            30,
-            JobConfig::default(),
-            provider.clone(),
-            "mock".into(),
-            None,
-            Some(Arc::new(Tools)),
-        )
+        let ids = crate::research::start_refresh(crate::research::RefreshRequest {
+            kms: "labour-kb".into(),
+            slugs: vec!["overtime-pay".into()],
+            older_than_days: 30,
+            base: JobConfig::default(),
+            provider: provider.clone(),
+            model: "mock".into(),
+            digest_provider: None,
+            tools: Some(Arc::new(Tools)),
+        })
         .await
         .unwrap();
         assert_eq!(ids.len(), 1);
@@ -1298,16 +1310,16 @@ mod tests {
         assert_ne!(after, before, "note body rewritten by the refresh");
         let calls = provider.calls.lock().unwrap().clone();
         assert!(calls.iter().any(|c| c == "plan-refresh"), "{calls:?}");
-        let err = crate::research::start_refresh(
-            "labour-kb".into(),
-            vec!["nope".into()],
-            30,
-            JobConfig::default(),
+        let err = crate::research::start_refresh(crate::research::RefreshRequest {
+            kms: "labour-kb".into(),
+            slugs: vec!["nope".into()],
+            older_than_days: 30,
+            base: JobConfig::default(),
             provider,
-            "mock".into(),
-            None,
-            None,
-        )
+            model: "mock".into(),
+            digest_provider: None,
+            tools: None,
+        })
         .await
         .err()
         .map(|e| e.to_string())

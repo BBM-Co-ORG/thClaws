@@ -16,6 +16,8 @@
 //! *                                → 404 (silent — no auth challenge advertised)
 //! ```
 
+type ContentRange = (u64, u64, u64);
+
 use super::{ShellRef, ShellRegistry, ShellToken};
 use crate::error::{Error, Result};
 use axum::body::Body;
@@ -158,7 +160,7 @@ pub fn serve_shell_index(shell: &ShellRef, ws_url: &str) -> Response<Body> {
 pub fn read_asset_maybe_range(
     path: &std::path::Path,
     range: Option<&str>,
-) -> std::io::Result<(Vec<u8>, Option<(u64, u64, u64)>)> {
+) -> std::io::Result<(Vec<u8>, Option<ContentRange>)> {
     use std::io::{Read, Seek, SeekFrom};
     const OPEN_ENDED_CHUNK: u64 = 8 * 1024 * 1024;
     let total = std::fs::metadata(path)?.len();

@@ -38,6 +38,7 @@ pub struct OpenAIResponsesProvider {
     /// - `chatgpt-account-id: <value>`
     /// - `originator: pi`
     /// - `OpenAI-Beta: responses=experimental`
+    ///
     /// When `None`, behaves as the regular API-key Responses-API client.
     chatgpt_account_id: Option<String>,
 }

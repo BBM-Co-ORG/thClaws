@@ -537,7 +537,9 @@ fn scan_stdio_mcp_names(path: &Path) -> Result<Vec<String>, String> {
 /// Returns the new bytes + the names of entries that got dropped.
 /// `None` when the source file has no stdio entries (no rewrite
 /// needed; caller ships the original).
-fn filter_stdio_mcp(path: &Path) -> Result<Option<(Vec<u8>, Vec<String>)>, String> {
+type FilteredMcpConfig = (Vec<u8>, Vec<String>);
+
+fn filter_stdio_mcp(path: &Path) -> Result<Option<FilteredMcpConfig>, String> {
     let body = std::fs::read_to_string(path).map_err(|e| format!("read mcp.json: {e}"))?;
     let mut v: serde_json::Value =
         serde_json::from_str(&body).map_err(|e| format!("parse mcp.json: {e}"))?;

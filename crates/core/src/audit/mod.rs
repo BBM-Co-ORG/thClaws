@@ -186,7 +186,7 @@ pub fn set_session(id: &str) {
             if g.as_deref() == Some(id) {
                 return;
             }
-            std::mem::replace(&mut *g, Some(id.to_string()))
+            (*g).replace(id.to_string())
         }
         Err(_) => return,
     };

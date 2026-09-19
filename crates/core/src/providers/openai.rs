@@ -168,8 +168,8 @@ impl OpenAIProvider {
             // blocks — OpenAI's tool-role messages are text-only, so a
             // separate user message is the documented pattern for
             // getting tool-returned imagery in front of a vision model.
-            let mut trailing_tool_results: Vec<(String, String, Vec<(String, String)>)> =
-                Vec::new();
+            type ToolResultWithImages = (String, String, Vec<(String, String)>);
+            let mut trailing_tool_results: Vec<ToolResultWithImages> = Vec::new();
             // Inline images attached directly to a user message
             // (Phase 4 paste/drag-drop). Held separately so the
             // emit-step below can switch to OpenAI's array-form
@@ -588,14 +588,15 @@ fn strip_request_images(req: &StreamRequest) -> StreamRequest {
                         text: NOTE.to_string(),
                     };
                 }
-                ContentBlock::ToolResult { content, .. } => {
-                    if let ToolResultContent::Blocks(blocks) = content {
-                        for tb in blocks.iter_mut() {
-                            if matches!(tb, ToolResultBlock::Image { .. }) {
-                                *tb = ToolResultBlock::Text {
-                                    text: NOTE.to_string(),
-                                };
-                            }
+                ContentBlock::ToolResult {
+                    content: ToolResultContent::Blocks(blocks),
+                    ..
+                } => {
+                    for tb in blocks.iter_mut() {
+                        if matches!(tb, ToolResultBlock::Image { .. }) {
+                            *tb = ToolResultBlock::Text {
+                                text: NOTE.to_string(),
+                            };
                         }
                     }
                 }

@@ -547,7 +547,8 @@ pub async fn verify_entailment(
         return Ok(());
     }
 
-    let mut jobs: Vec<(String, String, Vec<(u32, String)>)> = Vec::new();
+    type VerificationJob = (String, String, Vec<(u32, String)>);
+    let mut jobs: Vec<VerificationJob> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(kref.pages_dir()) {
         for entry in rd.flatten() {
             let path = entry.path();

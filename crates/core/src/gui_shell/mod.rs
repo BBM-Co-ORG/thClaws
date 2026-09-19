@@ -15,8 +15,8 @@ pub mod serve;
 pub mod shell_cli;
 pub mod shell_preview;
 pub mod storage;
-pub mod tokens;
 pub mod team;
+pub mod tokens;
 
 pub use manifest::ShellManifest;
 pub use registry::{

@@ -180,7 +180,7 @@ pub fn build_plan_prompt(
         }
         s.push('\n');
     }
-    let mut ents: Vec<(&String, &(String, String, u32, u32))> = tables.entities.iter().collect();
+    let mut ents: Vec<_> = tables.entities.iter().collect();
     ents.sort_by(|a, b| (b.1 .3, b.1 .2).cmp(&(a.1 .3, a.1 .2)).then(a.0.cmp(b.0)));
     let ent_total = ents.len();
     ents.truncate(PLAN_ENTITY_ROWS);
@@ -707,7 +707,7 @@ fn fallback_notes(
 ) -> Vec<NotePlan> {
     let known_slugs: HashSet<&str> = known.iter().map(|k| k.slug.as_str()).collect();
     let topic = sanitize_slug(topic_slug);
-    let mut ents: Vec<(&String, &(String, String, u32, u32))> = tables
+    let mut ents: Vec<_> = tables
         .entities
         .iter()
         .filter(|(slug, (_, _, claims, sources))| {
@@ -764,20 +764,36 @@ fn clamp(s: &str, max: usize) -> String {
     }
 }
 
-pub async fn plan_notes(
-    provider: &dyn Provider,
-    model: &str,
-    query: &str,
-    tables: &Tables,
-    known: &[KnownNote],
-    topic_slug: &str,
-    topic_title: &str,
-    max_notes: u32,
-    timeout: Duration,
-    cancel: &CancelToken,
-    language: &str,
-    anchor: Option<&str>,
-) -> Result<PlanOutcome> {
+pub struct PlanningRequest<'a> {
+    pub provider: &'a dyn Provider,
+    pub model: &'a str,
+    pub query: &'a str,
+    pub tables: &'a Tables,
+    pub known: &'a [KnownNote],
+    pub topic_slug: &'a str,
+    pub topic_title: &'a str,
+    pub max_notes: u32,
+    pub timeout: Duration,
+    pub cancel: &'a CancelToken,
+    pub language: &'a str,
+    pub anchor: Option<&'a str>,
+}
+
+pub async fn plan_notes(context: PlanningRequest<'_>) -> Result<PlanOutcome> {
+    let PlanningRequest {
+        provider,
+        model,
+        query,
+        tables,
+        known,
+        topic_slug,
+        topic_title,
+        max_notes,
+        timeout,
+        cancel,
+        language,
+        anchor,
+    } = context;
     let prompt = build_plan_prompt(
         query, tables, known, topic_slug, max_notes, language, anchor,
     );
@@ -841,16 +857,28 @@ pub fn build_gap_prompt(query: &str, tables: &Tables, prior_queries: &[String], 
     s
 }
 
-pub async fn gap_queries(
-    provider: &dyn Provider,
-    model: &str,
-    query: &str,
-    tables: &Tables,
-    prior: &[String],
-    n: u32,
-    timeout: Duration,
-    cancel: &CancelToken,
-) -> Result<Vec<String>> {
+pub struct GapQueryRequest<'a> {
+    pub provider: &'a dyn Provider,
+    pub model: &'a str,
+    pub query: &'a str,
+    pub tables: &'a Tables,
+    pub prior: &'a [String],
+    pub n: u32,
+    pub timeout: Duration,
+    pub cancel: &'a CancelToken,
+}
+
+pub async fn gap_queries(context: GapQueryRequest<'_>) -> Result<Vec<String>> {
+    let GapQueryRequest {
+        provider,
+        model,
+        query,
+        tables,
+        prior,
+        n,
+        timeout,
+        cancel,
+    } = context;
     let raw = oneshot(
         provider,
         model,

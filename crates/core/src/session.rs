@@ -31,7 +31,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// tool_use lines with large content easily exceed that. With M6.19
 /// H1's per-line skip-with-warning fix in place, the practical
 /// impact dropped from "session disappears" to "occasional warning
-/// + dropped corrupt line" — but corrupt lines are still corrupt
+/// \+ dropped corrupt line" — but corrupt lines are still corrupt
 /// data. Locking eliminates the interleave entirely. Acquire
 /// exclusive lock before each write; release at scope end via Drop.
 ///
@@ -1452,7 +1452,7 @@ impl SessionStore {
                 out.push(meta);
             }
         }
-        out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        out.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
         Ok(out)
     }
 

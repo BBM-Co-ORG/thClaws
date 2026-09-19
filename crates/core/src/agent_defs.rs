@@ -699,11 +699,8 @@ pub async fn install_subagent_from_url(
     ));
     let (md_src, source_label) = if crate::skills::is_zip_url(url) {
         let bytes = crate::skills::download_zip(url).await?;
-        if let Err(e) = std::fs::create_dir_all(&stage)
-            .map_err(|e| crate::Error::Tool(format!("mkdir stage: {e}")))
-        {
-            return Err(e);
-        }
+        std::fs::create_dir_all(&stage)
+            .map_err(|e| crate::Error::Tool(format!("mkdir stage: {e}")))?;
         if let Err(e) = crate::skills::extract_zip(&bytes, &stage) {
             let _ = std::fs::remove_dir_all(&stage);
             return Err(e);

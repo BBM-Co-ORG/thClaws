@@ -1207,10 +1207,7 @@ fn derive_name_from_url(url: &str) -> String {
         .trim_end_matches(".git")
         .trim_end_matches(".zip")
         .trim_end_matches(".ZIP");
-    let tail = trimmed
-        .rsplit(|c| c == '/' || c == ':')
-        .next()
-        .unwrap_or("");
+    let tail = trimmed.rsplit(['/', ':']).next().unwrap_or("");
     tail.to_string()
 }
 

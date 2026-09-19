@@ -106,6 +106,7 @@ fn default_transport() -> String {
 ///   - `"author": "Jane Doe"`                              → `"Jane Doe"`
 ///   - `"author": {"name": "Jane Doe", "email": "j@x.io"}` → `"Jane Doe"`
 ///   - `"author": null` or missing                          → `""`
+///
 /// Letting both shapes deserialize means anthropics-style plugin
 /// manifests work in thClaws unchanged.
 fn deserialize_author_flexible<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>

@@ -461,22 +461,36 @@ pub async fn fetch_many(tools: &Arc<dyn ResearchTools>, hits: Vec<SearchHit>) ->
     futures::future::join_all(futs).await
 }
 
+pub struct DigestBatch<'a> {
+    pub provider: Arc<dyn Provider>,
+    pub model: &'a str,
+    pub query: &'a str,
+    pub sources: &'a [ResearchSource],
+    pub known_slugs: &'a [String],
+    pub kref: &'a KmsRef,
+    pub today: &'a str,
+    pub timeout: Duration,
+    pub cancel: &'a CancelToken,
+    pub language: &'a str,
+}
+
 /// Digest every source concurrently (bounded), consulting the cache
 /// first. Returns digests in the same order as `sources`. A cache hit
 /// is re-stamped with the source's current citation index so `[c:ID]`
 /// markers stay consistent within this run.
-pub async fn digest_many(
-    provider: Arc<dyn Provider>,
-    model: &str,
-    query: &str,
-    sources: &[ResearchSource],
-    known_slugs: &[String],
-    kref: &KmsRef,
-    today: &str,
-    timeout: Duration,
-    cancel: &CancelToken,
-    language: &str,
-) -> Vec<Digest> {
+pub async fn digest_many(context: DigestBatch<'_>) -> Vec<Digest> {
+    let DigestBatch {
+        provider,
+        model,
+        query,
+        sources,
+        known_slugs,
+        kref,
+        today,
+        timeout,
+        cancel,
+        language,
+    } = context;
     let sem = Arc::new(tokio::sync::Semaphore::new(DIGEST_CONCURRENCY));
     let known: Arc<Vec<String>> = Arc::new(known_slugs.to_vec());
     let futs = sources.iter().map(|src| {

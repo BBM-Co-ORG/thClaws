@@ -171,9 +171,8 @@ pub(crate) fn parse(source: &str) -> (Program, Vec<CompileError>) {
                 &format!("shot {}: missing closing `}}`", s.id),
             ),
         ));
-        match seq.as_mut().or(implicit.as_mut()) {
-            Some(sq) => sq.shots.push(s),
-            None => {}
+        if let Some(sq) = seq.as_mut().or(implicit.as_mut()) {
+            sq.shots.push(s)
         }
     }
     if let Some(s) = seq.take() {
@@ -490,7 +489,7 @@ fn parse_variant_decl(
             format!("line {line_no}: {kw} ${full} lacks a #tag"),
         )
     })?;
-    let mut rhs_toks = rhs.trim().split_whitespace();
+    let mut rhs_toks = rhs.split_whitespace();
     let path_tok = rhs_toks.next().unwrap_or("");
     let image_path = path_tok
         .strip_prefix('@')
@@ -536,7 +535,7 @@ fn parse_audio_decl(
             format!("line {line_no}: {kw} needs a $handle"),
         )
     })?;
-    let mut rhs_toks = rhs.trim().split_whitespace();
+    let mut rhs_toks = rhs.split_whitespace();
     let path_tok = rhs_toks.next().unwrap_or("");
     let path = path_tok
         .strip_prefix('@')

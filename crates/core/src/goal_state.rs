@@ -9,6 +9,7 @@
 //!   - `RecordGoalProgress` — mid-loop checkpoint, status stays Active
 //!   - `MarkGoalComplete`   — terminal Complete (audit required)
 //!   - `MarkGoalBlocked`    — terminal Blocked (reason required)
+//!
 //! All three call `apply()` which fires the broadcaster (same pattern as
 //! `plan_state`).
 //!

@@ -1957,7 +1957,7 @@ pub fn parse_slash(input: &str) -> Option<SlashCommand> {
                 }
             } else if let Some(after_mp) = rest.strip_prefix("marketplace").map(str::trim_start) {
                 let parts: Vec<&str> = after_mp.split_whitespace().collect();
-                let refresh = parts.iter().any(|p| *p == "--refresh");
+                let refresh = parts.contains(&"--refresh");
                 SlashCommand::SkillMarketplace { refresh }
             } else if let Some(after_search) = rest.strip_prefix("search").map(str::trim_start) {
                 if after_search.is_empty() {
@@ -2236,7 +2236,7 @@ fn parse_cloud_subcommand(args: &str) -> SlashCommand {
             ) {
                 return SlashCommand::Unknown(err);
             }
-            let has = |f: &str| toks.iter().any(|t| *t == f);
+            let has = |f: &str| toks.contains(&f);
             let delete = has("--delete");
             let dry_run = has("--dry-run");
             let force_rebind = has("--force-rebind");
@@ -2482,10 +2482,8 @@ fn parse_memory_shortcut(input: &str) -> Option<SlashCommand> {
     // anchors the body separator.
     let after_hash = if let Some(rest) = input.strip_prefix("# ") {
         rest
-    } else if let Some(rest) = input.strip_prefix('#') {
-        rest
     } else {
-        return None;
+        input.strip_prefix('#')?
     };
 
     let (name_part, body_part) = after_hash.split_once(':')?;
@@ -2716,6 +2714,7 @@ pub enum KmsIngestSessionAliasSource {
 ///   1. User-supplied `as <alias>` (sanitized)
 ///   2. `session.title` if set (sanitized)
 ///   3. `session.id` (already slug-safe — `sess-<hex>`)
+///
 /// The slug is guaranteed non-empty because session.id always starts
 /// with `sess-` + hex chars.
 pub fn resolve_session_alias(
@@ -5944,6 +5943,18 @@ pub async fn run_agent_workflow(
     }
 }
 
+struct ReplPromptContext<'a> {
+    agent: &'a mut Agent,
+    system: &'a mut String,
+    factory_snapshot: &'a std::sync::Arc<std::sync::RwLock<crate::subagent::FactorySnapshot>>,
+    tool_registry: &'a crate::tools::ToolRegistry,
+    config: &'a AppConfig,
+    cwd: &'a std::path::Path,
+    skill_store_handle: &'a Option<std::sync::Arc<std::sync::Mutex<crate::skills::SkillStore>>>,
+    mcp_clients: &'a [std::sync::Arc<crate::mcp::McpClient>],
+    addendum: &'a str,
+}
+
 /// Recompose the REPL agent's system prompt from current project
 /// state. Mirrors what `shared_session::rebuild_system_prompt` does
 /// for the GUI worker — pre-fix the CLI captured `self.system` once
@@ -5954,17 +5965,18 @@ pub async fn run_agent_workflow(
 /// (not the local snapshot) is the live skill catalog — `/skill
 /// install` and `/plugin install` write through it, so reading from
 /// it here picks up the additions automatically.
-fn refresh_repl_system_prompt(
-    agent: &mut Agent,
-    system: &mut String,
-    factory_snapshot: &std::sync::Arc<std::sync::RwLock<crate::subagent::FactorySnapshot>>,
-    tool_registry: &crate::tools::ToolRegistry,
-    config: &AppConfig,
-    cwd: &std::path::Path,
-    skill_store_handle: &Option<std::sync::Arc<std::sync::Mutex<crate::skills::SkillStore>>>,
-    mcp_clients: &[std::sync::Arc<crate::mcp::McpClient>],
-    addendum: &str,
-) {
+fn refresh_repl_system_prompt(context: ReplPromptContext<'_>) {
+    let ReplPromptContext {
+        agent,
+        system,
+        factory_snapshot,
+        tool_registry,
+        config,
+        cwd,
+        skill_store_handle,
+        mcp_clients,
+        addendum,
+    } = context;
     let mcp_instructions = crate::mcp::collect_mcp_instructions(mcp_clients);
     let store_guard = skill_store_handle.as_ref().and_then(|h| h.lock().ok());
     let mut new_system = crate::prompts::build_full_system_prompt(
@@ -6722,7 +6734,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                 if let Some(proto) = crate::team::parse_protocol_message(msg.content()) {
                     match proto {
                         crate::team::ProtocolMessage::ShutdownRequest { from } => {
-                            let _ = mailbox.mark_as_read(agent_name, &[msg.id.clone()]);
+                            let _ = mailbox.mark_as_read(agent_name, std::slice::from_ref(&msg.id));
                             let has_active_task = mailbox
                                 .task_queue()
                                 .list(Some(crate::team::TaskStatus::InProgress))
@@ -6762,7 +6774,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                         }
                         // AbortTurn while idle = nothing to abort; just ack.
                         crate::team::ProtocolMessage::AbortTurn { .. } => {
-                            let _ = mailbox.mark_as_read(agent_name, &[msg.id.clone()]);
+                            let _ = mailbox.mark_as_read(agent_name, std::slice::from_ref(&msg.id));
                         }
                         // Other protocol messages (idle/shutdown replies) must
                         // NOT be silently dropped — surface them to the model.
@@ -7003,7 +7015,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                 }
                 // This message's turn ran — mark it read (consume it) and drop
                 // it from in_flight so it isn't re-pushed next poll.
-                let _ = mailbox.mark_as_read(agent_name, &[msg.id.clone()]);
+                let _ = mailbox.mark_as_read(agent_name, std::slice::from_ref(&msg.id));
                 in_flight.remove(&msg.id);
 
                 let tq = mailbox.task_queue();
@@ -8735,17 +8747,17 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                             // skills land in the catalogue section immediately.
                             // MCP servers still need /reload (live tool registry
                             // doesn't track per-plugin server lifecycle).
-                            refresh_repl_system_prompt(
-                                &mut agent,
-                                &mut system,
-                                &factory_snapshot,
-                                &tool_registry,
-                                &config,
-                                &cwd,
-                                &skill_store_handle,
-                                &mcp_clients,
-                                &system_addendum,
-                            );
+                            refresh_repl_system_prompt(ReplPromptContext {
+                                agent: &mut agent,
+                                system: &mut system,
+                                factory_snapshot: &factory_snapshot,
+                                tool_registry: &tool_registry,
+                                config: &config,
+                                cwd: &cwd,
+                                skill_store_handle: &skill_store_handle,
+                                mcp_clients: &mcp_clients,
+                                addendum: &system_addendum,
+                            });
                             // Skills + commands are live (skill store
                             // refreshed above; commands re-discover per
                             // /-resolution call). MCP servers are the
@@ -9043,17 +9055,17 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                                 //    `# MCP server instructions` section. Must
                                 //    happen BEFORE the Agent::new below — that
                                 //    constructor captures `system` by value.
-                                refresh_repl_system_prompt(
-                                    &mut agent,
-                                    &mut system,
-                                    &factory_snapshot,
-                                    &tool_registry,
-                                    &config,
-                                    &cwd,
-                                    &skill_store_handle,
-                                    &mcp_clients,
-                                    &system_addendum,
-                                );
+                                refresh_repl_system_prompt(ReplPromptContext {
+                                    agent: &mut agent,
+                                    system: &mut system,
+                                    factory_snapshot: &factory_snapshot,
+                                    tool_registry: &tool_registry,
+                                    config: &config,
+                                    cwd: &cwd,
+                                    skill_store_handle: &skill_store_handle,
+                                    mcp_clients: &mcp_clients,
+                                    addendum: &system_addendum,
+                                });
                                 // 4. Rebuild agent so it picks up the new tools.
                                 //    Preserve history so the conversation keeps going.
                                 let prev_history = agent.history_snapshot();
@@ -9132,17 +9144,17 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                                 }
                                 mcp_summary.push((name.clone(), names.clone()));
                                 mcp_clients.push(client);
-                                refresh_repl_system_prompt(
-                                    &mut agent,
-                                    &mut system,
-                                    &factory_snapshot,
-                                    &tool_registry,
-                                    &config,
-                                    &cwd,
-                                    &skill_store_handle,
-                                    &mcp_clients,
-                                    &system_addendum,
-                                );
+                                refresh_repl_system_prompt(ReplPromptContext {
+                                    agent: &mut agent,
+                                    system: &mut system,
+                                    factory_snapshot: &factory_snapshot,
+                                    tool_registry: &tool_registry,
+                                    config: &config,
+                                    cwd: &cwd,
+                                    skill_store_handle: &skill_store_handle,
+                                    mcp_clients: &mcp_clients,
+                                    addendum: &system_addendum,
+                                });
                                 let prev_history = agent.history_snapshot();
                                 agent = Agent::new(
                                     build_provider(&config)?,
@@ -9312,17 +9324,17 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     println!("{COLOR_YELLOW}[reload] re-exec failed: {err}{COLOR_RESET}");
                 }
                 SlashCommand::ReloadPrompt => {
-                    refresh_repl_system_prompt(
-                        &mut agent,
-                        &mut system,
-                        &factory_snapshot,
-                        &tool_registry,
-                        &config,
-                        &cwd,
-                        &skill_store_handle,
-                        &mcp_clients,
-                        &system_addendum,
-                    );
+                    refresh_repl_system_prompt(ReplPromptContext {
+                        agent: &mut agent,
+                        system: &mut system,
+                        factory_snapshot: &factory_snapshot,
+                        tool_registry: &tool_registry,
+                        config: &config,
+                        cwd: &cwd,
+                        skill_store_handle: &skill_store_handle,
+                        mcp_clients: &mcp_clients,
+                        addendum: &system_addendum,
+                    });
                     println!(
                         "{COLOR_DIM}[reload-prompt] system prompt rebuilt from current state ({} bytes){COLOR_RESET}",
                         system.len()
@@ -9757,17 +9769,17 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                                 // Refresh the system prompt's skill catalogue
                                 // section so the model sees the newly-installed
                                 // skill on the very next turn (not just `/reload`).
-                                refresh_repl_system_prompt(
-                                    &mut agent,
-                                    &mut system,
-                                    &factory_snapshot,
-                                    &tool_registry,
-                                    &config,
-                                    &cwd,
-                                    &skill_store_handle,
-                                    &mcp_clients,
-                                    &system_addendum,
-                                );
+                                refresh_repl_system_prompt(ReplPromptContext {
+                                    agent: &mut agent,
+                                    system: &mut system,
+                                    factory_snapshot: &factory_snapshot,
+                                    tool_registry: &tool_registry,
+                                    config: &config,
+                                    cwd: &cwd,
+                                    skill_store_handle: &skill_store_handle,
+                                    mcp_clients: &mcp_clients,
+                                    addendum: &system_addendum,
+                                });
                             }
                             Err(e) => {
                                 println!("{COLOR_YELLOW}skill install failed: {e}{COLOR_RESET}");
@@ -10388,17 +10400,17 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                             // pre-fix this used to print "restart chat or start
                             // a new turn to pick it up" because self.system was
                             // captured at REPL startup and never refreshed.
-                            refresh_repl_system_prompt(
-                                &mut agent,
-                                &mut system,
-                                &factory_snapshot,
-                                &tool_registry,
-                                &config,
-                                &cwd,
-                                &skill_store_handle,
-                                &mcp_clients,
-                                &system_addendum,
-                            );
+                            refresh_repl_system_prompt(ReplPromptContext {
+                                agent: &mut agent,
+                                system: &mut system,
+                                factory_snapshot: &factory_snapshot,
+                                tool_registry: &tool_registry,
+                                config: &config,
+                                cwd: &cwd,
+                                skill_store_handle: &skill_store_handle,
+                                mcp_clients: &mcp_clients,
+                                addendum: &system_addendum,
+                            });
                             println!(
                                 "{COLOR_DIM}KMS '{name}' attached{COLOR_RESET}"
                             );
@@ -10414,17 +10426,17 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     {
                         println!("{COLOR_YELLOW}save failed: {e}{COLOR_RESET}");
                     } else {
-                        refresh_repl_system_prompt(
-                            &mut agent,
-                            &mut system,
-                            &factory_snapshot,
-                            &tool_registry,
-                            &config,
-                            &cwd,
-                            &skill_store_handle,
-                            &mcp_clients,
-                            &system_addendum,
-                        );
+                        refresh_repl_system_prompt(ReplPromptContext {
+                            agent: &mut agent,
+                            system: &mut system,
+                            factory_snapshot: &factory_snapshot,
+                            tool_registry: &tool_registry,
+                            config: &config,
+                            cwd: &cwd,
+                            skill_store_handle: &skill_store_handle,
+                            mcp_clients: &mcp_clients,
+                            addendum: &system_addendum,
+                        });
                         println!(
                             "{COLOR_DIM}KMS '{name}' detached{COLOR_RESET}"
                         );
@@ -11357,16 +11369,16 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                         }
                     };
                     let _ = all;
-                    match crate::research::start_refresh(
-                        kms.clone(),
+                    match crate::research::start_refresh(crate::research::RefreshRequest {
+                        kms: kms.clone(),
                         slugs,
-                        older_than_days.unwrap_or(30),
-                        cfg,
+                        older_than_days: older_than_days.unwrap_or(30),
+                        base: cfg,
                         provider,
-                        config.model.clone(),
+                        model: config.model.clone(),
                         digest_provider,
-                        None,
-                    )
+                        tools: None,
+                    })
                     .await
                     {
                         Ok(ids) => {
@@ -12829,7 +12841,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     match output {
                         Ok(ref body) => {
                             let src_suffix = crate::tools::extract_tool_source(body)
-                                .map(|s| crate::tool_display::sanitize_label_field(s))
+                                .map(crate::tool_display::sanitize_label_field)
                                 .map(|s| format!(" {COLOR_DIM}(via {s}){COLOR_RESET}"))
                                 .unwrap_or_default();
                             let label = td.as_ref().map(|t| t.label.as_str()).unwrap_or(&name);
@@ -15676,12 +15688,7 @@ mod tests {
 
     #[test]
     fn build_provider_honors_env_keys() {
-        let _guard = crate::kms::test_env_lock();
-
-        let saved_a = std::env::var("ANTHROPIC_API_KEY").ok();
-        let saved_o = std::env::var("OPENAI_API_KEY").ok();
-        std::env::remove_var("ANTHROPIC_API_KEY");
-        std::env::remove_var("OPENAI_API_KEY");
+        let _env = crate::providers::test_support::CredentialEnv::new();
 
         // Case 1: no key → error with a pointer at the env var.
         let cfg = AppConfig::default();
@@ -15701,14 +15708,6 @@ mod tests {
         openai_cfg.model = "gpt-4o".into();
         build_provider(&openai_cfg).expect("openai should build");
         std::env::remove_var("OPENAI_API_KEY");
-
-        // Restore original env if the caller had any.
-        if let Some(v) = saved_a {
-            std::env::set_var("ANTHROPIC_API_KEY", v);
-        }
-        if let Some(v) = saved_o {
-            std::env::set_var("OPENAI_API_KEY", v);
-        }
     }
 
     // Regression: cloud runners ship placeholder provider keys and rely
@@ -15717,7 +15716,7 @@ mod tests {
     // placeholder → 401 (dev-plan: the book4 dashscope incident).
     #[test]
     fn compat_endpoint_routes_via_gateway_when_enabled() {
-        let _guard = crate::kms::test_env_lock();
+        let _guard = crate::providers::test_support::CredentialEnv::new();
         let saved = std::env::var("THCLAWS_GATEWAY_API_KEY").ok();
         std::env::set_var("THCLAWS_GATEWAY_API_KEY", "gw_v1_test");
         std::env::remove_var("THCLAWS_GATEWAY_BASE_URL");
@@ -15767,26 +15766,16 @@ mod tests {
     /// Trace: https://github.com/thClaws/thClaws (screenshot in Thai)
     #[test]
     fn empty_env_var_treated_as_unset() {
-        let _guard = crate::kms::test_env_lock();
-
-        let saved_a = std::env::var("ANTHROPIC_API_KEY").ok();
-        let saved_g = std::env::var("GEMINI_API_KEY").ok();
-
-        // Empty Anthropic env (the bug-trigger), no Gemini env.
+        let _env = crate::providers::test_support::CredentialEnv::new();
         std::env::set_var("ANTHROPIC_API_KEY", "");
-        std::env::remove_var("GEMINI_API_KEY");
 
         // api_key_from_env on a Claude model should NOT return Some("")
         // — that produces a 401 with an empty bearer.
         let mut cfg = AppConfig::default();
         cfg.model = "claude-sonnet-4-6".into();
         assert!(
-            cfg.api_key_from_env().is_none()
-                || cfg
-                    .api_key_from_env()
-                    .map(|v| !v.trim().is_empty())
-                    .unwrap_or(false),
-            "empty ANTHROPIC_API_KEY must not produce an empty Some(\"\")"
+            cfg.api_key_from_env().is_none(),
+            "empty API key must be treated as unset"
         );
 
         // build_provider should error pointing at the env var, same as
@@ -15797,15 +15786,6 @@ mod tests {
                 format!("{e}").contains("ANTHROPIC_API_KEY"),
                 "error should point at the missing env var, got: {e}"
             ),
-        }
-
-        // Restore original env.
-        std::env::remove_var("ANTHROPIC_API_KEY");
-        if let Some(v) = saved_a {
-            std::env::set_var("ANTHROPIC_API_KEY", v);
-        }
-        if let Some(v) = saved_g {
-            std::env::set_var("GEMINI_API_KEY", v);
         }
     }
 
@@ -15926,17 +15906,17 @@ mod tests {
         // Refresh — should rebuild base from build_full_system_prompt
         // (against the tempdir cwd, so no project state) AND append
         // the addendum at the end.
-        super::refresh_repl_system_prompt(
-            &mut agent,
-            &mut system,
-            &factory_snapshot,
-            &tool_registry,
-            &cfg,
-            tmp.path(),
-            &None,
-            &[],
+        super::refresh_repl_system_prompt(super::ReplPromptContext {
+            agent: &mut agent,
+            system: &mut system,
+            factory_snapshot: &factory_snapshot,
+            tool_registry: &tool_registry,
+            config: &cfg,
+            cwd: tmp.path(),
+            skill_store_handle: &None,
+            mcp_clients: &[],
             addendum,
-        );
+        });
 
         let agent_sys = agent.system_text();
         assert!(
@@ -15959,17 +15939,17 @@ mod tests {
 
         // Empty-addendum path: no extra bytes appended.
         let before_len = system.len();
-        super::refresh_repl_system_prompt(
-            &mut agent,
-            &mut system,
-            &factory_snapshot,
-            &tool_registry,
-            &cfg,
-            tmp.path(),
-            &None,
-            &[],
-            "",
-        );
+        super::refresh_repl_system_prompt(super::ReplPromptContext {
+            agent: &mut agent,
+            system: &mut system,
+            factory_snapshot: &factory_snapshot,
+            tool_registry: &tool_registry,
+            config: &cfg,
+            cwd: tmp.path(),
+            skill_store_handle: &None,
+            mcp_clients: &[],
+            addendum: "",
+        });
         assert_eq!(
             system.len(),
             before_len - addendum.len(),
