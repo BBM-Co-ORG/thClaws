@@ -346,7 +346,7 @@ pub async fn run_on(
             while let Some(req) = approval_rx.recv().await {
                 let payload = serde_json::json!({
                     "type": "approval_request",
-                            "session_id": req.session_id,
+                    "session_id": req.session_id,
                     "id": req.id,
                     "tool_name": req.tool_name,
                     "input": req.input,
@@ -2652,11 +2652,12 @@ async fn handle_socket(socket: WebSocket, state: ServeState, shared: Arc<SharedS
         approver: state.approver.clone(),
         pending_asks: state.pending_asks.clone(),
         dispatch,
-        on_quit: Arc::new(|| {
-            eprintln!(
-                "\x1b[36m[serve] frontend requested app_close — closing WS connection\x1b[0m"
-            );
-        }),
+        on_quit: {
+            let tx = out_tx.clone();
+            Arc::new(move || {
+                let _ = tx.send(serde_json::json!({"type":"session_quit"}).to_string());
+            })
+        },
         on_send_initial_state: Arc::new(move || {
             // dev-plan/42: per-user sessions dir from the resolved handle
             // (multiuser) so the snapshot lists this user's history.
@@ -2748,7 +2749,7 @@ async fn handle_socket(socket: WebSocket, state: ServeState, shared: Arc<SharedS
     for req in state.approver.unresolved_requests() {
         let payload = serde_json::json!({
             "type": "approval_request",
-                            "session_id": req.session_id,
+            "session_id": req.session_id,
             "id": req.id,
             "tool_name": req.tool_name,
             "input": req.input,
@@ -2788,6 +2789,12 @@ async fn handle_socket(socket: WebSocket, state: ServeState, shared: Arc<SharedS
     // Outbound writer task — serializes every payload to the WS sink.
     let writer = tokio::spawn(async move {
         while let Some(payload) = out_rx.recv().await {
+            if serde_json::from_str::<serde_json::Value>(&payload)
+                .is_ok_and(|frame| frame["type"] == "session_quit")
+            {
+                let _ = sink.send(Message::Close(None)).await;
+                break;
+            }
             if sink.send(Message::text(payload)).await.is_err() {
                 break;
             }
@@ -3264,7 +3271,22 @@ mod tests {
         .await
         .expect("reconnect must replay execution identity");
         assert!(!identity.is_empty());
-        let _ = reconnected.send(WsMessage::Close(None)).await;
+        reconnected
+            .send(WsMessage::text(
+                serde_json::json!({"type":"shell_input", "text":"/quit"}).to_string(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(frame) = reconnected.next().await {
+                if matches!(frame, Ok(WsMessage::Close(_))) {
+                    return;
+                }
+            }
+            panic!("expected a WebSocket close frame after /quit");
+        })
+        .await
+        .expect("/quit must close the WebSocket");
         server_handle.abort();
     }
 

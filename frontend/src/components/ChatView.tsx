@@ -1111,6 +1111,14 @@ export function ChatView({ active, modalOpen }: Props) {
     // Allow send when EITHER text or attachments are present —
     // "describe this image" with no text is a valid use case.
     if (!text && attachments.length === 0) return;
+    if (attachments.length > 10) {
+      showAttachmentError("At most 10 attachments are allowed. Remove some images and send again.");
+      return;
+    }
+    if (attachments.reduce((total, image) => total + image.data.length, 0) > 67 * 1024 * 1024) {
+      showAttachmentError("Attachments exceed the 67 MiB base64-encoded payload limit. Reduce their size and send again.");
+      return;
+    }
 
     // Mid-turn injection path (issue #106): if the agent is already
     // streaming, the message goes into the agent's injection queue

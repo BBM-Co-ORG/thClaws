@@ -526,18 +526,60 @@ fn rel_slide_pngs(workspace: &std::path::Path, pdf: &std::path::Path) -> Vec<Str
         .collect()
 }
 
+fn draft_session(id: &str, ctx: &IpcContext) -> Option<crate::session::Session> {
+    uuid::Uuid::parse_str(id.strip_prefix("draft-")?).ok()?;
+    let model = crate::config::AppConfig::load()
+        .map(|c| c.model)
+        .unwrap_or_default();
+    let mut session = crate::session::Session::new_detached(
+        model,
+        ctx.shared
+            .session_roots
+            .as_ref()
+            .and_then(|r| r.workspace_root.clone())
+            .unwrap_or_else(crate::workdir::current_workdir)
+            .to_string_lossy(),
+    );
+    session.id = id.to_string();
+    Some(session)
+}
+
+pub(crate) fn parse_session_attachments(
+    msg: &Value,
+) -> Result<Vec<(String, String)>, &'static str> {
+    let Some(items) = msg.get("attachments").and_then(Value::as_array) else {
+        return Ok(vec![]);
+    };
+    if items.len() > 10 {
+        return Err("At most 10 attachments are allowed. Remove some images and send again.");
+    }
+    let mut total = 0usize;
+    let mut images = Vec::new();
+    for item in items {
+        let media = item
+            .get("mediaType")
+            .and_then(Value::as_str)
+            .ok_or("Invalid attachment mediaType.")?;
+        let data = item
+            .get("data")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or("Invalid or empty attachment data.")?;
+        total = total.saturating_add(data.len());
+        if total > 67 * 1024 * 1024 {
+            return Err("Attachments exceed the 67 MiB base64-encoded payload limit. Reduce their size and send again.");
+        }
+        images.push((media.to_owned(), data.to_owned()));
+    }
+    Ok(images)
+}
+
 pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
     let ty = msg.get("type").and_then(|t| t.as_str()).unwrap_or("");
     let target = msg
         .get("session_id")
         .and_then(Value::as_str)
         .filter(|id| !id.is_empty());
-    let busy = crate::agent_activity::busy_meta();
-    let execution = ctx.shared.execution_session_id.lock().unwrap().clone();
-    let active = busy
-        .as_ref()
-        .map(|m| m.session_id.as_str())
-        .unwrap_or(&execution);
     let input = matches!(ty, "shell_input" | "chat_prompt" | "pty_write");
     let control = ty.starts_with("plan_")
         || ty.starts_with("goal_")
@@ -548,14 +590,19 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                 | "approval_response"
                 | "ask_user_response"
                 | "workflow_decision"
-                | "plan_approve"
-                | "plan_reject"
-                | "plan_cancel"
-                | "goal_set"
-                | "goal_clear"
-                | "goal_continue"
         );
     if let Some(target) = target {
+        let busy = crate::agent_activity::busy_meta();
+        let execution = ctx
+            .shared
+            .execution_session_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let active = busy
+            .as_ref()
+            .map(|m| m.session_id.as_str())
+            .unwrap_or(&execution);
         if target != active && (control || (input && busy.is_some())) {
             (ctx.dispatch)(serde_json::json!({"type":"session_action_rejected", "session_id":target, "text":format!("Session {active} is the execution session. Return to it to control the task; wait for it to finish before sending here.")}).to_string());
             return true;
@@ -592,6 +639,16 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                 .unwrap_or_default();
             let trimmed = line.trim_end_matches(['\r', '\n']).to_string();
             if trimmed.is_empty() && !has_attachments {
+                return true;
+            }
+            // A browser closes its connection; it cannot answer a native quit dialog.
+            if ctx.is_serve_mode
+                && matches!(
+                    trimmed.trim().to_ascii_lowercase().as_str(),
+                    "/quit" | "/exit" | "/q"
+                )
+            {
+                (ctx.on_quit)();
                 return true;
             }
             // dev-plan/32 Tier 3 Terminal-tab approval intercept. The
@@ -632,22 +689,25 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                     (ctx.dispatch)(serde_json::json!({"type":"session_action_rejected","session_id":id,"text":"This session belongs to a teammate. Open its current session from Team to send a message."}).to_string());
                     return true;
                 }
-                let images: Vec<(String, String)> = msg
-                    .get("attachments")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .take(10)
-                    .filter_map(|a| {
-                        Some((
-                            a.get("mediaType")?.as_str()?.to_string(),
-                            a.get("data")?.as_str()?.to_string(),
-                        ))
-                    })
-                    .collect();
-                if images.iter().map(|(_, data)| data.len()).sum::<usize>() > 67 * 1024 * 1024 {
-                    (ctx.dispatch)(serde_json::json!({"type":"session_action_rejected", "session_id":id, "text":"Attachments exceed the 67 MB limit."}).to_string());
-                    return true;
+                let images = match parse_session_attachments(&msg) {
+                    Ok(images) => images,
+                    Err(error) => {
+                        (ctx.dispatch)(serde_json::json!({"type":"session_action_rejected", "session_id":id, "text":error}).to_string());
+                        return true;
+                    }
+                };
+                if let Some(session) = draft_session(id, ctx) {
+                    let result = ipc_session_store(ctx)
+                        .ok_or_else(|| "No session store".to_string())
+                        .and_then(|store| {
+                            session
+                                .write_header_if_missing(&store.path_for(id))
+                                .map_err(|e| e.to_string())
+                        });
+                    if let Err(error) = result {
+                        (ctx.dispatch)(serde_json::json!({"type":"session_action_rejected", "session_id":id, "text":error}).to_string());
+                        return true;
+                    }
                 }
                 ShellInput::SessionInput {
                     id: id.to_string(),
@@ -668,7 +728,12 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
             ctx.shared.ready_gate.signal();
             // The worker may have activated before this client subscribed.
             // Replay its identity and busy state on every handshake.
-            let id = ctx.shared.execution_session_id.lock().unwrap().clone();
+            let id = ctx
+                .shared
+                .execution_session_id
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
             if !id.is_empty() {
                 (ctx.dispatch)(
                     serde_json::json!({"type":"session_execution","session_id":id}).to_string(),
@@ -3099,35 +3164,14 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
 
         "new_session" => {
             if let Some(request_id) = msg.get("view_request").and_then(Value::as_str) {
-                let store = ipc_session_store(ctx);
-                let result = store
-                    .as_ref()
-                    .ok_or_else(|| "No session store".to_string())
-                    .and_then(|store| {
-                        let model = crate::config::AppConfig::load()
-                            .map(|c| c.model)
-                            .unwrap_or_default();
-                        let session = crate::session::Session::new_detached(
-                            model,
-                            ctx.shared
-                                .session_roots
-                                .as_ref()
-                                .and_then(|r| r.workspace_root.clone())
-                                .unwrap_or_else(crate::workdir::current_workdir)
-                                .to_string_lossy(),
-                        );
-                        session
-                            .write_header_if_missing(&store.path_for(&session.id))
-                            .map_err(|e| e.to_string())?;
-                        Ok(session)
-                    });
-                match result {
-                    Ok(session) => {
-                        let _ = ctx.shared.events_tx.send(crate::shared_session::ViewEvent::SessionListRefresh(crate::shared_session::build_session_list(&store, &execution)));
-                        let _ = ctx.shared.events_tx.send(crate::shared_session::ViewEvent::SessionViewRequest {session:Box::new(session), request_id:request_id.to_string()});
-                    }
-                    Err(error) => (ctx.dispatch)(serde_json::json!({"type":"session_view_error", "request_id":request_id, "text":error}).to_string()),
-                }
+                let id = format!("draft-{}", uuid::Uuid::new_v4());
+                let session = draft_session(&id, ctx).expect("generated draft id");
+                let _ = ctx.shared.events_tx.send(
+                    crate::shared_session::ViewEvent::SessionViewRequest {
+                        session: Box::new(session),
+                        request_id: request_id.to_string(),
+                    },
+                );
             } else {
                 let _ = ctx.shared.input_tx.send(ShellInput::NewSession);
                 (ctx.dispatch)(serde_json::json!({"type":"new_session_ack"}).to_string());
@@ -6177,6 +6221,12 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
             });
         }
         "team_list" => {
+            let execution = ctx
+                .shared
+                .execution_session_id
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
             let mailbox = ipc_team_mailbox(ctx);
             let agents: Vec<serde_json::Value> = mailbox
                 .all_status()
@@ -7198,14 +7248,22 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                 if let Some(request_id) = msg.get("view_request").and_then(Value::as_str) {
                     let result = ipc_session_store(ctx)
                         .ok_or_else(|| "No session store".to_string())
-                        .and_then(|store| store.load(id).map_err(|e| e.to_string()));
+                        .and_then(|store| {
+                            store
+                                .load(id)
+                                .or_else(|error| draft_session(id, ctx).ok_or(error))
+                                .map_err(|e| e.to_string())
+                        });
                     match result {
                         Ok(session) => {
                             let _ = ctx.shared.events_tx.send(crate::shared_session::ViewEvent::SessionViewRequest {session:Box::new(session), request_id:request_id.to_string()});
                         }
                         Err(error) => (ctx.dispatch)(serde_json::json!({"type":"session_view_error", "request_id":request_id, "text":error}).to_string()),
                     }
-                } else if busy.as_ref().is_none_or(|m| m.session_id != id) {
+                } else if crate::agent_activity::busy_meta()
+                    .as_ref()
+                    .is_none_or(|m| m.session_id != id)
+                {
                     let _ = ctx
                         .shared
                         .input_tx
@@ -7345,6 +7403,144 @@ mod tests {
             user.path().join(crate::team::Mailbox::default_dir())
         );
         assert!(ipc.all_status().unwrap().is_empty());
+    }
+
+    #[test]
+    fn session_attachments_reject_excess_or_malformed_images_without_truncation() {
+        let image = serde_json::json!({"mediaType":"image/png", "data":"YWJj"});
+        let ten = serde_json::json!({"attachments":vec![image.clone();10]});
+        let images = parse_session_attachments(&ten).unwrap();
+        assert_eq!(images.len(), 10);
+        assert_eq!(images[0], ("image/png".into(), "YWJj".into()));
+        assert!(
+            parse_session_attachments(&serde_json::json!({"attachments":vec![image;11]}))
+                .unwrap_err()
+                .contains("10")
+        );
+        assert!(parse_session_attachments(
+            &serde_json::json!({"attachments":[{"mediaType":"image/png"}]})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn session_view_requests_do_not_enqueue_execution_or_cancel() {
+        use crate::shared_session::{ReadyGate, ViewEvent};
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::session::SessionStore::new(temp.path().join("sessions"));
+        let mut saved =
+            crate::session::Session::new_detached("mock", temp.path().to_string_lossy());
+        store.save(&mut saved).unwrap();
+        let (input_tx, input_rx) = std::sync::mpsc::channel();
+        let (events_tx, mut events_rx) = tokio::sync::broadcast::channel(32);
+        let execution = Arc::new(Mutex::new("running-A".to_string()));
+        let shared = Arc::new(SharedSessionHandle {
+            view_events: tokio::sync::broadcast::channel(32).0,
+            execution_session_id: execution.clone(),
+            input_tx,
+            events_tx,
+            cancel: crate::cancel::CancelToken::new(),
+            ready_gate: Arc::new(ReadyGate::new()),
+            injection_queue: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            workflow_approver: crate::workflow::WorkflowApprover::new(),
+            session_roots: Some(crate::multi_tenant::SessionRoots {
+                sessions_dir: temp.path().join("sessions"),
+                storage_dir: temp.path().join("storage"),
+                usage_dir: temp.path().join("usage"),
+                workspace_root: Some(temp.path().to_path_buf()),
+                member_id: None,
+                member_name: None,
+            }),
+            browser_mcp: Arc::new(std::sync::RwLock::new(None)),
+        });
+        let (approver, _) = GuiApprover::new();
+        let replies = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let captured = replies.clone();
+        let ctx = IpcContext {
+            is_serve_mode: true,
+            shared: shared.clone(),
+            approver,
+            pending_asks: Arc::new(Mutex::new(HashMap::new())),
+            dispatch: Arc::new(move |frame| {
+                captured
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_str(&frame).unwrap())
+            }),
+            on_quit: Arc::new(|| {}),
+            on_send_initial_state: Arc::new(|| {}),
+            on_zoom: Arc::new(|_| {}),
+            workflow_approver: crate::workflow::WorkflowApprover::new(),
+        };
+        assert!(handle_ipc(
+            serde_json::json!({"type":"session_load","id":saved.id,"view_request":"view-B"}),
+            &ctx
+        ));
+        match events_rx.try_recv().unwrap() {
+            ViewEvent::SessionViewRequest {
+                session,
+                request_id,
+            } => {
+                assert_eq!(session.id, saved.id);
+                assert_eq!(request_id, "view-B");
+            }
+            event => panic!("unexpected event: {event:?}"),
+        }
+        assert!(handle_ipc(
+            serde_json::json!({"type":"new_session","view_request":"new-B"}),
+            &ctx
+        ));
+        match events_rx.try_recv().unwrap() {
+            ViewEvent::SessionViewRequest {
+                session,
+                request_id,
+            } => {
+                assert_eq!(request_id, "new-B");
+                assert_ne!(session.id, "running-A");
+                assert!(
+                    store.load(&session.id).is_err(),
+                    "preview must not persist an empty session"
+                );
+            }
+            event => panic!("unexpected event: {event:?}"),
+        }
+        assert!(
+            input_rx.try_recv().is_err(),
+            "viewing must not queue a worker session switch"
+        );
+        let draft_id = format!("draft-{}", uuid::Uuid::new_v4());
+        assert!(draft_session(&draft_id, &ctx).is_some());
+        assert!(draft_session("draft-../../escape", &ctx).is_none());
+        assert!(store.load(&draft_id).is_err());
+        assert!(handle_ipc(
+            serde_json::json!({"type":"shell_input", "session_id":draft_id, "text":"first prompt"}),
+            &ctx
+        ));
+        assert!(matches!(
+            input_rx.try_recv().unwrap(),
+            ShellInput::SessionInput { .. }
+        ));
+        assert!(store.load(&draft_id).is_ok());
+        assert_eq!(*execution.lock().unwrap(), "running-A");
+        assert!(!shared.cancel.is_cancelled());
+        let poisoned = execution.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("simulate poisoned identity lock");
+        })
+        .join();
+        handle_ipc(
+            serde_json::json!({"type":"shell_cancel","session_id":saved.id}),
+            &ctx,
+        );
+        assert!(
+            !shared.cancel.is_cancelled(),
+            "Stop from B must not cancel A"
+        );
+        assert_eq!(
+            replies.lock().unwrap().last().unwrap()["type"],
+            "session_action_rejected"
+        );
     }
 
     /// IpcContext can be constructed with stub closures for tests.
