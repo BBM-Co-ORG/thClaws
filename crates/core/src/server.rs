@@ -2958,6 +2958,104 @@ fn build_kms_initial_payload(config: &AppConfig) -> Vec<serde_json::Value> {
 #[cfg(test)]
 mod tests {
 
+    #[tokio::test]
+    async fn team_control_assets_reach_the_selected_host_agent() {
+        use crate::bots::supervisor::BotSupervisor;
+        use crate::gui_shell::ShellRegistry;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let sup = BotSupervisor::with_program(workspace.path(), "unused-test-engine");
+        let mut servers = Vec::new();
+        for slug in ["main", "writer"] {
+            let dir = crate::bots::bot_dir(workspace.path(), slug);
+            std::fs::create_dir_all(&dir).unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            sup.add_ready_for_test(slug, dir, listener.local_addr().unwrap());
+            let app = Router::new().fallback(get(move |req: Request| async move {
+                assert_eq!(
+                    req.headers()[axum::http::header::AUTHORIZATION],
+                    "Bearer test-token"
+                );
+                let shell = ShellRegistry::builtin_only()
+                    .resolve("team-control")
+                    .unwrap();
+                let rel = req
+                    .uri()
+                    .path()
+                    .strip_prefix("/gui-shell/team-control/")
+                    .unwrap();
+                let mut response = if rel == "index.html" {
+                    crate::gui_shell::serve::serve_shell_index_inline(&shell)
+                } else {
+                    crate::gui_shell::serve::serve_shell_asset(&shell, rel)
+                };
+                response
+                    .headers_mut()
+                    .insert("x-test-agent", slug.parse().unwrap());
+                response
+            }));
+            servers.push(tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap()
+            }));
+        }
+        sup.set_default("main");
+
+        // Built-ins have no unique on-disk owner. The second bot's index and
+        // its relative assets must keep that selection through the proxy.
+        for rel in ["index.html", "main.js", "style.css", "icon.svg"] {
+            let req = Request::builder()
+                .uri(format!("/gui-shell/team-control/{rel}"))
+                .header(
+                    "referer",
+                    "http://host/gui-shell/team-control/index.html?bot=writer",
+                )
+                .body(Body::empty())
+                .unwrap();
+            let response =
+                supervisor_forward(State(sup.clone()), Query(BotQuery { bot: None }), req).await;
+            assert_eq!(response.status(), StatusCode::OK, "{rel}");
+            assert_eq!(response.headers()["x-test-agent"], "writer", "{rel}");
+            if rel == "index.html" {
+                assert_eq!(response.headers()["referrer-policy"], "same-origin");
+            }
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(!body.is_empty(), "{rel}");
+        }
+
+        // An installed override belongs to its on-disk owner even when a
+        // stale Referer points at the default bot. Explicit bot wins over both.
+        std::fs::create_dir_all(
+            crate::bots::bot_dir(workspace.path(), "writer")
+                .join(".thclaws/gui-shell/team-control"),
+        )
+        .unwrap();
+        for (explicit, expected) in [(None, "writer"), (Some("main"), "main")] {
+            let req = Request::builder()
+                .uri("/gui-shell/team-control/main.js")
+                .header(
+                    "referer",
+                    "http://host/gui-shell/team-control/index.html?bot=main",
+                )
+                .body(Body::empty())
+                .unwrap();
+            let response = supervisor_forward(
+                State(sup.clone()),
+                Query(BotQuery {
+                    bot: explicit.map(str::to_string),
+                }),
+                req,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["x-test-agent"], expected);
+        }
+        for server in servers {
+            server.abort();
+        }
+    }
+
     /// The host can name a shell's agent without asking the browser, which is
     /// the point: the Referer it used to rely on is suppressed by the shell's
     /// own `Referrer-Policy`, and every sub-asset went to the wrong agent.
