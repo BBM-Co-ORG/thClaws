@@ -9,11 +9,11 @@
 //! Protocol (matches anthropics/claude-agent-sdk-python):
 //!
 //!   1. We send an `initialize` control_request on stdin:
-//!        `{"type":"control_request","request_id":"req_<n>","request":{"subtype":"initialize","hooks":null}}`
+//!      `{"type":"control_request","request_id":"req_<n>","request":{"subtype":"initialize","hooks":null}}`
 //!   2. CLI replies with a matching `control_response` on stdout. We wait for
 //!      it before anything else — otherwise the CLI ignores user input.
 //!   3. We write a user message envelope on stdin:
-//!        `{"type":"user","session_id":"","message":{"role":"user","content":"..."},"parent_tool_use_id":null}`
+//!      `{"type":"user","session_id":"","message":{"role":"user","content":"..."},"parent_tool_use_id":null}`
 //!   4. We keep stdin open when the SDK MCP bridge is wired, because the
 //!      CLI drives that bridge over it — including DURING step 2, before
 //!      our own ack arrives. Only a bridge-less provider drops stdin

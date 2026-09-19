@@ -259,7 +259,7 @@ pub fn assemble(job_id: &str, plan: &AssemblyPlan, state: &JobState) -> Result<A
             }
         }
         if trim_head {
-            vf.insert(0, format!("trim=start_frame=1,setpts=PTS-STARTPTS"));
+            vf.insert(0, "trim=start_frame=1,setpts=PTS-STARTPTS".to_string());
         }
         if let Some(t) = plan.transitions.iter().find(|t| t.after_shot == *shot_id) {
             let start = (src_ms as f64 / 1000.0 - t.sec as f64).max(0.0);

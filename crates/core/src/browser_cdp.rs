@@ -973,7 +973,8 @@ pub fn input(kind: &str, args: &Value) -> Result<(), String> {
 /// A thread per event let a drag's `up` overtake its last `move`, which
 /// ends the drag short — or lands the release before the press.
 fn input_queue() -> &'static Mutex<std::sync::mpsc::Sender<Box<dyn FnOnce() + Send>>> {
-    static Q: OnceLock<Mutex<std::sync::mpsc::Sender<Box<dyn FnOnce() + Send>>>> = OnceLock::new();
+    type MainThreadJob = Box<dyn FnOnce() + Send>;
+    static Q: OnceLock<Mutex<std::sync::mpsc::Sender<MainThreadJob>>> = OnceLock::new();
     Q.get_or_init(|| {
         let (tx, rx) = std::sync::mpsc::channel::<Box<dyn FnOnce() + Send>>();
         std::thread::Builder::new()

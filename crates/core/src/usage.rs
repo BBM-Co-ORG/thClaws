@@ -82,6 +82,7 @@ impl UsageTracker {
         let lock_path = path.with_extension("json.lock");
         let Ok(lock_file) = std::fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&lock_path)

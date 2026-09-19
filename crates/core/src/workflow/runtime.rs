@@ -71,7 +71,7 @@ impl WorkflowSandbox {
         let source = Source::from_bytes(wrapped.as_bytes());
         let module = boa_engine::Module::parse(source, None, &mut self.ctx)?;
         let promise = module.load_link_evaluate(&mut self.ctx);
-        self.ctx.run_jobs().map_err(JsError::from)?;
+        self.ctx.run_jobs()?;
         match promise.state() {
             PromiseState::Fulfilled(_) => {
                 let global = self.ctx.global_object();
@@ -638,7 +638,7 @@ fn poll_until(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<
         let result = check_fn.call(&JsValue::undefined(), &[], ctx)?;
         let done = match &until_fn {
             Some(f) => f
-                .call(&JsValue::undefined(), &[result.clone()], ctx)?
+                .call(&JsValue::undefined(), std::slice::from_ref(&result), ctx)?
                 .to_boolean(),
             None => result.to_boolean(),
         };
@@ -761,8 +761,8 @@ fn subagent(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<Js
                 // newer) schema before returning, so a schema change
                 // between runs surfaces as a clear error rather than
                 // a stale value.
-                match jsonschema::validator_for(s) {
-                    Ok(validator) => match extract_json_from_text(&cached) {
+                if let Ok(validator) = jsonschema::validator_for(s) {
+                    match extract_json_from_text(&cached) {
                         Some(json_val) if validator.is_valid(&json_val) => {
                             return JsValue::from_json(&json_val, ctx);
                         }
@@ -770,8 +770,7 @@ fn subagent(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<Js
                             // Cached value no longer matches the schema —
                             // re-spawn fresh.
                         }
-                    },
-                    Err(_) => {}
+                    }
                 }
             }
             None => {

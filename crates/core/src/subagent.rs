@@ -252,7 +252,7 @@ pub trait AgentFactory: Send + Sync {
 ///   plumbing yet); GUI passes the worker's CancelToken.
 pub struct ProductionAgentFactory {
     /// Live view of the parent agent's system prompt + tool registry
-    /// + model/provider. Shared by Arc with the worker — see
+    /// \+ model/provider. Shared by Arc with the worker — see
     /// [`FactorySnapshot`] docs.
     pub snapshot: Arc<RwLock<FactorySnapshot>>,
     pub max_iterations: usize,
@@ -753,11 +753,11 @@ impl Tool for SubAgentTool {
 
         // Look up named agent definition if specified.
         let agent_def = agent_name.and_then(|name| self.agent_defs.get(name));
-        if agent_name.is_some() && agent_def.is_none() {
+        if let (Some(name), None) = (agent_name, agent_def) {
             let available = self.agent_defs.names().join(", ");
             return Err(Error::Agent(format!(
                 "unknown agent '{}'. Available: {}",
-                agent_name.unwrap(),
+                name,
                 if available.is_empty() {
                     "none"
                 } else {

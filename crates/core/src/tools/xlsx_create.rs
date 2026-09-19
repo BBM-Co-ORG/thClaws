@@ -283,6 +283,7 @@ fn value_to_cell(v: &Value) -> Cell {
 ///   - Phone-like strings ("+15551234567" → 15551234567, lost +)
 ///   - Trailing-zero decimals ("3.14000" → 3.14, lost precision shown)
 ///   - Scientific notation ("1e10" → 10000000000, lost notation)
+///
 /// The byte-identical check catches all these by comparing the f64's
 /// canonical Display form against the trimmed input. Side effect:
 /// "5.0" stays as Text (round-trips as "5"), which is intentional —

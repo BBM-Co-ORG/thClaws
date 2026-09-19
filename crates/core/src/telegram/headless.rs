@@ -191,7 +191,7 @@ impl TelegramMessageHandler for HeadlessAgentHandler {
 /// trailing text, but only matches the bare command as the first token
 /// (so `/resethard` or `hello /reset` don't trigger it).
 fn is_reset_command(text: &str) -> bool {
-    let first = text.trim().split_whitespace().next().unwrap_or("");
+    let first = text.split_whitespace().next().unwrap_or("");
     let cmd = first.split('@').next().unwrap_or(first);
     matches!(cmd, "/new" | "/reset" | "/clear")
 }

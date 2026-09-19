@@ -590,6 +590,7 @@ fn maybe_wrap_with_venv(cmd: &str, cwd: &std::path::Path) -> String {
 ///     mis-attributed to the script itself,
 ///   - Created a `.venv/` directory inside agent workspaces that had
 ///     no business owning one.
+///
 /// If a user actually needs venv-bound python, they call `pip` or
 /// activate the venv themselves; both still get auto-handled here.
 fn needs_venv(cmd: &str) -> bool {
@@ -1085,16 +1086,15 @@ pub fn is_destructive_command(cmd: &str) -> bool {
     }
 
     // Detect piping download commands into a shell: curl ... | sh, wget ... | bash
-    if lower.contains("| sh")
+    if (lower.contains("| sh")
         || lower.contains("|sh")
         || lower.contains("| bash")
         || lower.contains("|bash")
         || lower.contains("| zsh")
-        || lower.contains("|zsh")
+        || lower.contains("|zsh"))
+        && (lower.contains("curl") || lower.contains("wget") || lower.contains("fetch "))
     {
-        if lower.contains("curl") || lower.contains("wget") || lower.contains("fetch ") {
-            return true;
-        }
+        return true;
     }
 
     false
@@ -1362,6 +1362,22 @@ fn looks_like_tty_required(stdout: &str, stderr: &str) -> bool {
 /// re-injected as `THCLAWS_GATEWAY_{API_KEY,BASE_URL}` so agent scripts can
 /// reach Gemini image/TTS through the metered gateway with zero .env setup.
 fn scrub_sensitive_env(cmd: &mut tokio::process::Command) {
+    scrub_sensitive_env_for(cmd, crate::workdir::is_multiuser(), || {
+        crate::providers::thclaws_gateway::resolve_access_key().map(|key| {
+            let base = std::env::var("THCLAWS_GATEWAY_BASE_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| crate::providers::thclaws_gateway::GATEWAY_BASE_URL.to_string());
+            (key, base)
+        })
+    });
+}
+
+fn scrub_sensitive_env_for(
+    cmd: &mut tokio::process::Command,
+    multiuser: bool,
+    gateway: impl FnOnce() -> Option<(String, String)>,
+) {
     const ALWAYS: &[&str] = &[
         "THCLAWS_CLOUD_HMAC_SECRET",
         "THCLAWS_GATEWAY_API_KEY",
@@ -1370,7 +1386,7 @@ fn scrub_sensitive_env(cmd: &mut tokio::process::Command) {
     for k in ALWAYS {
         cmd.env_remove(k);
     }
-    if crate::workdir::is_multiuser() {
+    if multiuser {
         const SCOPED: &[&str] = &[
             "ANTHROPIC_API_KEY",
             "OPENAI_API_KEY",
@@ -1404,11 +1420,7 @@ fn scrub_sensitive_env(cmd: &mut tokio::process::Command) {
     // gateway" users hit `no credential` from every subprocess. Resolving
     // via the same env→keychain→cloud-token chain the providers use means
     // a gateway-configured desktop just works.
-    if let Some(key) = crate::providers::thclaws_gateway::resolve_access_key() {
-        let base = std::env::var("THCLAWS_GATEWAY_BASE_URL")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .unwrap_or_else(|| crate::providers::thclaws_gateway::GATEWAY_BASE_URL.to_string());
+    if let Some((key, base)) = gateway() {
         cmd.env("THCLAWS_GATEWAY_API_KEY", key);
         cmd.env("THCLAWS_GATEWAY_BASE_URL", base);
     }
@@ -1448,7 +1460,7 @@ mod tests {
         cmd.env("THCLAWS_GATEWAY_API_KEY", "spend-me")
             .env("THCLAWS_CLOUD_HMAC_SECRET", "forge-me")
             .env("KEEP_ME", "1");
-        scrub_sensitive_env(&mut cmd);
+        scrub_sensitive_env_for(&mut cmd, false, || None);
         let std = cmd.as_std();
         let removed = |key: &str| {
             std.get_envs()
@@ -1469,6 +1481,67 @@ mod tests {
             "non-secret env must be preserved"
         );
     }
+    #[test]
+    fn scrub_single_user_injects_resolved_gateway() {
+        let mut cmd = crate::util::shell_command_async("true");
+        cmd.env("THCLAWS_GATEWAY_API_KEY", "stale")
+            .env("ANTHROPIC_API_KEY", "own-provider-key")
+            .env("THCLAWS_CLOUD_TOKEN", "private-cloud-token");
+        scrub_sensitive_env_for(&mut cmd, false, || {
+            Some(("resolved-key".into(), "https://gateway.example".into()))
+        });
+        let env: std::collections::BTreeMap<_, _> = cmd.as_std().get_envs().collect();
+        let get = |key: &str| env.get(std::ffi::OsStr::new(key)).copied().flatten();
+        assert_eq!(
+            get("THCLAWS_GATEWAY_API_KEY"),
+            Some(std::ffi::OsStr::new("resolved-key"))
+        );
+        assert_eq!(
+            get("THCLAWS_GATEWAY_BASE_URL"),
+            Some(std::ffi::OsStr::new("https://gateway.example"))
+        );
+        assert_eq!(
+            get("ANTHROPIC_API_KEY"),
+            Some(std::ffi::OsStr::new("own-provider-key"))
+        );
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("THCLAWS_CLOUD_TOKEN")),
+            Some(&None)
+        );
+    }
+
+    #[test]
+    fn scrub_multiuser_removes_credentials_without_resolving_gateway() {
+        let mut cmd = crate::util::shell_command_async("true");
+        for key in [
+            "THCLAWS_GATEWAY_API_KEY",
+            "THCLAWS_CLOUD_HMAC_SECRET",
+            "THCLAWS_CLOUD_TOKEN",
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+        ] {
+            cmd.env(key, "secret");
+        }
+        cmd.env("KEEP_ME", "1");
+        scrub_sensitive_env_for(&mut cmd, true, || {
+            panic!("must not resolve owner credentials for a guest")
+        });
+        let env: std::collections::BTreeMap<_, _> = cmd.as_std().get_envs().collect();
+        for key in [
+            "THCLAWS_GATEWAY_API_KEY",
+            "THCLAWS_CLOUD_HMAC_SECRET",
+            "THCLAWS_CLOUD_TOKEN",
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+        ] {
+            assert_eq!(env.get(std::ffi::OsStr::new(key)), Some(&None), "{key}");
+        }
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("KEEP_ME")),
+            Some(&Some(std::ffi::OsStr::new("1")))
+        );
+    }
+
     use tempfile::tempdir;
 
     #[test]

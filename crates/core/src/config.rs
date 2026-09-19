@@ -149,7 +149,7 @@ pub struct AppConfig {
     /// How installed skills are surfaced to the model (dev-plan/06 P2).
     /// Trade-offs between system-prompt token cost and discoverability.
     /// - `"full"` (default): every skill listed with name + description
-    ///   + when_to_use trigger. Highest token cost; highest "model
+    ///   \+ when_to_use trigger. Highest token cost; highest "model
     ///   always knows" coverage. Right for users with ≤20 skills.
     /// - `"names-only"`: list only skill names + a hint to call the
     ///   Skill / SkillSearch tools for detail. Constant per-skill cost
@@ -2563,6 +2563,7 @@ impl AppConfig {
     ///      already-spawned PTY-child REPL can't see the GUI process's
     ///      updated env. Both processes can, however, read the same
     ///      keychain entry.)
+    ///
     /// Returns `None` when neither source has a key (providers without
     /// auth, like ollama, are OK either way).
     pub fn api_key_from_env(&self) -> Option<String> {

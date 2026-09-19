@@ -436,25 +436,38 @@ fn carried_frontmatter(kref: &KmsRef, slug: &str) -> Vec<(String, String)> {
     let (fm, _) = crate::kms::parse_frontmatter(&raw);
     fm.into_iter()
         .filter(|(k, v)| {
-            !MANAGED_FRONTMATTER.contains(&k.as_str())
-                && !(k == "status" && matches!(v.trim(), "derived" | "researching"))
+            !(MANAGED_FRONTMATTER.contains(&k.as_str())
+                || k == "status" && matches!(v.trim(), "derived" | "researching"))
         })
         .collect()
 }
 
+pub struct NoteToPersist<'a> {
+    pub kref: &'a KmsRef,
+    pub note: &'a NotePlan,
+    pub body: &'a str,
+    pub cited: &'a BTreeSet<u32>,
+    pub claim_count: usize,
+    pub confidence: f32,
+    pub today: &'a str,
+    pub append: bool,
+    pub sources_meta: &'a [(u32, String, String)],
+}
+
 /// Compose frontmatter + body and write through the KMS (create /
 /// merge) or append a dated section (`--append`).
-pub fn persist_note(
-    kref: &KmsRef,
-    note: &NotePlan,
-    body: &str,
-    cited: &BTreeSet<u32>,
-    claim_count: usize,
-    confidence: f32,
-    today: &str,
-    append: bool,
-    sources_meta: &[(u32, String, String)],
-) -> Result<WrittenNote> {
+pub fn persist_note(context: NoteToPersist<'_>) -> Result<WrittenNote> {
+    let NoteToPersist {
+        kref,
+        note,
+        body,
+        cited,
+        claim_count,
+        confidence,
+        today,
+        append,
+        sources_meta,
+    } = context;
     let mut body = super::kms_writer::strip_sources_section(body.trim());
     body = super::kms_writer::ensure_sources_section(&body, sources_meta);
     body = super::kms_writer::linkify_citations(&body, sources_meta);
@@ -556,13 +569,15 @@ fn strip_leading_heading(s: &str) -> String {
     lines.collect::<Vec<_>>().join("\n")
 }
 
+pub type RoundSummary = (u32, u32, u32, u32, f32, Vec<String>);
+
 /// `runs/<date>-<slug>.md`: machine-readable record of what the run
 /// did. What `/research show` opens.
 pub struct RunLog<'a> {
     pub query: &'a str,
     pub topic_slug: &'a str,
     pub today: &'a str,
-    pub rounds: &'a [(u32, u32, u32, u32, f32, Vec<String>)],
+    pub rounds: &'a [RoundSummary],
     pub sources_digested: u32,
     pub sources_cached: u32,
     pub claims_total: u32,
@@ -751,17 +766,17 @@ mod tests {
         )
         .unwrap();
         let cited = BTreeSet::from([1u32]);
-        persist_note(
-            &kref,
-            &note_plan("deepseek", "DeepSeek", Action::Update),
-            "new body [1].",
-            &cited,
-            1,
-            0.9,
-            "2026-09-08",
-            false,
-            &[(1, "S".into(), "https://s".into())],
-        )
+        persist_note(NoteToPersist {
+            kref: &kref,
+            note: &note_plan("deepseek", "DeepSeek", Action::Update),
+            body: "new body [1].",
+            cited: &cited,
+            claim_count: 1,
+            confidence: 0.9,
+            today: "2026-09-08",
+            append: false,
+            sources_meta: &[(1, "S".into(), "https://s".into())],
+        })
         .unwrap();
         let on_disk = std::fs::read_to_string(kref.pages_dir().join("deepseek.md")).unwrap();
         assert!(on_disk.contains("category: vendors"), "{on_disk}");
@@ -956,17 +971,17 @@ mod tests {
         };
         let meta = vec![(1u32, "Src".to_string(), "https://s1".to_string())];
         let cited: BTreeSet<u32> = [1u32].into_iter().collect();
-        let w = persist_note(
-            &kref,
-            &note,
-            "OT is 1.5x [1].",
-            &cited,
-            1,
-            0.9,
-            "2026-09-06",
-            false,
-            &meta,
-        )
+        let w = persist_note(NoteToPersist {
+            kref: &kref,
+            note: &note,
+            body: "OT is 1.5x [1].",
+            cited: &cited,
+            claim_count: 1,
+            confidence: 0.9,
+            today: "2026-09-06",
+            append: false,
+            sources_meta: &meta,
+        })
         .unwrap();
         let raw = std::fs::read_to_string(&w.path).unwrap();
         assert!(raw.contains("type: note"));
@@ -977,17 +992,17 @@ mod tests {
             action: Action::Update,
             ..note.clone()
         };
-        persist_note(
-            &kref,
-            &upd,
-            "New fact [1].",
-            &cited,
-            1,
-            0.9,
-            "2026-09-07",
-            true,
-            &meta,
-        )
+        persist_note(NoteToPersist {
+            kref: &kref,
+            note: &upd,
+            body: "New fact [1].",
+            cited: &cited,
+            claim_count: 1,
+            confidence: 0.9,
+            today: "2026-09-07",
+            append: true,
+            sources_meta: &meta,
+        })
         .unwrap();
         let raw = std::fs::read_to_string(&w.path).unwrap();
         assert!(raw.contains("## Update 2026-09-07"));

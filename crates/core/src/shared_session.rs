@@ -382,7 +382,7 @@ pub enum ViewEvent {
     /// envelope carrying the current `busy_meta()` so the workspace
     /// UI's running chip + the cloud-dashboard pill can update
     /// without polling. Fired at user-facing turn boundaries (start
-    /// + end). Side-channel turns (auto-learn ingest/reconcile) do
+    /// \+ end). Side-channel turns (auto-learn ingest/reconcile) do
     /// not fire this — they don't change the surface meta.
     BusyChanged(Option<crate::agent_activity::BusyMeta>),
     HistoryReplaced(Vec<DisplayMessage>),
@@ -519,7 +519,7 @@ pub enum ViewEvent {
     /// resolver formats them so the worker doesn't repeat the prose:
     ///   - "[model → claude-sonnet-4-6 (skill: namecard-to-excel)]"
     ///   - "[skill 'namecard-to-excel' recommends claude-sonnet-4-6
-    ///      (vision); using current gemini-2.5-flash]"
+    ///     (vision); using current gemini-2.5-flash]"
     ///   - "[model → gemini-2.5-flash (skill ended)]"
     SkillModelNote(String),
     /// Permission mode changed (M2). Carried to the sidebar so the
@@ -892,7 +892,7 @@ pub struct WorkerState {
     pub line_pre_approver: Option<std::sync::Arc<dyn crate::permissions::ApprovalSink>>,
     /// dev-plan/29 Tier 1: active Telegram-bridge session. `Some` only
     /// while the polling task is running; `telegram_disconnect` cancels
-    /// + clears it. Mirrors `line_session`. Running LINE and Telegram
+    /// \+ clears it. Mirrors `line_session`. Running LINE and Telegram
     /// simultaneously isn't a Tier 1 goal — last-connect wins the
     /// approver routing.
     pub telegram_session: Option<crate::telegram::TelegramSessionHandle>,
@@ -1206,18 +1206,18 @@ pub fn spawn_with_roots(
     std::thread::spawn(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-            rt.block_on(run_worker(
+            rt.block_on(run_worker(WorkerContext {
                 input_rx,
-                input_tx_for_poller,
-                events_tx_for_thread.clone(),
-                cancel_for_thread,
+                input_tx_self: input_tx_for_poller,
+                events_tx: events_tx_for_thread.clone(),
+                cancel: cancel_for_thread,
                 approver,
-                gate_for_thread,
-                injection_queue_for_worker,
-                workflow_approver_for_worker,
-                session_roots_for_worker,
-                browser_mcp_for_worker,
-            ));
+                ready_gate: gate_for_thread,
+                injection_queue: injection_queue_for_worker,
+                workflow_approver: workflow_approver_for_worker,
+                session_roots: session_roots_for_worker,
+                browser_mcp: browser_mcp_for_worker,
+            }));
         }));
         if let Err(payload) = result {
             let msg = if let Some(s) = payload.downcast_ref::<&str>() {
@@ -1379,7 +1379,7 @@ fn messenger_disconnected_payload() -> serde_json::Value {
     })
 }
 
-async fn run_worker(
+struct WorkerContext {
     input_rx: mpsc::Receiver<ShellInput>,
     input_tx_self: mpsc::Sender<ShellInput>,
     events_tx: broadcast::Sender<ViewEvent>,
@@ -1390,7 +1390,21 @@ async fn run_worker(
     workflow_approver: std::sync::Arc<crate::workflow::WorkflowApprover>,
     session_roots: Option<crate::multi_tenant::SessionRoots>,
     browser_mcp: std::sync::Arc<std::sync::RwLock<Option<std::sync::Arc<crate::mcp::McpClient>>>>,
-) {
+}
+
+async fn run_worker(context: WorkerContext) {
+    let WorkerContext {
+        input_rx,
+        input_tx_self,
+        events_tx,
+        cancel,
+        approver,
+        ready_gate,
+        injection_queue,
+        workflow_approver,
+        session_roots,
+        browser_mcp,
+    } = context;
     // dev-plan/42: when this worker belongs to a per-user workspace
     // (multiuser `--serve`), its working directory is that user's
     // `workspace-<id>/`, not the process cwd. Falls back to process cwd

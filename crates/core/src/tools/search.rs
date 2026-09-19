@@ -104,7 +104,7 @@ impl WebSearchTool {
     }
 
     /// Resolve the ordered list of backends to try, based on `self.engine`
-    /// + env-var presence. Index 0 is tried first; later entries are
+    /// \+ env-var presence. Index 0 is tried first; later entries are
     /// runtime fallback candidates. Always non-empty in practice — DDG
     /// is the universal floor for any non-`"duckduckgo"`-pinned config.
     ///

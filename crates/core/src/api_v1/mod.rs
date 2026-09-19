@@ -129,14 +129,15 @@ impl<S: Send + Sync> FromRequestParts<S> for AuthOk {
 /// same token policy — Tier 1 of job-artifacts: `THCLAWS_SYNC_REQUIRE_AUTH=1`
 /// wraps `/workspace/sync/*` with this so an external orchestrator can use
 /// export/push holding only the API token, no tunnel/ForwardAuth needed.
-pub fn check_bearer_headers(headers: &axum::http::HeaderMap) -> Result<(), Response> {
+pub fn check_bearer_headers(headers: &axum::http::HeaderMap) -> Result<(), Box<Response>> {
     let expected = match auth_token() {
         AuthMode::Disabled => {
             return Err((
                 StatusCode::UNAUTHORIZED,
                 "sync auth required but THCLAWS_API_TOKEN is unset",
             )
-                .into_response());
+                .into_response()
+                .into());
         }
         AuthMode::Bypass => return Ok(()),
         AuthMode::Token(t) => t,
@@ -153,7 +154,8 @@ pub fn check_bearer_headers(headers: &axum::http::HeaderMap) -> Result<(), Respo
             StatusCode::UNAUTHORIZED,
             Json(errors::OpenAiError::invalid_api_key()),
         )
-            .into_response())
+            .into_response()
+            .into())
     }
 }
 

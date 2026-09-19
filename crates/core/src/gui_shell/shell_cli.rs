@@ -53,21 +53,16 @@ pub fn shell_new(template: &str, dest: &Path, force: bool) -> Result<Vec<PathBuf
     }
 
     let mut written: Vec<PathBuf> = Vec::new();
-    extract_dir(tpl, dest, dest, &mut written)?;
+    extract_dir(tpl, dest, &mut written)?;
     Ok(written)
 }
 
-fn extract_dir(
-    src: &Dir<'_>,
-    root: &Path,
-    out: &Path,
-    written: &mut Vec<PathBuf>,
-) -> Result<(), String> {
+fn extract_dir(src: &Dir<'_>, out: &Path, written: &mut Vec<PathBuf>) -> Result<(), String> {
     for sub in src.dirs() {
         let rel = sub.path().strip_prefix(src.path()).unwrap_or(sub.path());
         let dst = out.join(rel);
         fs::create_dir_all(&dst).map_err(|e| format!("create {}: {e}", dst.display()))?;
-        extract_dir(sub, root, &dst, written)?;
+        extract_dir(sub, &dst, written)?;
     }
     for f in src.files() {
         let rel = f

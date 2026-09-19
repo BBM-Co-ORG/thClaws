@@ -450,6 +450,17 @@ pub fn strip_sources_section(body: &str) -> String {
     }
 }
 
+pub struct ResearchPage<'a> {
+    pub kms_name: &'a str,
+    pub page_slug: &'a str,
+    pub page_title: &'a str,
+    pub page_topic: &'a str,
+    pub query: &'a str,
+    pub today: &'a str,
+    pub body: &'a str,
+    pub verification_score: Option<f32>,
+}
+
 /// M6.39.11: write one page from a multi-page research run.
 /// Filename is just `<page-slug>.md` — frontmatter (date, run query,
 /// topic) carries the metadata, so the long
@@ -461,16 +472,17 @@ pub fn strip_sources_section(body: &str) -> String {
 ///
 /// Frontmatter discriminator `type: research-page` (sibling of
 /// `type: research` for the legacy single-page output).
-pub fn write_research_page(
-    kms_name: &str,
-    page_slug: &str,
-    page_title: &str,
-    page_topic: &str,
-    query: &str,
-    today: &str,
-    body: &str,
-    verification_score: Option<f32>,
-) -> Result<std::path::PathBuf> {
+pub fn write_research_page(context: ResearchPage<'_>) -> Result<std::path::PathBuf> {
+    let ResearchPage {
+        kms_name,
+        page_slug,
+        page_title,
+        page_topic,
+        query,
+        today,
+        body,
+        verification_score,
+    } = context;
     let kref = resolve_or_create_kms(kms_name)?;
     // `verified: <today>` is stamped on every research page so the
     // KmsRead staleness check has a baseline. `verification_score`
@@ -964,16 +976,16 @@ mod tests {
         // M6.39.11: filename is just `<slug>.md`, no run prefix.
         let _g = scoped_home();
         let _ = crate::kms::create("multi-page-test", crate::kms::KmsScope::Project).unwrap();
-        let path = write_research_page(
-            "multi-page-test",
-            "karpathy",
-            "Andrej Karpathy",
-            "Karpathy's role as proponent",
-            "what is OBON",
-            "2026-05-09",
-            "Andrej Karpathy is a researcher [1].\n\n## Background\n\nMore here.",
-            Some(0.95),
-        )
+        let path = write_research_page(ResearchPage {
+            kms_name: "multi-page-test",
+            page_slug: "karpathy",
+            page_title: "Andrej Karpathy",
+            page_topic: "Karpathy's role as proponent",
+            query: "what is OBON",
+            today: "2026-05-09",
+            body: "Andrej Karpathy is a researcher [1].\n\n## Background\n\nMore here.",
+            verification_score: Some(0.95),
+        })
         .unwrap();
         assert!(
             path.to_str().unwrap().ends_with("/karpathy.md"),

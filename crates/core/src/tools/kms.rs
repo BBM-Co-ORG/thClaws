@@ -676,7 +676,7 @@ pub fn run_slash_search(name: &str, query: &str, is_pattern: bool) -> String {
     for (idx, kref) in kmses.iter().enumerate() {
         if multi {
             if idx > 0 {
-                out.push_str("\n");
+                out.push('\n');
             }
             out.push_str(&format!("── KMS: {} ──\n", kref.name));
         }

@@ -66,7 +66,7 @@ fn ext_for(abs_url: &str, content_type: Option<&str>) -> String {
     }
     // Fall back to the URL path's extension.
     if let Ok(u) = url::Url::parse(abs_url) {
-        if let Some(seg) = u.path_segments().and_then(|s| s.last()) {
+        if let Some(seg) = u.path_segments().and_then(|mut s| s.next_back()) {
             if let Some((_, ext)) = seg.rsplit_once('.') {
                 let ext = ext.to_ascii_lowercase();
                 if !ext.is_empty()
@@ -342,7 +342,7 @@ impl Tool for FetchImagesTool {
             idx += 1;
             let stem = abs
                 .path_segments()
-                .and_then(|s| s.last())
+                .and_then(|mut s| s.next_back())
                 .and_then(|seg| seg.rsplit_once('.').map(|(a, _)| a).or(Some(seg)))
                 .unwrap_or("");
             let name_hint = slugify(stem, &format!("image-{idx}"));

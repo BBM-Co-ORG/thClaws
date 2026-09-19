@@ -369,10 +369,7 @@ async fn run() -> Result<String, String> {
                 // so merge_discovered doesn't skip rows for "no context".
                 // 262144 covers most current cloud models; specific rows
                 // can be hand-bumped later (e.g. deepseek-v4-flash at 1M).
-                let pc = cat
-                    .providers
-                    .entry("ollama-cloud".into())
-                    .or_insert_with(ProviderCatalogue::default);
+                let pc = cat.providers.entry("ollama-cloud".into()).or_default();
                 if pc.default_context.is_none() {
                     pc.default_context = Some(262144);
                 }
@@ -402,10 +399,7 @@ async fn run() -> Result<String, String> {
     if let Ok(key) = std::env::var("DEEPSEEK_API_KEY") {
         match fetch_deepseek(&key).await {
             Ok(ids) => {
-                let pc = cat
-                    .providers
-                    .entry("deepseek".into())
-                    .or_insert_with(ProviderCatalogue::default);
+                let pc = cat.providers.entry("deepseek".into()).or_default();
                 if pc.default_context.is_none() {
                     pc.default_context = Some(131072);
                 }
@@ -437,10 +431,7 @@ async fn run() -> Result<String, String> {
             Ok(ids) => {
                 let prefixed: Vec<String> =
                     ids.into_iter().map(|id| format!("thaillm/{id}")).collect();
-                let pc = cat
-                    .providers
-                    .entry("thaillm".into())
-                    .or_insert_with(ProviderCatalogue::default);
+                let pc = cat.providers.entry("thaillm".into()).or_default();
                 if pc.default_context.is_none() {
                     pc.default_context = Some(131072);
                 }
@@ -478,10 +469,7 @@ async fn run() -> Result<String, String> {
             Ok(ids) => {
                 let prefixed: Vec<String> =
                     ids.into_iter().map(|id| format!("nvidia/{id}")).collect();
-                let pc = cat
-                    .providers
-                    .entry("nvidia".into())
-                    .or_insert_with(ProviderCatalogue::default);
+                let pc = cat.providers.entry("nvidia".into()).or_default();
                 if pc.default_context.is_none() {
                     pc.default_context = Some(131072);
                 }
@@ -515,10 +503,7 @@ async fn run() -> Result<String, String> {
             Ok(ids) => {
                 let prefixed: Vec<String> =
                     ids.into_iter().map(|id| format!("minimax/{id}")).collect();
-                let pc = cat
-                    .providers
-                    .entry("minimax".into())
-                    .or_insert_with(ProviderCatalogue::default);
+                let pc = cat.providers.entry("minimax".into()).or_default();
                 if pc.default_context.is_none() {
                     pc.default_context = Some(200000);
                 }
@@ -560,10 +545,7 @@ async fn run() -> Result<String, String> {
                     .into_iter()
                     .map(|id| format!("opencode-go/{id}"))
                     .collect();
-                let pc = cat
-                    .providers
-                    .entry("opencode-go".into())
-                    .or_insert_with(ProviderCatalogue::default);
+                let pc = cat.providers.entry("opencode-go".into()).or_default();
                 if pc.default_context.is_none() {
                     pc.default_context = Some(131072);
                 }
@@ -601,10 +583,7 @@ async fn run() -> Result<String, String> {
                     .into_iter()
                     .map(|id| format!("dashscope/{id}"))
                     .collect();
-                let pc = cat
-                    .providers
-                    .entry("dashscope".into())
-                    .or_insert_with(ProviderCatalogue::default);
+                let pc = cat.providers.entry("dashscope".into()).or_default();
                 if pc.default_context.is_none() {
                     pc.default_context = Some(32768);
                 }
@@ -642,10 +621,7 @@ async fn run() -> Result<String, String> {
         match fetch_dashscope(&qwencloud_url, &key).await {
             Ok(ids) => {
                 let prefixed: Vec<String> = ids.into_iter().map(|id| format!("qc/{id}")).collect();
-                let pc = cat
-                    .providers
-                    .entry("qwen-cloud".into())
-                    .or_insert_with(ProviderCatalogue::default);
+                let pc = cat.providers.entry("qwen-cloud".into()).or_default();
                 if pc.default_context.is_none() {
                     pc.default_context = Some(32768);
                 }
@@ -685,10 +661,7 @@ async fn run() -> Result<String, String> {
         })
         .unwrap_or_default();
     if !claude_ids.is_empty() {
-        let agent_pc = cat
-            .providers
-            .entry("anthropic-agent".into())
-            .or_insert_with(ProviderCatalogue::default);
+        let agent_pc = cat.providers.entry("anthropic-agent".into()).or_default();
         if agent_pc.default_context.is_none() {
             agent_pc.default_context = Some(200000);
         }
@@ -878,10 +851,7 @@ fn merge_discovered(
     openrouter_max_output_by_bare: &HashMap<String, u32>,
     today: &str,
 ) -> MergeStats {
-    let pc = cat
-        .providers
-        .entry(provider.into())
-        .or_insert_with(ProviderCatalogue::default);
+    let pc = cat.providers.entry(provider.into()).or_default();
     if pc.list_url.is_none() {
         pc.list_url = Some(list_url.into());
     }

@@ -1983,9 +1983,9 @@ pub async fn ingest_pdf(
     });
     let alias_clean = sanitize_alias(&resolved_alias);
     if alias_clean.is_empty() {
-        return Err(Error::Tool(format!(
-            "alias derived from PDF is empty — pass --alias"
-        )));
+        return Err(Error::Tool(
+            "alias derived from PDF is empty — pass --alias".to_string(),
+        ));
     }
     // Run pdftotext in a blocking task — same shape PdfReadTool uses.
     let pdf_owned = pdf_path.to_path_buf();
@@ -2724,7 +2724,7 @@ pub fn writable_page_path(kref: &KmsRef, page_name: &str) -> Result<PathBuf> {
 /// from every successful page mutation in this module
 /// (write_page / append_to_page / delete_page / rename_page /
 /// merge_into / auto_link). Errors inside the indexer are logged
-/// + swallowed there — the underlying KMS write has already
+/// \+ swallowed there — the underlying KMS write has already
 /// succeeded and shouldn't roll back due to index drift.
 fn fire_index_upsert(kref: &KmsRef, page_stem: &str) {
     #[cfg(feature = "kms_search_index")]
@@ -3537,7 +3537,7 @@ fn extract_source_link_targets(body: &str) -> Vec<String> {
         let target = &rest[..end];
         // Strip optional `.md` suffix and any URL fragment / query.
         let cleaned = target
-            .split(|c| c == '#' || c == '?')
+            .split(['#', '?'])
             .next()
             .unwrap_or(target)
             .trim_end_matches(".md");
@@ -4716,7 +4716,7 @@ fn okf_concept_stem(rel: &Path) -> String {
 /// Recursively collect `.md` concept files under `dir`, skipping
 /// symlinks, reserved files (index.md/log.md/SCHEMA.md at any level),
 /// and the `references/` subtree (handled as sources).
-fn collect_okf_concepts(bundle: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
+fn collect_okf_concepts(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -4730,7 +4730,7 @@ fn collect_okf_concepts(bundle: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
             if path.file_name().and_then(|s| s.to_str()) == Some("references") {
                 continue;
             }
-            collect_okf_concepts(bundle, &path, out);
+            collect_okf_concepts(&path, out);
             continue;
         }
         if !ft.is_file() {
@@ -4784,7 +4784,7 @@ pub fn import_okf(bundle: &Path, name: &str, scope: KmsScope) -> Result<OkfImpor
     // to follow the flattening (a concept at `/tables/x.md` becomes
     // `pages/tables-x.md`, so links to it must too).
     let mut concepts = Vec::new();
-    collect_okf_concepts(bundle, bundle, &mut concepts);
+    collect_okf_concepts(bundle, &mut concepts);
     concepts.sort();
     let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut stem_for: Vec<String> = Vec::with_capacity(concepts.len());
@@ -5028,7 +5028,7 @@ pub fn auto_link(kref: &KmsRef, opts: AutoLinkOptions) -> Result<AutoLinkReport>
     // "PostgreSQL" when both are in the dictionary (avoid the shorter
     // key claiming a substring of the longer one's match).
     let mut candidates: Vec<(String, String)> = dictionary.into_iter().collect();
-    candidates.sort_by(|a, b| b.0.chars().count().cmp(&a.0.chars().count()));
+    candidates.sort_by_key(|b| std::cmp::Reverse(b.0.chars().count()));
 
     // Pre-compile a case-insensitive whole-token regex per candidate.
     // `\b` in the `regex` crate is Unicode-aware, so non-ASCII titles
@@ -5071,6 +5071,7 @@ pub fn auto_link(kref: &KmsRef, opts: AutoLinkOptions) -> Result<AutoLinkReport>
     let mut report = AutoLinkReport::default();
 
     // ── 2. Pass: rewrite each page ────────────────────────────────
+    let restore_re = Regex::new(r"\u{0000}P(\d+)\u{0000}").expect("static regex");
     for (stem, path) in &page_files {
         report.pages_scanned += 1;
         let original = std::fs::read_to_string(path)
@@ -5164,7 +5165,6 @@ pub fn auto_link(kref: &KmsRef, opts: AutoLinkOptions) -> Result<AutoLinkReport>
             }
 
             // Restore protected placeholders.
-            let restore_re = Regex::new(r"\u{0000}P(\d+)\u{0000}").expect("static regex");
             let restored = restore_re.replace_all(&working, |caps: &regex::Captures| {
                 let n: usize = caps[1].parse().unwrap_or(usize::MAX);
                 placeholders

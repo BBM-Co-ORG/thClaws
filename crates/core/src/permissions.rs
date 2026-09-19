@@ -22,11 +22,13 @@ use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum PermissionMode {
     /// Never prompt; every tool call is auto-approved. Matches the pre-Phase-11
     /// behavior. Useful for non-interactive runs and tests.
     Auto,
     /// Prompt on any tool whose `requires_approval` returns true.
+    #[default]
     Ask,
     /// Plan mode (M2+) — read-only exploration. Any tool whose
     /// `requires_approval` returns true is BLOCKED at dispatch with a
@@ -74,12 +76,6 @@ impl PermissionMode {
     /// surfaces a structured tool_result; no approval flow).
     pub fn blocks_mutations(&self) -> bool {
         matches!(self, Self::Plan)
-    }
-}
-
-impl Default for PermissionMode {
-    fn default() -> Self {
-        PermissionMode::Ask
     }
 }
 
@@ -173,8 +169,10 @@ pub fn set_current_mode_and_broadcast(mode: PermissionMode) {
 /// concurrency-aware yet.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Default)]
 pub enum AgentOrigin {
     /// Main agent — the user's primary conversation surface.
+    #[default]
     Main,
     /// Side-channel subagent spawned by the user via `/agent <name>`.
     /// Runs concurrently with the main agent on its own tokio task,
@@ -197,12 +195,6 @@ pub enum AgentOrigin {
         /// `DEFAULT_MAX_DEPTH = 3`).
         depth: usize,
     },
-}
-
-impl Default for AgentOrigin {
-    fn default() -> Self {
-        Self::Main
-    }
 }
 
 #[derive(Debug, Clone)]

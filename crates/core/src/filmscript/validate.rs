@@ -339,9 +339,10 @@ fn validate_shot(
         }
     }
 
-    if shot.match_cut.is_some() {
-        if !shot.used.is_empty() || shot.dialogue.is_some() || shot.continue_from.is_some() {
-            errors.push(CompileError::error(
+    if shot.match_cut.is_some()
+        && (!shot.used.is_empty() || shot.dialogue.is_some() || shot.continue_from.is_some())
+    {
+        errors.push(CompileError::error(
                 "E_MODE_CONFLICT",
                 Some(sid),
                 msg(
@@ -350,7 +351,6 @@ fn validate_shot(
                     &format!("shot {sid}: match_cut uses first-frame mode, which excludes image/audio/video refs — use @continue_from or drop the refs/dialogue"),
                 ),
             ));
-        }
     }
 
     for (target, dir) in [
@@ -478,7 +478,7 @@ fn check_camera(camera: &str, sid: &str, thai: bool, errors: &mut Vec<CompileErr
     let words: Vec<&str> = lower
         .split(|c: char| !c.is_ascii_alphanumeric() && c != '-')
         .collect();
-    if words.iter().any(|w| *w == "fast") {
+    if words.contains(&"fast") {
         errors.push(CompileError::error(
             "E_FAST_TOKEN",
             Some(sid),

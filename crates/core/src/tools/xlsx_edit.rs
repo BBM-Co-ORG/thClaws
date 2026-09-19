@@ -106,10 +106,7 @@ impl Tool for XlsxEditTool {
                         "set_cell needs either `value` or `formula`".into(),
                     ));
                 }
-                let format = input
-                    .get("format")
-                    .map(|f| parse_cell_format(f))
-                    .transpose()?;
+                let format = input.get("format").map(parse_cell_format).transpose()?;
                 Edit::SetCell {
                     cell: req_str(&input, "cell")?.to_string(),
                     value: value.unwrap_or(Value::Null),

@@ -284,7 +284,7 @@ async fn extract_tar(body: &Bytes, dest: &Path) -> std::io::Result<ExtractStats>
     let dest = dest.to_path_buf();
     tokio::task::spawn_blocking(move || extract_tar_blocking(body.as_ref(), &dest))
         .await
-        .unwrap_or_else(|e| Err(std::io::Error::new(std::io::ErrorKind::Other, e)))
+        .unwrap_or_else(|e| Err(std::io::Error::other(e)))
 }
 
 fn extract_tar_blocking(body: &[u8], dest: &Path) -> std::io::Result<ExtractStats> {
@@ -401,7 +401,7 @@ async fn seed_scratch_from_live(live: &Path, scratch: &Path) -> std::io::Result<
         copy_dir_contents(&live, &scratch)
     })
     .await
-    .unwrap_or_else(|e| Err(std::io::Error::new(std::io::ErrorKind::Other, e)))
+    .unwrap_or_else(|e| Err(std::io::Error::other(e)))
 }
 
 /// Atomically commit `scratch` into `live`. Old live moves to `prev`
@@ -419,7 +419,7 @@ async fn swap_dir(scratch: &Path, live: &Path, prev: &Path) -> std::io::Result<(
         Ok(())
     })
     .await
-    .unwrap_or_else(|e| Err(std::io::Error::new(std::io::ErrorKind::Other, e)))
+    .unwrap_or_else(|e| Err(std::io::Error::other(e)))
 }
 
 /// Copy every entry under `src` into `dst`. `dst` must exist.
@@ -459,10 +459,8 @@ fn prune_prev_dirs(workspace: &Path, max_age_secs: u64) -> std::io::Result<usize
             .and_then(|t| now.duration_since(t).ok())
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        if age >= max_age_secs {
-            if std::fs::remove_dir_all(&path).is_ok() {
-                pruned += 1;
-            }
+        if age >= max_age_secs && std::fs::remove_dir_all(&path).is_ok() {
+            pruned += 1;
         }
     }
     Ok(pruned)

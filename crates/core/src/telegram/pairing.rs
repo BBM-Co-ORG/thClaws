@@ -126,7 +126,7 @@ impl PairingManager {
         let mut guard = self.pending.lock().expect("pairing mutex");
         guard.retain(|_, p| !is_expired(p.minted_at, now, self.expiry));
         let mut list: Vec<PendingPair> = guard.values().cloned().collect();
-        list.sort_by(|a, b| a.minted_at.cmp(&b.minted_at));
+        list.sort_by_key(|a| a.minted_at);
         list
     }
 

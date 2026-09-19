@@ -1223,7 +1223,7 @@ impl ThinkingLevel {
             // than no word — the usage line offers `<tokens>` for people who
             // want more, and never advertised `max` in the first place.
             "3" | "high" => Some(Some(Self::HIGH_BUDGET)),
-            _ => t.parse::<u32>().ok().filter(|n| *n >= 100).map(|n| Some(n)),
+            _ => t.parse::<u32>().ok().filter(|n| *n >= 100).map(Some),
         }
     }
 
@@ -1321,7 +1321,7 @@ pub struct StreamRequest {
 pub const LONG_RUNNING_STREAM_CHUNK_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(900);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Usage {
     pub input_tokens: u32,
     pub output_tokens: u32,
@@ -1336,18 +1336,6 @@ pub struct Usage {
     /// as `None`. `Some(0)` ⇒ provider explicitly reported zero
     /// reasoning tokens (distinct from "didn't report").
     pub reasoning_output_tokens: Option<u32>,
-}
-
-impl Default for Usage {
-    fn default() -> Self {
-        Self {
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_creation_input_tokens: None,
-            cache_read_input_tokens: None,
-            reasoning_output_tokens: None,
-        }
-    }
 }
 
 impl Usage {
@@ -1985,6 +1973,9 @@ pub fn preferred_default_model(cfg: &crate::config::AppConfig) -> Option<String>
 }
 
 #[cfg(test)]
+pub(crate) mod test_support;
+
+#[cfg(test)]
 mod tests {
 
     /// Issue #215: the picker listed every provider kind fully populated from
@@ -1997,7 +1988,7 @@ mod tests {
     /// stays in.
     #[test]
     fn the_picker_lists_only_providers_the_user_can_reach() {
-        let _g = crate::kms::test_env_lock();
+        let _g = super::test_support::CredentialEnv::new();
         let cfg = crate::config::AppConfig::default();
 
         let key_var = ProviderKind::Anthropic
@@ -2046,7 +2037,7 @@ mod tests {
     /// the box they actually configured.
     #[test]
     fn endpoint_hint_names_the_configured_url() {
-        let _g = crate::kms::test_env_lock();
+        let _g = super::test_support::CredentialEnv::new();
         std::env::remove_var("OPENAI_COMPAT_BASE_URL");
         let d = super::endpoint_hint(ProviderKind::OpenAICompat);
         assert!(d.contains("localhost:8000"), "default shown: {d}");
@@ -2069,6 +2060,7 @@ mod tests {
     // so a regression that drops the filter would resurface `codex/` here.
     #[tokio::test]
     async fn picker_hides_codex_openai_responses_models() {
+        let _env = super::test_support::CredentialEnv::new();
         let payload = build_all_models_payload().await;
         assert!(
             !payload.contains("codex/gpt-5"),
@@ -2112,7 +2104,7 @@ mod tests {
         // Share the one lock with the other tests that mutate
         // THCLAWS_GATEWAY_API_KEY / provider-key env vars — distinct mutexes
         // would let them race and intermittently clear each other's state.
-        let _guard = PREF_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = super::test_support::CredentialEnv::new();
         let mut cfg = crate::config::AppConfig::default();
         // Detects as Gemini; segment "google" is the gateway key.
         cfg.model = "gemini-2.5-flash".to_string();
@@ -2532,7 +2524,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let _guard = crate::kms::test_env_lock();
+        let _guard = super::test_support::CredentialEnv::new();
         let saved = std::env::var("LITELLM_BASE_URL").ok();
         std::env::set_var("LITELLM_BASE_URL", format!("{}/v1", server.uri()));
         let ids = live_model_ids(ProviderKind::LiteLlm, 5000).await;
@@ -2551,7 +2543,7 @@ mod tests {
     /// would otherwise render a provider as having no models at all.
     #[tokio::test]
     async fn live_model_ids_is_none_when_endpoint_is_down() {
-        let _guard = crate::kms::test_env_lock();
+        let _guard = super::test_support::CredentialEnv::new();
         let saved = std::env::var("LITELLM_BASE_URL").ok();
         // Reserved-for-documentation address: nothing listens, connect fails.
         std::env::set_var("LITELLM_BASE_URL", "http://127.0.0.1:1/v1");
@@ -2612,7 +2604,7 @@ mod tests {
         )
         .expect("write cache");
 
-        let _guard = crate::kms::test_env_lock();
+        let _guard = super::test_support::CredentialEnv::new();
         let saved_xdg = std::env::var("XDG_CONFIG_HOME").ok();
         let saved_base = std::env::var("LITELLM_BASE_URL").ok();
         std::env::set_var("XDG_CONFIG_HOME", home.path());
@@ -2702,10 +2694,6 @@ mod tests {
             "self-hosted — never metered through the thClaws gateway"
         );
     }
-
-    // Serialises the env-var mutation in `preferred_default_model_*`
-    // tests (api-key + gateway-key vars are process-global).
-    static PREF_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn tier_classifies_featured_vs_additional() {
@@ -2852,7 +2840,7 @@ mod tests {
 
     #[test]
     fn preferred_default_model_follows_deepseek_dashscope_openai_anthropic_order() {
-        let _guard = PREF_ENV_LOCK.lock().unwrap();
+        let _guard = super::test_support::CredentialEnv::new();
         // Isolate from any real provider keys in the host env so only the
         // gateway route under test decides the pick.
         for v in [

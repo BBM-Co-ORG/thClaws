@@ -1149,8 +1149,8 @@ impl Agent {
         let provider = self.provider.clone();
         // Cache for a cross-provider skill swap, so the provider is built
         // once per turn rather than per iteration.
-        let swapped_provider: Arc<Mutex<Option<(String, Arc<dyn Provider>)>>> =
-            Arc::new(Mutex::new(None));
+        type ProviderSwap = Option<(String, Arc<dyn Provider>)>;
+        let swapped_provider: Arc<Mutex<ProviderSwap>> = Arc::new(Mutex::new(None));
         let tools = self.tools.clone();
         let model = self.model.clone();
         let model_override = self.model_override.clone();
@@ -1377,10 +1377,9 @@ impl Agent {
                 // run_turn carries through every retry/iteration of
                 // the same turn. Cleared in the end-of-run_turn cleanup
                 // (alongside `model_override`).
-                let chunk_timeout_override = next_turn_chunk_timeout
+                let chunk_timeout_override = *next_turn_chunk_timeout
                     .lock()
-                    .expect("next_turn_chunk_timeout lock")
-                    .clone();
+                    .expect("next_turn_chunk_timeout lock");
                 // Cap the requested max_tokens against the model's
                 // documented `max_output` so we don't hit per-model 400s
                 // (e.g. gpt-4o = 16384, gpt-4-turbo = 4096). Pre-fix the
@@ -1955,7 +1954,7 @@ impl Agent {
                     // is a weaker claim than "the call does not run".
                     if !crate::policy::tool_allowed(name) {
                         crate::audit::record_denied(
-                            &id,
+                            id,
                             tool.as_ref(),
                             input,
                             "policy",
@@ -2082,11 +2081,11 @@ impl Agent {
                             // tool-level rejections); only the explicit
                             // approver Deny lands here.
                             if let Some(h) = &hooks {
-                                crate::hooks::fire_permission_denied(h, &name);
+                                crate::hooks::fire_permission_denied(h, name);
                             }
                             let denied = format!("denied by user: {name}");
                             crate::audit::record_denied(
-                                &id, tool.as_ref(), input, approver.audit_kind(), &denied,
+                                id, tool.as_ref(), input, approver.audit_kind(), &denied,
                             );
                             result_blocks.push(ContentBlock::ToolResult {
                                 tool_use_id: id.clone(),
@@ -2110,7 +2109,7 @@ impl Agent {
                     let hook_denied: Option<String> = if let Some(h) = &hooks {
                         let input_str = serde_json::to_string(input)
                             .unwrap_or_else(|_| "<unserializable>".to_string());
-                        match crate::hooks::fire_pre_tool_use_gate(h, &name, &input_str).await {
+                        match crate::hooks::fire_pre_tool_use_gate(h, name, &input_str).await {
                             crate::hooks::PreToolDecision::Deny(reason) => Some(reason),
                             crate::hooks::PreToolDecision::Allow => None,
                         }
@@ -2163,10 +2162,10 @@ impl Agent {
                     };
                     match &hook_denied {
                         Some(reason) => {
-                            crate::audit::record_denied(&id, tool.as_ref(), input, "hook", reason)
+                            crate::audit::record_denied(id, tool.as_ref(), input, "hook", reason)
                         }
                         None => crate::audit::record_tool_call(crate::audit::ToolCall {
-                            tool_use_id: &id,
+                            tool_use_id: id,
                             tool: tool.as_ref(),
                             input,
                             decision: audit_decision.0,
@@ -2188,7 +2187,7 @@ impl Agent {
                             crate::types::ToolResultContent::Text(s) => s.clone(),
                             crate::types::ToolResultContent::Blocks(_) => "<multimodal>".to_string(),
                         };
-                        crate::hooks::fire_post_tool_use(h, &name, &preview, is_error);
+                        crate::hooks::fire_post_tool_use(h, name, &preview, is_error);
                     }
                     result_blocks.push(ContentBlock::ToolResult {
                         tool_use_id: id.clone(),
@@ -2202,7 +2201,7 @@ impl Agent {
                     // errored tool call doesn't produce a widget. The
                     // fetch is best-effort — if it fails the user
                     // still sees the text result.
-                    let ui_resource = if matches!(tool_result, Ok(_)) {
+                    let ui_resource = if tool_result.is_ok() {
                         tool.fetch_ui_resource().await
                     } else {
                         None
@@ -2470,7 +2469,7 @@ fn drop_images_in_message(msg: &mut Message) {
 /// shrink every image toward `FIT_LONG_EDGE` / JPEG; (2) if still over budget
 /// (pathologically many images), evict the oldest image blocks — keeping the
 /// most recent ones the model is actively working with.
-fn fit_image_payload_to(messages: &mut Vec<Message>, budget: usize) {
+fn fit_image_payload_to(messages: &mut [Message], budget: usize) {
     use crate::types::{ContentBlock, ImageSource, ToolResultBlock, ToolResultContent};
     if outgoing_image_b64_bytes(messages) <= budget {
         return;
@@ -2520,11 +2519,11 @@ fn fit_image_payload_to(messages: &mut Vec<Message>, budget: usize) {
 
 /// Bound the outgoing image payload to the gateway body cap. See
 /// [`fit_image_payload_to`].
-fn fit_outgoing_image_payload(messages: &mut Vec<Message>) {
+fn fit_outgoing_image_payload(messages: &mut [Message]) {
     fit_image_payload_to(messages, OUTGOING_IMAGE_BUDGET_BYTES);
 }
 
-fn redact_consumed_images_from_history(history: &mut Vec<Message>) {
+fn redact_consumed_images_from_history(history: &mut [Message]) {
     use crate::types::{ContentBlock, ImageSource, Role, ToolResultBlock, ToolResultContent};
     for msg in history.iter_mut() {
         if msg.role != Role::User {

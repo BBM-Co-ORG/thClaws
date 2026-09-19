@@ -104,7 +104,7 @@ struct PreviewState {
 
 /// Edits one Telegram message in place as a turn streams, then swaps in
 /// the final reply. Created by the session sink (which has the chat/topic
-/// + client), handed to the handler as a [`PreviewSink`], and finalised
+/// \+ client), handed to the handler as a [`PreviewSink`], and finalised
 /// by the sink via [`TelegramPreview::finish`].
 pub struct TelegramPreview {
     client: Arc<TelegramClient>,

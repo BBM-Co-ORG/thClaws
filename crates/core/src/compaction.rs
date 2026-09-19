@@ -249,7 +249,7 @@ pub async fn compact_with_summary(
     }
 
     // Keep at least the last 4 messages (2 user-assistant turns).
-    let keep_recent = messages.len().min(4).max(1);
+    let keep_recent = messages.len().clamp(1, 4);
     let split_at = messages.len().saturating_sub(keep_recent);
     if split_at == 0 {
         return compact(messages, budget_tokens);
@@ -386,7 +386,7 @@ fn render_for_summary(messages: &[Message]) -> String {
 /// Returns the approximate number of bytes saved across all rewritten
 /// `ToolResult` blocks — useful for the worker's `[compacted: …]`
 /// debug notice.
-pub fn compact_for_step_boundary(messages: &mut Vec<Message>) -> usize {
+pub fn compact_for_step_boundary(messages: &mut [Message]) -> usize {
     // Find the most recent boundary marker: a User-role message whose
     // first text block starts with one of the driver's per-step
     // prompt prefixes. Anything BEFORE this index is "completed

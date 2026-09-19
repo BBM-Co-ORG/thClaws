@@ -229,7 +229,7 @@ fn collect_model_capabilities(config: &crate::config::AppConfig) -> ModelCapabil
     let mut seen = std::collections::HashSet::new();
     let layers = [cat.cache.as_ref(), Some(&cat.baseline)];
     for layer in layers.into_iter().flatten() {
-        for (_provider, provider_cat) in &layer.providers {
+        for provider_cat in layer.providers.values() {
             for (model_id, entry) in &provider_cat.models {
                 if entry.chat == Some(false) {
                     continue;

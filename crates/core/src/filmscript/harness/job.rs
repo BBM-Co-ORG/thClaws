@@ -95,7 +95,8 @@ impl JobState {
 /// In-process active-job registry — "running" in job.json alone may be
 /// a stale artifact of a killed process; this is the live truth.
 fn active() -> &'static Mutex<Option<(String, Arc<AtomicBool>)>> {
-    static ACTIVE: OnceLock<Mutex<Option<(String, Arc<AtomicBool>)>>> = OnceLock::new();
+    type ActiveJob = Option<(String, Arc<AtomicBool>)>;
+    static ACTIVE: OnceLock<Mutex<ActiveJob>> = OnceLock::new();
     ACTIVE.get_or_init(|| Mutex::new(None))
 }
 

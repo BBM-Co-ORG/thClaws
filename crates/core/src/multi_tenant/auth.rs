@@ -269,7 +269,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// Decode lowercase hex to bytes. Returns `None` on any non-hex
 /// character or odd length.
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     let mut out = Vec::with_capacity(s.len() / 2);

@@ -610,7 +610,7 @@ pub async fn dispatch(
                     || id.is_empty()
                 {
                     store.list().ok().and_then(|mut list| {
-                        list.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+                        list.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
                         list.into_iter().next().map(|m| m.id)
                     })
                 } else {
@@ -641,7 +641,7 @@ pub async fn dispatch(
         SlashCommand::Sessions => match &state.session_store {
             Some(store) => match store.list() {
                 Ok(mut list) => {
-                    list.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+                    list.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
                     if list.is_empty() {
                         emit(events_tx, "(no saved sessions)".into());
                     } else {
@@ -923,7 +923,6 @@ pub async fn dispatch(
             // direct exec() from this thread would restore the last size saved
             // on a normal close instead of the current one.
             let _ = events_tx.send(ViewEvent::ReloadRequested);
-            return;
         }
         SlashCommand::Fork => {
             // Flush the current session to disk so the archive reflects
@@ -1401,16 +1400,16 @@ pub async fn dispatch(
                 }
             };
             let _ = all;
-            match crate::research::start_refresh(
-                kms.clone(),
+            match crate::research::start_refresh(crate::research::RefreshRequest {
+                kms: kms.clone(),
                 slugs,
-                older_than_days.unwrap_or(30),
-                cfg,
+                older_than_days: older_than_days.unwrap_or(30),
+                base: cfg,
                 provider,
-                state.config.model.clone(),
+                model: state.config.model.clone(),
                 digest_provider,
-                None,
-            )
+                tools: None,
+            })
             .await
             {
                 Ok(ids) => {
@@ -3030,17 +3029,15 @@ pub async fn dispatch(
                 .iter()
                 .rev()
                 .find(|m| matches!(m.role, crate::types::Role::Assistant))
-                .and_then(|m| {
-                    Some(
-                        m.content
-                            .iter()
-                            .filter_map(|b| match b {
-                                crate::types::ContentBlock::Text { text } => Some(text.as_str()),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n\n"),
-                    )
+                .map(|m| {
+                    m.content
+                        .iter()
+                        .filter_map(|b| match b {
+                            crate::types::ContentBlock::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n\n")
                 });
             let Some(answer_text) = answer.filter(|s| !s.trim().is_empty()) else {
                 emit(
@@ -4028,7 +4025,6 @@ pub async fn dispatch(
                                     "[reload] re-exec failed: {err} — run /reload to activate the agent"
                                 )));
                             });
-                            return;
                         }
                     }
                     CloudSlash::Publish => {
@@ -5419,7 +5415,7 @@ async fn persist_and_register_mcp(
 }
 
 /// M6.16 BUG H1 helper: refresh skill_store + rebuild system prompt
-/// + rebuild agent so plugin contributions stop / start being callable
+/// \+ rebuild agent so plugin contributions stop / start being callable
 /// in this session without a restart. Mirrors the install path's
 /// refresh block; called from PluginRemove / PluginEnable / PluginDisable.
 /// MCP subprocess teardown is NOT handled here — the live tool registry

@@ -242,11 +242,13 @@ pub struct StartFlags {
 
 impl JobConfig {
     pub fn from_flags(f: StartFlags) -> Self {
-        let mut cfg = Self::default();
-        cfg.kms_target = match f.kms_target.as_deref().map(str::trim) {
-            Some("new") | Some("-") => None,
-            Some(name) if !name.is_empty() => Some(name.to_string()),
-            _ => f.attached_kms.last().cloned(),
+        let mut cfg = Self {
+            kms_target: match f.kms_target.as_deref().map(str::trim) {
+                Some("new") | Some("-") => None,
+                Some(name) if !name.is_empty() => Some(name.to_string()),
+                _ => f.attached_kms.last().cloned(),
+            },
+            ..Self::default()
         };
         if let Some(v) = f.min_iter {
             cfg.min_iter = v;
@@ -325,6 +327,8 @@ impl JobView {
     }
 }
 
+type JobBroadcaster = Box<dyn Fn(&[JobView]) + Send + Sync>;
+
 /// Thread-safe registry of running + recently-completed jobs.
 ///
 /// Ownership: process-wide singleton, accessed via [`manager`]. Same
@@ -339,7 +343,7 @@ pub struct ResearchManager {
     /// `build_research_update_payload()` produces. CLI uses are no-op
     /// (broadcaster unset) — phases are visible via `/research list`
     /// and the auto-print on next REPL prompt.
-    broadcaster: Mutex<Option<Box<dyn Fn(&[JobView]) + Send + Sync>>>,
+    broadcaster: Mutex<Option<JobBroadcaster>>,
 }
 
 #[derive(Debug)]
@@ -395,7 +399,6 @@ impl ResearchManager {
                 .split('-')
                 .next()
                 .unwrap_or("anon")
-                .to_string()
         );
         let cancel = CancelToken::new();
         let inner = JobInner {
@@ -527,7 +530,7 @@ impl ResearchManager {
             .values()
             .map(|j| j.read().unwrap().view.clone())
             .collect();
-        all.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        all.sort_by_key(|b| std::cmp::Reverse(b.started_at));
         all
     }
 
@@ -596,16 +599,16 @@ pub async fn start(
     let (id, cancel) = manager().register(query.clone(), &config);
     let id_for_task = id.clone();
     tokio::spawn(async move {
-        run_job(
-            id_for_task,
+        run_job(JobRun {
+            id: id_for_task,
             cancel,
             query,
             config,
             provider,
             model,
             digest_provider,
-            None,
-        )
+            tools: None,
+        })
         .await;
     });
     Ok(id)
@@ -636,23 +639,22 @@ pub async fn start_ingest(
     let (id, cancel) = manager().register(title.clone(), &cfg);
     let id_for_task = id.clone();
     tokio::spawn(async move {
-        run_job(
-            id_for_task,
+        run_job(JobRun {
+            id: id_for_task,
             cancel,
-            title,
-            cfg,
+            query: title,
+            config: cfg,
             provider,
             model,
             digest_provider,
-            None,
-        )
+            tools: None,
+        })
         .await;
     });
     Ok(id)
 }
 
-/// One job to completion, finalizing the manager entry either way.
-async fn run_job(
+struct JobRun {
     id: JobId,
     cancel: CancelToken,
     query: String,
@@ -661,7 +663,20 @@ async fn run_job(
     model: String,
     digest_provider: Option<Arc<dyn crate::providers::Provider>>,
     tools: Option<Arc<dyn pipeline::ResearchTools>>,
-) {
+}
+
+/// One job to completion, finalizing the manager entry either way.
+async fn run_job(context: JobRun) {
+    let JobRun {
+        id,
+        cancel,
+        query,
+        config,
+        provider,
+        model,
+        digest_provider,
+        tools,
+    } = context;
     let mut cfg = config;
     if cfg.legacy {
         // v1 prompts carry whole source bodies; keep its old ceiling.
@@ -675,16 +690,16 @@ async fn run_job(
             let m = cfg.digest_model.clone().unwrap_or_else(|| model.clone());
             (p, m)
         });
-        pipeline_v2::run_with_tools(
-            &id,
+        pipeline_v2::run_with_tools(pipeline_v2::PipelineRequest {
+            job_id: &id,
             query,
-            cfg,
+            config: cfg,
             provider,
             model,
-            cancel.clone(),
+            cancel: cancel.clone(),
             tools,
             digest,
-        )
+        })
         .await
     };
     match outcome {
@@ -703,21 +718,33 @@ async fn run_job(
     }
 }
 
+pub struct RefreshRequest {
+    pub kms: String,
+    pub slugs: Vec<String>,
+    pub older_than_days: u32,
+    pub base: JobConfig,
+    pub provider: Arc<dyn crate::providers::Provider>,
+    pub model: String,
+    pub digest_provider: Option<Arc<dyn crate::providers::Provider>>,
+    pub tools: Option<Arc<dyn pipeline::ResearchTools>>,
+}
+
 /// `/research refresh`: re-research existing notes of `kms` and merge
 /// what is new into them. Jobs are registered up front (so `/research
 /// list` shows the queue) and run one after another in a single task.
 /// `slugs` empty ⇒ every non-MOC note whose `updated` is older than
 /// `older_than_days` (or has none).
-pub async fn start_refresh(
-    kms: String,
-    slugs: Vec<String>,
-    older_than_days: u32,
-    base: JobConfig,
-    provider: Arc<dyn crate::providers::Provider>,
-    model: String,
-    digest_provider: Option<Arc<dyn crate::providers::Provider>>,
-    tools: Option<Arc<dyn pipeline::ResearchTools>>,
-) -> Result<Vec<(JobId, String)>> {
+pub async fn start_refresh(context: RefreshRequest) -> Result<Vec<(JobId, String)>> {
+    let RefreshRequest {
+        kms,
+        slugs,
+        older_than_days,
+        base,
+        provider,
+        model,
+        digest_provider,
+        tools,
+    } = context;
     let kref = crate::kms::resolve(&kms)
         .ok_or_else(|| crate::error::Error::Tool(format!("no KMS named '{kms}'")))?;
     let known = graph::load_known(&kref);
@@ -762,16 +789,16 @@ pub async fn start_refresh(
         .collect();
     tokio::spawn(async move {
         for (id, cancel, query, cfg, _) in queue {
-            run_job(
+            run_job(JobRun {
                 id,
                 cancel,
                 query,
-                cfg,
-                provider.clone(),
-                model.clone(),
-                digest_provider.clone(),
-                tools.clone(),
-            )
+                config: cfg,
+                provider: provider.clone(),
+                model: model.clone(),
+                digest_provider: digest_provider.clone(),
+                tools: tools.clone(),
+            })
             .await;
         }
     });

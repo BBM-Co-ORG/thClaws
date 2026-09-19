@@ -657,7 +657,7 @@ async fn sync_stat(State(sync): State<SyncRoot>) -> Response {
                 file_count: s.file_count,
                 bytes: s.bytes,
                 empty: crate::cloud::wssync::is_empty(root).unwrap_or(false),
-                busy: busy,
+                busy,
                 engine_version: env!("CARGO_PKG_VERSION"),
                 workspace_id: binding.workspace_id,
                 revision: binding.revision,
@@ -1136,7 +1136,7 @@ struct BotQuery {
 fn pick_bot(
     sup: &crate::bots::supervisor::BotSupervisor,
     want: Option<&str>,
-) -> std::result::Result<Arc<crate::bots::supervisor::Bot>, Response> {
+) -> std::result::Result<Arc<crate::bots::supervisor::Bot>, Box<Response>> {
     match want.map(str::trim).filter(|s| !s.is_empty()) {
         Some(slug) => sup.get(slug).ok_or_else(|| {
             (
@@ -1144,9 +1144,12 @@ fn pick_bot(
                 format!("no agent '{slug}' is running in this workspace"),
             )
                 .into_response()
+                .into()
         }),
         None => sup.focused().ok_or_else(|| {
-            (StatusCode::SERVICE_UNAVAILABLE, "no agents are running").into_response()
+            (StatusCode::SERVICE_UNAVAILABLE, "no agents are running")
+                .into_response()
+                .into()
         }),
     }
 }
@@ -1161,7 +1164,7 @@ async fn supervisor_ws(
     // single-bot case and the pre-UI default.
     let bot = match pick_bot(&sup, q.bot.as_deref()) {
         Ok(b) => b,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     // Counted for the keepalive's `activity`, the way a plain serve counts
     // its own sockets.
@@ -1252,7 +1255,7 @@ async fn supervisor_forward_api(
 ) -> Response {
     let bot = match pick_bot(&sup, q.bot.as_deref()) {
         Ok(b) => b,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let (addr, _) = match bot.wait_ready(std::time::Duration::from_secs(30)).await {
         Ok(v) => v,
@@ -1287,7 +1290,7 @@ async fn supervisor_forward(
         .or_else(|| bot_from_referer(&req));
     let bot = match pick_bot(&sup, want.as_deref()) {
         Ok(b) => b,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let (addr, token) = match bot.wait_ready(std::time::Duration::from_secs(30)).await {
         Ok(v) => v,
@@ -1549,7 +1552,7 @@ fn spawn_host_heartbeat(sup: Arc<crate::bots::supervisor::BotSupervisor>) {
                     )
                 });
             let flipped = busy != last_busy || agents != last_agents;
-            let due = last_sent.map_or(true, |t| t.elapsed() >= Duration::from_secs(60));
+            let due = last_sent.is_none_or(|t| t.elapsed() >= Duration::from_secs(60));
             if !flipped && (!due || (!activity && next_schedule_at.is_none())) {
                 continue;
             }
@@ -2027,7 +2030,7 @@ async fn sync_bearer_gate(
         .unwrap_or(false);
     if required {
         if let Err(resp) = crate::api_v1::check_bearer_headers(req.headers()) {
-            return resp;
+            return *resp;
         }
     }
     next.run(req).await
@@ -2661,7 +2664,7 @@ async fn handle_socket(socket: WebSocket, state: ServeState, shared: Arc<SharedS
                 .as_ref()
                 .map(|r: &crate::multi_tenant::SessionRoots| r.sessions_dir.clone());
             let payload = build_initial_state_payload(sessions_dir.clone());
-            let _ = initial_dispatch(payload);
+            initial_dispatch(payload);
             // Hydrate a chat-first gui-shell (`<thc-chat>`) with the active
             // session's transcript on (re)connect. The worker's input queue
             // only drains between turns, so we read the session from disk
@@ -2670,7 +2673,7 @@ async fn handle_socket(socket: WebSocket, state: ServeState, shared: Arc<SharedS
             // after the (possibly minutes-long) turn finishes. Targeted to
             // THIS client; no broadcast, no worker involvement.
             if let Some(hist) = build_gui_shell_history_payload(sessions_dir) {
-                let _ = initial_dispatch(hist);
+                initial_dispatch(hist);
             }
             // A newer release, when the last check found one. Same shape as
             // the desktop's: the cached answer is a file read, so nothing on
@@ -2681,7 +2684,7 @@ async fn handle_socket(socket: WebSocket, state: ServeState, shared: Arc<SharedS
             // so a hosted workspace — whose engine is ours and not the user's
             // to upgrade — stays quiet without a check here.
             if let Some(up) = crate::update_check::cached() {
-                let _ = initial_dispatch(
+                initial_dispatch(
                     serde_json::json!({
                         "type": "update_available",
                         "version": up.version,

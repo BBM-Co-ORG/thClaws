@@ -530,7 +530,7 @@ impl Provider for GeminiProvider {
                     let event_bytes: Vec<u8> = buffer.drain(..boundary + sep_len).collect();
                     let event_text = String::from_utf8_lossy(&event_bytes);
                     let trimmed = event_text
-                        .trim_end_matches(|c: char| c == '\n' || c == '\r');
+                        .trim_end_matches(['\n', '\r']);
                     for event in parse_sse_event(trimmed, &mut state)? {
                         if let ProviderEvent::TextDelta(ref s) = event {
                             raw.push(s);

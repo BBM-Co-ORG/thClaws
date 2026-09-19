@@ -5,7 +5,7 @@
 //! `output_schema` files, a manifest pinned to the supporting engine version,
 //! and — for the static / batch-fanout patterns — a deterministic
 //! `WorkflowRun` script with the bounded-loop + graceful-`step()` + `thclaws.log`
-//! + verifier-gate shape. The conversational meta-agent `agent-builder` is the
+//! \+ verifier-gate shape. The conversational meta-agent `agent-builder` is the
 //! guided experience; this is the zero-LLM deterministic skeleton it (or a human)
 //! starts from.
 
@@ -62,21 +62,19 @@ pub fn scaffold_agent(
         &mut files,
         dir,
         "manifest.json",
-        &format!(
-            r#"{{
+        r#"{
   "version": "0.1.0",
   "categories": ["custom"],
   "license": "MIT",
-  "requires": {{
+  "requires": {
     "thclaws_min_version": "0.73.0",
     "mcp_servers": []
-  }},
-  "permissions": {{
+  },
+  "permissions": {
     "shell_execution": "sandboxed"
-  }}
-}}
-"#
-        ),
+  }
+}
+"#,
     )?;
     write(
         &mut files,

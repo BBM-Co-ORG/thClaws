@@ -247,16 +247,16 @@ pub async fn run_with_tools(
             job_id,
             format!("iteration {iter}/{}: planning next round", config.max_iter),
         );
-        subtopics = llm_calls::extract_next_subtopics(
-            provider.as_ref(),
-            &model,
-            &query,
-            &sources,
-            &eval.notes,
-            config.subtopics_per_iter,
-            config.llm_timeout,
-            &cancel,
-        )
+        subtopics = llm_calls::extract_next_subtopics(llm_calls::SubtopicRequest {
+            provider: provider.as_ref(),
+            model: &model,
+            query: &query,
+            sources: &sources,
+            eval_notes: &eval.notes,
+            n: config.subtopics_per_iter,
+            timeout: config.llm_timeout,
+            cancel: &cancel,
+        })
         .await?;
     }
 
@@ -321,16 +321,16 @@ pub async fn run_with_tools(
         let cancel_owned = cancel.clone();
         let timeout = config.llm_timeout;
         page_futures.push(tokio::spawn(async move {
-            llm_calls::write_research_page(
-                provider_ref.as_ref(),
-                &model_owned,
-                &query_owned,
-                &page_owned,
-                &plan_owned,
-                &sources_owned,
+            llm_calls::write_research_page(llm_calls::PageRequest {
+                provider: provider_ref.as_ref(),
+                model: &model_owned,
+                query: &query_owned,
+                this_page: &page_owned,
+                all_pages: &plan_owned,
+                sources: &sources_owned,
                 timeout,
-                &cancel_owned,
-            )
+                cancel: &cancel_owned,
+            })
             .await
         }));
     }
@@ -438,16 +438,16 @@ pub async fn run_with_tools(
             }
         };
 
-        let path = kms_writer::write_research_page(
-            &kms_name,
-            &page.slug,
-            &page.title,
-            &page.topic,
-            &query,
-            &today,
-            &rewritten,
+        let path = kms_writer::write_research_page(kms_writer::ResearchPage {
+            kms_name: &kms_name,
+            page_slug: &page.slug,
+            page_title: &page.title,
+            page_topic: &page.topic,
+            query: &query,
+            today: &today,
+            body: &rewritten,
             verification_score,
-        )?;
+        })?;
         if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
             last_page_path = Some(name.to_string());
         }

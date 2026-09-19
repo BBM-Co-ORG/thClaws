@@ -211,7 +211,7 @@ pub struct WorkspaceQuery {
     pub workspace_dir: Option<String>,
 }
 
-fn resolve_workspace(q: &WorkspaceQuery) -> Result<PathBuf, Response> {
+fn resolve_workspace(q: &WorkspaceQuery) -> Result<PathBuf, Box<Response>> {
     match q
         .workspace_dir
         .as_ref()
@@ -224,6 +224,7 @@ fn resolve_workspace(q: &WorkspaceQuery) -> Result<PathBuf, Response> {
                 Json(OpenAiError::invalid_request(msg, "invalid_workspace_dir")),
             )
                 .into_response()
+                .into()
         }),
         None => std::env::current_dir().map_err(|e| {
             (
@@ -231,6 +232,7 @@ fn resolve_workspace(q: &WorkspaceQuery) -> Result<PathBuf, Response> {
                 Json(OpenAiError::server_error(format!("daemon CWD: {e}"))),
             )
                 .into_response()
+                .into()
         }),
     }
 }
@@ -241,7 +243,7 @@ pub async fn get_manifest(
     AxPath(sid): AxPath<String>,
     Query(q): Query<WorkspaceQuery>,
 ) -> Result<Response, Response> {
-    let ws = resolve_workspace(&q)?;
+    let ws = resolve_workspace(&q).map_err(|response| *response)?;
     if !safe_session_id(&sid) {
         return Err(bad_id());
     }
@@ -260,7 +262,7 @@ pub async fn get_artifact(
     AxPath((sid, aid)): AxPath<(String, String)>,
     Query(q): Query<WorkspaceQuery>,
 ) -> Result<Response, Response> {
-    let ws = resolve_workspace(&q)?;
+    let ws = resolve_workspace(&q).map_err(|response| *response)?;
     if !safe_session_id(&sid) {
         return Err(bad_id());
     }
@@ -357,7 +359,8 @@ pub async fn post_inputs(
 ) -> Result<Response, Response> {
     let ws = resolve_workspace(&WorkspaceQuery {
         workspace_dir: req.workspace_dir.clone(),
-    })?;
+    })
+    .map_err(|response| *response)?;
     if req.files.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,

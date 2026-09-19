@@ -151,7 +151,8 @@ async fn agent_run_sync(
     workspace_dir: std::path::PathBuf,
 ) -> Result<Response, Response> {
     let model = effective_config(&req).model;
-    let (session, store) = resolve_session(&workspace_dir, req.session_id.as_deref(), &model)?;
+    let (session, store) = resolve_session(&workspace_dir, req.session_id.as_deref(), &model)
+        .map_err(|response| *response)?;
     let (outcome, session_id) = run_outcome_with_session(&req, &workspace_dir, session, &store)
         .await
         .map_err(|e| {
@@ -190,7 +191,8 @@ async fn agent_run_stream(
 ) -> Result<Response, Response> {
     let config = effective_config(&req);
     let (session, store) =
-        resolve_session(&workspace_dir, req.session_id.as_deref(), &config.model)?;
+        resolve_session(&workspace_dir, req.session_id.as_deref(), &config.model)
+            .map_err(|response| *response)?;
     let session_id_for_event = session.id.clone();
     let runtime = build_runtime_for_workspace(&config, &workspace_dir, req.system.as_deref())
         .await
@@ -340,7 +342,8 @@ async fn agent_run_async(
     // than disappearing into the callback path.
     let effective_model = effective_config(&req).model;
     let (session, store) =
-        resolve_session(&workspace_dir, req.session_id.as_deref(), &effective_model)?;
+        resolve_session(&workspace_dir, req.session_id.as_deref(), &effective_model)
+            .map_err(|response| *response)?;
     let session_id_for_ack = session.id.clone();
 
     let run_id = target.run_id.clone();
@@ -409,7 +412,7 @@ fn resolve_session(
     workspace_dir: &std::path::Path,
     session_id: Option<&str>,
     model: &str,
-) -> Result<(crate::session::Session, crate::session::SessionStore), Response> {
+) -> Result<(crate::session::Session, crate::session::SessionStore), Box<Response>> {
     let store_root = workspace_dir
         .join(".thclaws")
         .join("state")
@@ -425,7 +428,8 @@ fn resolve_session(
                     "session_not_found",
                 )),
             )
-                .into_response()),
+                .into_response()
+                .into()),
         },
         None => Ok((
             crate::session::Session::new(model.to_string(), workspace_dir.display().to_string()),

@@ -16,7 +16,7 @@ pub struct WebFetchTool {
     /// is on the hot path.
     client: reqwest::Client,
     /// Separate client for the HAL scrape path. HAL's `scroll_to_bottom`
-    /// + JS render can legitimately run 60s+, so the round-trip
+    /// \+ JS render can legitimately run 60s+, so the round-trip
     /// timeout is bumped to 90s (same as `hal::HAL_TIMEOUT`).
     hal_client: reqwest::Client,
 }

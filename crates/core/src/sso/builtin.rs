@@ -235,8 +235,8 @@ pub fn invalidate_session_memo() {
 
 fn session_memo() -> &'static std::sync::RwLock<Option<Option<(BuiltinProvider, super::Session)>>> {
     use std::sync::OnceLock;
-    static MEMO: OnceLock<std::sync::RwLock<Option<Option<(BuiltinProvider, super::Session)>>>> =
-        OnceLock::new();
+    type CachedSession = Option<Option<(BuiltinProvider, super::Session)>>;
+    static MEMO: OnceLock<std::sync::RwLock<CachedSession>> = OnceLock::new();
     MEMO.get_or_init(|| std::sync::RwLock::new(None))
 }
 
