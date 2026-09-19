@@ -52,6 +52,7 @@ the live GUI event journal.
 - `cargo test --features gui --lib session_view`: ordered replay, two real Agent
   loops using independently controlled mock provider streams, persistence,
   inbox isolation, cursor boundaries, and replaced-session rejection.
+- `cargo test --features gui --lib team_control_assets_reach_the_selected_host_agent`: HTTP proxy routing with two simulated host agents, built-in Team Control assets, on-disk ownership, and explicit bot selection. This does not launch real agent processes.
 - `cargo test --features gui --lib cancelled_gui_approval`: cancelled requests
   must not reappear on reconnect.
 - For UI-only verification, run `pnpm -C frontend dev` and open

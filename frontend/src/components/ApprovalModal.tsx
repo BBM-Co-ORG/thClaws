@@ -90,10 +90,13 @@ function summarizeInput(input: unknown): string {
 
 export function ApprovalModal() {
   const [queue, setQueue] = useState<(PendingRequest & { sessionId?: string })[]>([]);
+  const [attention, setAttention] = useState<string[]>([]);
   const [viewed, setViewed] = useState(viewedSessionId());
 
   useEffect(() => {
     const unsub = subscribe((msg) => {
+      if (msg.type === "session_attention") setAttention(msg.sessions as string[]);
+      if (msg.type === "session_requests_cleared") setQueue(prev => prev.filter(r => r.sessionId !== msg.session_id));
       if (msg.type === "session_view_state") setViewed(msg.session_id as string | null);
       if (msg.type === "chat_done") setQueue((prev) => prev.filter((r) => r.sessionId !== viewedSessionId()));
       if (msg.type === "approval_request" && typeof msg.id === "number") {
@@ -126,7 +129,14 @@ export function ApprovalModal() {
   }, []);
 
   const current = queue.find((r) => !r.sessionId || r.sessionId === viewed);
-  if (!current) return null;
+  if (!current) return attention.length ? (
+    <div role="status" className="fixed bottom-4 right-4 z-[60] rounded-lg border p-3 shadow-lg"
+      style={{ background: "var(--bg-primary)", color: "var(--text-primary)", borderColor: "var(--accent)" }}>
+      <p className="text-sm">A background session needs your approval or answer.</p>
+      {attention.map(id => <button key={id} className="block mt-2 text-sm underline"
+        onClick={() => send({ type: "session_load", id })}>Return to session {id}</button>)}
+    </div>
+  ) : null;
 
   const respond = (decision: Decision) => {
     send({ type: "approval_response", id: current.id, decision });

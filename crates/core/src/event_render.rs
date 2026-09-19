@@ -204,10 +204,9 @@ pub fn render_chat_dispatches(ev: &ViewEvent) -> Vec<String> {
             "isError": is_error,
         })
         .to_string()],
-        // QuitRequested is intercepted by the translator before this
-        // function is called — see the early-return in
-        // `gui::spawn_event_translator` / the equivalent web hook.
-        ViewEvent::QuitRequested => vec![],
+        // The desktop control subscriber handles quit locally; the web writer
+        // closes its socket when this ordered control frame arrives.
+        ViewEvent::QuitRequested => vec![serde_json::json!({"type":"session_quit"}).to_string()],
         // Host mode: `/reload` is dispatched inside the BOT process, which
         // has no tao event loop and therefore cannot re-exec anything — the
         // event fell on the floor here as `vec![]` while the user watched the
