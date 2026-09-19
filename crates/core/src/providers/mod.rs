@@ -1215,7 +1215,14 @@ impl ThinkingLevel {
             "0" | "off" | "none" => Some(Some(0)),
             "1" | "low" | "min" | "minimal" => Some(Some(Self::LOW_BUDGET)),
             "2" | "medium" | "med" | "mid" => Some(Some(Self::MEDIUM_BUDGET)),
-            "3" | "high" | "max" => Some(Some(Self::HIGH_BUDGET)),
+            // No `"max"` alias. It used to land here, on HIGH_BUDGET, which is
+            // not a maximum of anything: the arm below accepts any budget from
+            // 100 up, so `/thinking 200000` is both legal and larger, and
+            // anything over 16_000 already reports itself as "high". A word
+            // that promises a ceiling while quietly picking 32_000 is worse
+            // than no word — the usage line offers `<tokens>` for people who
+            // want more, and never advertised `max` in the first place.
+            "3" | "high" => Some(Some(Self::HIGH_BUDGET)),
             _ => t.parse::<u32>().ok().filter(|n| *n >= 100).map(|n| Some(n)),
         }
     }
@@ -1522,6 +1529,17 @@ pub fn kind_has_credentials(kind: Option<ProviderKind>) -> bool {
     }
 }
 
+/// Whether `kind` is something this user could actually send a request to —
+/// by its own credentials, or with the gateway supplying them.
+///
+/// The model picker lists only reachable providers (issue #215). Kept as its
+/// own function rather than inlined in the loop so the rule can be tested: it
+/// decides what a user sees, and getting it wrong in the strict direction
+/// makes working providers vanish, which is worse than the noise it removes.
+fn kind_is_reachable(cfg: &crate::config::AppConfig, kind: ProviderKind) -> bool {
+    kind_has_credentials(Some(kind)) || thclaws_gateway::for_kind(cfg, kind).is_some()
+}
+
 /// The `<provider>/` prefix a listing from `kind`'s endpoint must carry so
 /// a copied id routes back through [`ProviderKind::detect`]. Mirrors the
 /// `with_strip_model_prefix` argument each arm of `repl::build_provider`
@@ -1777,6 +1795,22 @@ pub async fn build_all_models_payload() -> String {
         if pod && kind.tier() != ProviderTier::Featured {
             continue;
         }
+        // Issue #215: a provider the user cannot actually reach has no
+        // business in the picker. This listed all ~30 kinds fully populated
+        // from the shipped catalogue, so someone holding a single key scrolled
+        // past hundreds of models they would get a 401 from — the one they
+        // could use was the hard one to find.
+        //
+        // `kind_has_credentials` is the same predicate the GUI's auto-fallback
+        // already trusts, and it is not merely "is there an API key": keyless
+        // local runtimes (Ollama, vLLM, llama.cpp, LM Studio, OpenAI-compatible)
+        // and the file-OAuth Codex path all answer true on their own terms.
+        // The gateway arm matters just as much — a gateway-routed provider is
+        // reachable with no local key at all, and dropping it here would take
+        // away the models hosted users have.
+        if !kind_is_reachable(&app_cfg, *kind) {
+            continue;
+        }
         let provider_featured = kind.tier() == ProviderTier::Featured;
         // (id) -> (context, featured, context_unverified). `featured` =
         // gateway-servable: a Featured-tier provider with a priced catalogue
@@ -1952,6 +1986,61 @@ pub fn preferred_default_model(cfg: &crate::config::AppConfig) -> Option<String>
 
 #[cfg(test)]
 mod tests {
+
+    /// Issue #215: the picker listed every provider kind fully populated from
+    /// the shipped catalogue, so a user with one key scrolled past hundreds of
+    /// models that would 401. It now lists only what the user can reach.
+    ///
+    /// The strict direction is the dangerous one — a predicate that is too
+    /// harsh makes working providers disappear — so this pins both sides:
+    /// a keyed provider without its key is out, and a keyless local runtime
+    /// stays in.
+    #[test]
+    fn the_picker_lists_only_providers_the_user_can_reach() {
+        let _g = crate::kms::test_env_lock();
+        let cfg = crate::config::AppConfig::default();
+
+        let key_var = ProviderKind::Anthropic
+            .api_key_env()
+            .expect("anthropic is key-authenticated");
+        let prev = std::env::var(key_var).ok();
+
+        std::env::remove_var(key_var);
+        assert!(
+            !super::kind_is_reachable(&cfg, ProviderKind::Anthropic),
+            "a key-authenticated provider with no key must not be listed"
+        );
+
+        std::env::set_var(key_var, "sk-test");
+        assert!(
+            super::kind_is_reachable(&cfg, ProviderKind::Anthropic),
+            "and must come back the moment the key is set"
+        );
+        std::env::remove_var(key_var);
+
+        // Keyless by nature: reachability is the gate, not a credential.
+        // These are the ones a naive "has an API key?" check would wrongly
+        // hide, leaving local-model users with an empty picker.
+        for kind in [
+            ProviderKind::Ollama,
+            ProviderKind::LMStudio,
+            ProviderKind::VLlm,
+            ProviderKind::LlamaCpp,
+            ProviderKind::OpenAICompat,
+            ProviderKind::LiteLlm,
+        ] {
+            assert!(
+                super::kind_is_reachable(&cfg, kind),
+                "{} needs no key and must stay listed",
+                kind.name()
+            );
+        }
+
+        match prev {
+            Some(v) => std::env::set_var(key_var, v),
+            None => std::env::remove_var(key_var),
+        }
+    }
     /// `/models` on a user-pointed provider says which endpoint it asked,
     /// because "no models for openai-compat" tells the user nothing about
     /// the box they actually configured.
@@ -3107,6 +3196,21 @@ mod tests {
 #[cfg(test)]
 mod thinking_level_tests {
     use super::ThinkingLevel as L;
+
+    /// `max` used to be an alias for `high`, i.e. 32_000 — while the raw-token
+    /// arm accepts anything from 100 up, so a plain `/thinking 200000` was both
+    /// accepted and larger. A word that promises a ceiling and silently picks a
+    /// middling number is worse than no word; the usage line never offered it.
+    #[test]
+    fn max_is_not_an_alias_for_high_because_it_is_not_a_maximum() {
+        assert_eq!(L::parse("max"), None, "`max` must be rejected, not aliased");
+        // The honest route to more is still open, and really is larger.
+        assert_eq!(L::parse("200000"), Some(Some(200_000)));
+        assert!(200_000 > L::HIGH_BUDGET);
+        // The documented words are untouched.
+        assert_eq!(L::parse("high"), Some(Some(L::HIGH_BUDGET)));
+        assert_eq!(L::parse("3"), Some(Some(L::HIGH_BUDGET)));
+    }
 
     #[test]
     fn parse_levels_names_and_raw() {

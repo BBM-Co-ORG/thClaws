@@ -1183,6 +1183,49 @@ async fn supervisor_ws(
 /// `app.js` or a previewed page's stylesheet is fetched relative to its
 /// document, which drops the query the page put there, but the Referer still
 /// carries it.
+/// `(slug, dir)` for every agent this host supervises.
+fn bot_dirs(sup: &crate::bots::supervisor::BotSupervisor) -> Vec<(String, std::path::PathBuf)> {
+    sup.list()
+        .into_iter()
+        .map(|b| (b.slug.clone(), b.dir.clone()))
+        .collect()
+}
+
+/// The shell id in a `/gui-shell/<id>/…` path, if this is one.
+fn shell_id_from_path(path: &str) -> Option<&str> {
+    let id = path.strip_prefix("/gui-shell/")?.split('/').next()?;
+    // A traversal here would let a crafted URL probe directories outside the
+    // shelf; an empty id matches nothing and would only waste the walk.
+    if id.is_empty() || id.contains("..") || id.contains('\\') {
+        return None;
+    }
+    Some(id)
+}
+
+/// Which agent ships shell `id`, read off disk.
+///
+/// The host already knows this: a shell id is a folder inside one agent's
+/// tree. Asking the browser instead — `?bot=` on the index, the Referer on
+/// everything relative under it — puts the answer in a header the shell's own
+/// `Referrer-Policy` suppresses, and every sub-asset then goes to whichever
+/// agent happens to be first.
+///
+/// `None` when no agent has it (a user-level or built-in shell belongs to no
+/// single agent) and also when more than one does — both are for the caller's
+/// remaining layers to settle rather than for this one to guess at.
+fn owner_of_shell(bots: &[(String, std::path::PathBuf)], id: &str) -> Option<String> {
+    let mut owner: Option<&str> = None;
+    for (slug, dir) in bots {
+        if dir.join(".thclaws").join("gui-shell").join(id).is_dir() {
+            if owner.is_some() {
+                return None;
+            }
+            owner = Some(slug);
+        }
+    }
+    owner.map(str::to_string)
+}
+
 fn bot_from_referer(req: &Request) -> Option<String> {
     let referer = req
         .headers()
@@ -1230,7 +1273,18 @@ async fn supervisor_forward(
     Query(q): Query<BotQuery>,
     req: Request,
 ) -> Response {
-    let want = q.bot.clone().or_else(|| bot_from_referer(&req));
+    // Layered, most explicit first: what the caller asked for, then what the
+    // filesystem says owns this shell, then the Referer, then the default.
+    // The disk lookup sits above the Referer because it cannot be stripped by
+    // a browser, an extension or a proxy — the header is the fragile one, and
+    // relying on it alone is what shipped shells that rendered unstyled.
+    let want = q
+        .bot
+        .clone()
+        .or_else(|| {
+            shell_id_from_path(req.uri().path()).and_then(|id| owner_of_shell(&bot_dirs(&sup), id))
+        })
+        .or_else(|| bot_from_referer(&req));
     let bot = match pick_bot(&sup, want.as_deref()) {
         Ok(b) => b,
         Err(resp) => return resp,
@@ -2900,6 +2954,70 @@ fn build_kms_initial_payload(config: &AppConfig) -> Vec<serde_json::Value> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The host can name a shell's agent without asking the browser, which is
+    /// the point: the Referer it used to rely on is suppressed by the shell's
+    /// own `Referrer-Policy`, and every sub-asset went to the wrong agent.
+    #[test]
+    fn a_shell_is_traced_back_to_the_agent_that_ships_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mk = |slug: &str, shell: &str| {
+            let dir = tmp.path().join(slug);
+            std::fs::create_dir_all(dir.join(".thclaws").join("gui-shell").join(shell)).unwrap();
+            (slug.to_string(), dir)
+        };
+        let main = mk("main", "session-explorer");
+        let writer = mk("writer", "book-studio");
+        let bots = vec![main, writer];
+
+        assert_eq!(
+            owner_of_shell(&bots, "book-studio").as_deref(),
+            Some("writer"),
+            "the second agent's shell must not resolve to the first"
+        );
+        assert_eq!(
+            owner_of_shell(&bots, "session-explorer").as_deref(),
+            Some("main")
+        );
+        // A built-in or user-level shell belongs to no one agent: leave it to
+        // the caller's remaining layers rather than guess.
+        assert_eq!(owner_of_shell(&bots, "not-installed"), None);
+    }
+
+    #[test]
+    fn a_shell_id_two_agents_both_ship_is_left_unresolved() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut bots = Vec::new();
+        for slug in ["main", "writer"] {
+            let dir = tmp.path().join(slug);
+            std::fs::create_dir_all(dir.join(".thclaws").join("gui-shell").join("desk")).unwrap();
+            bots.push((slug.to_string(), dir));
+        }
+        // Ambiguous — picking either would be a coin flip presented as a fact.
+        assert_eq!(owner_of_shell(&bots, "desk"), None);
+    }
+
+    #[test]
+    fn only_a_gui_shell_path_yields_an_id_and_never_a_traversal() {
+        assert_eq!(
+            shell_id_from_path("/gui-shell/book-studio/style.css"),
+            Some("book-studio")
+        );
+        assert_eq!(
+            shell_id_from_path("/gui-shell/book-studio/"),
+            Some("book-studio")
+        );
+        assert_eq!(
+            shell_id_from_path("/gui-shell/book-studio"),
+            Some("book-studio")
+        );
+        // Not a shell path at all.
+        assert_eq!(shell_id_from_path("/file-asset/out/a.png"), None);
+        assert_eq!(shell_id_from_path("/ws"), None);
+        // A crafted id must not send the walk outside the shelf.
+        assert_eq!(shell_id_from_path("/gui-shell/../../etc/passwd"), None);
+        assert_eq!(shell_id_from_path("/gui-shell//style.css"), None);
+    }
     use super::*;
 
     /// ServeConfig defaults bind to localhost — security-relevant
