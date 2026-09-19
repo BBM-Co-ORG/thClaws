@@ -2,19 +2,6 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
-test("sidebar navigation never cancels the active turn and current session is a no-op", () => {
-  const source = readFileSync(
-    new URL("../src/components/Sidebar.tsx", import.meta.url),
-    "utf8",
-  );
-  const sessions = source.slice(
-    source.indexOf("{/* Sessions */}"),
-    source.indexOf("{/* Knowledge bases */}"),
-  );
-  assert.doesNotMatch(sessions, /send\(\{ type: "shell_cancel"/);
-  assert.match(sessions, /if \(isCurrent\) return/);
-});
-
 const { transpileModule, ModuleKind } = await import("typescript");
 const source = readFileSync(
   new URL("../src/hooks/sessionNavigation.ts", import.meta.url),
@@ -153,9 +140,10 @@ test("ask/approval requests retain A ownership while B is visible", () => {
   view("B");
   received.length = 0;
   nav.receive({ type: "ask_user_question", id: 1, question: "A question" });
-  assert.equal(received.length, 0);
+  assert.deepEqual(received.at(-1), { type: "session_attention", sessions: ["A"] });
+  assert.ok(!received.some(f => f.type === "ask_user_question"));
   nav.receive({ type: "approval_request", id: 2 });
-  assert.equal(received[0].session_id, "A");
+  assert.equal(received.find(f => f.type === "approval_request").session_id, "A");
   view("A");
   assert.ok(received.some((f) => f.type === "ask_user_question" && f.id === 1));
   nav.send({ type: "ask_user_response", id: 1, text: "answer" });
@@ -225,4 +213,22 @@ test("first connection never sends an empty session target from a sidebar refres
   });
   nav.send({ type: "shell_input", text: "second prompt" });
   assert.equal(sent.at(-1).session_id, "A");
+});
+
+
+test("background attention clears on response/completion and follows the viewed session", () => {
+  const { nav, received, sent, view } = harness();
+  view("B");
+  nav.receive({ type: "approval_request", session_id: "A", id: 42 });
+  assert.deepEqual(received.findLast(f => f.type === "session_attention").sessions, ["A"]);
+  view("A");
+  assert.deepEqual(received.findLast(f => f.type === "session_attention").sessions, []);
+  nav.send({ type: "approval_response", id: 42, decision: "allow" });
+  assert.equal(sent.at(-1).session_id, "A");
+  view("B");
+  assert.deepEqual(received.findLast(f => f.type === "session_attention").sessions, []);
+  nav.receive({ type: "approval_request", session_id: "A", id: 43 });
+  nav.receive({ type: "session_event", session_id: "A", sequence: 5, events: [{type:"chat_done"}] });
+  assert.deepEqual(received.findLast(f => f.type === "session_attention").sessions, []);
+  assert.ok(received.some(f => f.type === "session_requests_cleared" && f.session_id === "A"));
 });

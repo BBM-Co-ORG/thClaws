@@ -6,12 +6,19 @@ use crate::event_render::{
 use crate::session::Session;
 use crate::shared_session::{DisplayMessage, ViewEvent};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use tokio::sync::broadcast;
+
+const MAX_TRANSCRIPT_EVENTS: usize = 4096;
+const MAX_TRANSCRIPT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_TRANSCRIPTS: usize = 16;
 
 #[derive(Default)]
 struct Transcript {
-    events: Vec<Value>,
+    events: VecDeque<Value>,
+    bytes: usize,
+    trimmed: bool,
+    last_viewed: u64,
     sequence: u64,
     terminal: TerminalRenderState,
 }
@@ -20,6 +27,42 @@ struct Transcript {
 pub(crate) struct SessionViews {
     active: String,
     transcripts: HashMap<String, Transcript>,
+    clock: u64,
+}
+
+impl Transcript {
+    fn extend(&mut self, events: Vec<Value>) {
+        for event in events {
+            let bytes = event.to_string().len();
+            if bytes > MAX_TRANSCRIPT_BYTES {
+                self.trimmed = true;
+                continue;
+            }
+            self.bytes += bytes;
+            self.events.push_back(event);
+            while self.events.len() > MAX_TRANSCRIPT_EVENTS || self.bytes > MAX_TRANSCRIPT_BYTES {
+                if let Some(old) = self.events.pop_front() {
+                    self.bytes -= old.to_string().len();
+                    self.trimmed = true;
+                }
+            }
+        }
+    }
+
+    fn snapshot(&self) -> Vec<Value> {
+        let mut events = Vec::new();
+        if self.trimmed {
+            events.push(json!({"type":"chat_slash_output", "text":"Earlier output trimmed from the in-memory preview. Full saved history remains in the session file."}));
+            events.push(
+                serde_json::from_str(&terminal_data_envelope(
+                    "\r\n[Earlier output trimmed from the in-memory preview.]\r\n",
+                ))
+                .expect("terminal envelope"),
+            );
+        }
+        events.extend(self.events.iter().cloned());
+        events
+    }
 }
 
 fn render(terminal: &mut TerminalRenderState, event: &ViewEvent) -> Vec<Value> {
@@ -44,27 +87,48 @@ fn from_session(session: &Session) -> Transcript {
         ViewEvent::PlanUpdate(session.plan.clone()),
         ViewEvent::GoalUpdate(session.goal.clone()),
     ] {
-        transcript
-            .events
-            .extend(render(&mut transcript.terminal, &event));
+        let frames = render(&mut transcript.terminal, &event);
+        transcript.extend(frames);
     }
     transcript
 }
 
 impl SessionViews {
+    fn evict(&mut self) {
+        while self.transcripts.len() > MAX_TRANSCRIPTS {
+            let oldest = self
+                .transcripts
+                .iter()
+                .filter(|(id, _)| **id != self.active)
+                .min_by_key(|(_, t)| t.last_viewed)
+                .map(|(id, _)| id.clone());
+            if let Some(id) = oldest {
+                self.transcripts.remove(&id);
+            } else {
+                break;
+            }
+        }
+    }
+
     pub(crate) fn apply(&mut self, event: ViewEvent) -> Vec<String> {
+        self.clock += 1;
         match event {
             ViewEvent::SessionActivated(session) => {
                 self.active = session.id.clone();
                 self.transcripts
                     .entry(session.id.clone())
                     .or_insert_with(|| from_session(&session));
+                self.transcripts.get_mut(&self.active).unwrap().last_viewed = self.clock;
+                self.evict();
                 vec![json!({"type":"session_execution", "session_id": self.active}).to_string()]
             }
             ViewEvent::SessionViewRequest {
                 session,
                 request_id,
             } => {
+                if let Some(t) = self.transcripts.get_mut(&session.id) {
+                    t.last_viewed = self.clock;
+                }
                 let fallback;
                 let transcript = match self.transcripts.get(&session.id) {
                     Some(transcript) => transcript,
@@ -76,7 +140,7 @@ impl SessionViews {
                 vec![json!({
                     "type":"session_view", "session_id": session.id,
                     "request_id": request_id, "sequence": transcript.sequence,
-                    "events": transcript.events,
+                    "events": transcript.snapshot(),
                 })
                 .to_string()]
             }
@@ -113,12 +177,14 @@ impl SessionViews {
                             Some("chat_plan_update" | "chat_goal_update" | "chat_permission_mode")
                         )
                     });
+                    transcript.bytes = transcript.events.iter().map(|e| e.to_string().len()).sum();
+                    transcript.trimmed = false;
                     transcript.terminal = TerminalRenderState::default();
                 }
                 let events = render(&mut transcript.terminal, &event);
                 if !events.is_empty() {
                     transcript.sequence += 1;
-                    transcript.events.extend(events.clone());
+                    transcript.extend(events.clone());
                     global.push(json!({"type":"session_event", "session_id": self.active, "sequence": transcript.sequence, "events":events}).to_string());
                 }
                 global
@@ -144,7 +210,9 @@ pub(crate) fn spawn(
                 match input.recv().await {
                     Ok(event) => {
                         if let ViewEvent::SessionActivated(session) = &event {
-                            *execution_session_id.lock().unwrap() = session.id.clone();
+                            *execution_session_id
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner()) = session.id.clone();
                         }
                         for frame in views.apply(event) {
                             let _ = tx.send(frame);
@@ -180,6 +248,61 @@ mod tests {
             })[0],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn session_view_bounds_event_count_bytes_and_marks_trimming() {
+        let mut t = Transcript::default();
+        for _ in 0..MAX_TRANSCRIPT_EVENTS + 20 {
+            t.extend(vec![json!({"type":"chat_text_delta","text":"chunk"})]);
+        }
+        assert_eq!(t.events.len(), MAX_TRANSCRIPT_EVENTS);
+        assert!(t.trimmed);
+        assert!(t.snapshot()[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("trimmed"));
+        for _ in 0..100 {
+            t.extend(vec![
+                json!({"type":"chat_tool_result","output":"x".repeat(50_000)}),
+            ]);
+        }
+        assert!(t.bytes <= MAX_TRANSCRIPT_BYTES);
+        assert!(t.events.len() < MAX_TRANSCRIPT_EVENTS);
+        t.extend(vec![
+            json!({"type":"chat_text_delta","text":"x".repeat(MAX_TRANSCRIPT_BYTES + 1)}),
+        ]);
+        assert!(t.bytes <= MAX_TRANSCRIPT_BYTES);
+    }
+
+    #[test]
+    fn session_view_evicts_old_sessions_but_retains_active_and_recently_viewed() {
+        let mut views = SessionViews::default();
+        for i in 0..MAX_TRANSCRIPTS {
+            views.apply(ViewEvent::SessionActivated(Box::new(session(&format!(
+                "s{i}"
+            )))));
+        }
+        snapshot(&mut views, "s0");
+        views.apply(ViewEvent::SessionActivated(Box::new(session("new"))));
+        assert_eq!(views.transcripts.len(), MAX_TRANSCRIPTS);
+        assert!(views.transcripts.contains_key("s0"));
+        assert!(views.transcripts.contains_key("new"));
+        assert!(!views.transcripts.contains_key("s1"));
+        assert_eq!(snapshot(&mut views, "s1")["session_id"], "s1");
+    }
+
+    #[test]
+    fn session_view_forwards_quit_as_an_ordered_control_frame() {
+        let mut views = SessionViews::default();
+        views.apply(ViewEvent::SessionActivated(Box::new(session("A"))));
+        assert_eq!(
+            views.apply(ViewEvent::QuitRequested),
+            vec![json!({"type":"session_quit"}).to_string()]
+        );
+        assert!(!snapshot(&mut views, "A")
+            .to_string()
+            .contains("session_quit"));
     }
 
     #[test]
