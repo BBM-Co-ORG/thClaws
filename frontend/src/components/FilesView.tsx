@@ -21,6 +21,11 @@ import {
   Globe,
 } from "lucide-react";
 import { send, subscribe } from "../hooks/useIPC";
+import {
+  DEFAULT_INGEST_MODE,
+  INGEST_MODES,
+  type IngestMode,
+} from "./kmsIngestModes";
 import { assetUrl, workspacePrefix } from "../lib/assetUrl";
 import { parentDir } from "../lib/markdownRoundTrip";
 import { useTheme } from "../hooks/useTheme";
@@ -168,11 +173,15 @@ function MenuItem({
   label,
   danger,
   onClick,
+  title,
 }: {
   icon: React.ReactNode;
   label: string;
   danger?: boolean;
   onClick: () => void;
+  /// Hover text. The ingest modes carry what each one costs and what
+  /// it does not give you, which the label has no room for.
+  title?: string;
 }) {
   const [hover, setHover] = useState(false);
   return (
@@ -186,6 +195,7 @@ function MenuItem({
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
       onClick={onClick}
+      title={title}
     >
       {icon} {label}
     </button>
@@ -326,7 +336,7 @@ export function FilesView({ active }: Props) {
   // Which "Add to KMS" flavour the expanded picker is for: `summary`
   // (agent curates the stub page) or `atomic` (research job splits the
   // document into a topic page + one note per idea).
-  const [kmsPickMode, setKmsPickMode] = useState<"summary" | "atomic">("summary");
+  const [kmsPickMode, setKmsPickMode] = useState<IngestMode>(DEFAULT_INGEST_MODE);
   // New file / folder name modal. null = closed; otherwise which kind.
   const [createKind, setCreateKind] = useState<"file" | "folder" | null>(null);
   const [createName, setCreateName] = useState("");
@@ -637,7 +647,7 @@ export function FilesView({ active }: Props) {
       name: string,
       kmsName: string,
       force = false,
-      mode: "summary" | "atomic" = "summary",
+      mode: IngestMode = DEFAULT_INGEST_MODE,
     ) => {
       const reqId = Date.now() + Math.floor(Math.random() * 100000);
       const unsub = subscribe((msg) => {
@@ -1162,12 +1172,19 @@ export function FilesView({ active }: Props) {
   ///      .md and code-mirror previews), but iframe-rendered HTML
   ///      uses src={assetUrl(path)} not srcDoc={content}, so it
   ///      doesn't notice the state change without a key bump.
-  const refreshPreview = () => {
+  const refreshPreview = async () => {
     if (!preview) return;
     if (editorDirty) {
-      const ok = window.confirm(
-        "You have unsaved changes in the editor. Refresh anyway? Unsaved edits will be lost."
-      );
+      // `platformConfirm`, not `window.confirm`: the desktop webview has no
+      // browser dialog, so the bare call answered falsy and Refresh silently
+      // did nothing whenever the editor was dirty — the one case this guard
+      // exists for.
+      const ok = await platformConfirm({
+        title: "Unsaved changes",
+        message:
+          "You have unsaved changes in the editor. Refresh anyway? Unsaved edits will be lost.",
+        yesLabel: "Refresh",
+      });
       if (!ok) return;
       setEditorDirty(false);
     }
@@ -1870,15 +1887,18 @@ export function FilesView({ active }: Props) {
                 a hint toast. */}
             {!entryMenu.isDir && /\.(md|markdown)$/i.test(entryMenu.name) && (
               <>
-                {(["summary", "atomic"] as const).map((mode) => {
+                {INGEST_MODES.map(({ id: mode, label, hint }) => {
                   const open = kmsPick && kmsPickMode === mode;
-                  const base =
-                    mode === "summary" ? "Add to KMS" : "Add to KMS as atomic notes";
                   return (
                     <MenuItem
                       key={`add-${mode}`}
                       icon={<Library size={13} />}
-                      label={kmsList.length > 1 ? `${base}${open ? " ▾" : " ▸"}` : base}
+                      title={hint}
+                      label={
+                        kmsList.length > 1
+                          ? `${label}${open ? " ▾" : " ▸"}`
+                          : label
+                      }
                       onClick={() => {
                         const m = entryMenu;
                         if (kmsList.length === 0) {

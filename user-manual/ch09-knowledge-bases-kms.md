@@ -52,7 +52,7 @@ Every page goes through `KmsWrite`, which expects this YAML frontmatter and stam
 ```yaml
 ---
 title: Human-readable title           # falls back to the filename when missing
-topic: One-line description           # rendered as Description: …; omitted line if missing
+topic: One-line description           # what the index shows for this page; write one
 sources: ["https://…", "memory"]      # REQUIRED — provenance (URLs, session-XYZ, memory, or [] for opinion)
 category: optional grouping
 tags: [optional, free-form]
@@ -74,8 +74,6 @@ verified: 2026-05-11                  # stamped by /research; manual KmsWrite le
 ---
 
 # {title}
-Description: {topic}
----
 
 (body)
 ```
@@ -670,7 +668,7 @@ confirmation, then runs `/kms drop NAME --force`).
 
 ### `/kms drop NAME [--force]`
 
-Destructive — removes the entire KMS directory tree (`<scope>/.thclaws/state/kms/<name>/` or `~/.config/thclaws/kms/<name>/`). Aliases: `delete`, `rm`.
+Removes the KMS directory tree (`<scope>/.thclaws/state/kms/<name>/` or `~/.config/thclaws/kms/<name>/`) — but does not destroy it: what it removes is **moved to `<scope>/.trash/`**, kept for 30 days, and brought back by `/kms restore NAME`. Aliases: `delete`, `rm`.
 
 **Dry-run is the default.** Without `--force` it prints how many pages and sources *would* be removed but doesn't touch disk:
 
@@ -895,7 +893,7 @@ Drops `<kms_root>/.index/` and rebuilds from `pages/` on disk. Operator-only (no
 
 The mutation surface used by the agent (and by the `/dream` consolidator below). Always-on — registered regardless of whether any KMS is currently attached, so `/dream` and other side-channel agents can bootstrap an audit-log KMS from a zero state. Each requires approval by default except `KmsCreate` (idempotent + name-validated, same risk profile as `SessionRename`).
 
-- `KmsWrite(kms, page, content)` — create-or-replace a page. Preserves YAML frontmatter, bumps `updated:`, refreshes the `index.md` bullet, appends a `wrote | <page>` entry to `log.md`. Auto-injects the `# {title}\nDescription: {topic}\n---` block when the body doesn't lead with a `# heading`. Warns when `sources:` frontmatter is missing.
+- `KmsWrite(kms, page, content)` — create-or-replace a page. Preserves YAML frontmatter, bumps `updated:`, refreshes the `index.md` bullet, appends a `wrote | <page>` entry to `log.md`. Auto-injects a `# {title}` heading when the body doesn't lead with a `# heading`. Warns when `sources:` frontmatter is missing.
 - `KmsAppend(kms, page, content)` — extend a page in place. Faster than `KmsWrite` for incremental updates (logs, journal entries, accumulated notes). Bumps `updated:` if the page has frontmatter.
 - `KmsDelete(kms, page)` — remove a page, prune its `index.md` bullet, append `deleted | <page>` to `log.md`. Used during consolidation to retire duplicates or stale entries.
 - `KmsCreate(name, scope)` — ensure a KMS exists. Idempotent: returns the existing ref if already present, otherwise seeds the directory tree (`pages/`, `sources/`, `index.md`, `log.md`, `SCHEMA.md`, `manifest.json`). Used by `/dream`'s Pass 4 to bootstrap the dedicated `dreams` audit KMS before writing the run summary.

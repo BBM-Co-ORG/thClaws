@@ -178,7 +178,12 @@ export function KmsCreateModal({ mode, onClose }: Props) {
                 hint={
                   scope === "user"
                     ? "~/.config/thclaws/kms/ (all projects)"
-                    : "./.thclaws/kms/ (this project only)"
+                    : // dev-plan/64 P5.8: this said `./.thclaws/kms/`, which
+                      // was wrong twice over — the folder is `state/kms`, and
+                      // since D1 a project knowledge base is anchored at the
+                      // workspace root so every agent in the workspace shares
+                      // it, not at whichever directory happens to be current.
+                      "<workspace>/.thclaws/state/kms/ (shared by every agent here)"
                 }
               >
                 <div className="flex gap-1.5">

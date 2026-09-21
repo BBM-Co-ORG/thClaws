@@ -270,6 +270,7 @@ pub async fn run(config: AppConfig) -> Result<()> {
     tools.register(Arc::new(crate::tools::KmsWriteTool));
     tools.register(Arc::new(crate::tools::KmsWriteSourceTool));
     tools.register(Arc::new(crate::tools::KmsAppendTool));
+    tools.register(Arc::new(crate::tools::KmsEditTool));
     tools.register(Arc::new(crate::tools::KmsDeleteTool));
     tools.register(Arc::new(crate::tools::KmsCreateTool));
     tools.register(Arc::new(crate::tools::MemoryReadTool));

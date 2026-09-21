@@ -237,15 +237,15 @@ impl UsageTracker {
     }
 }
 
+/// Today, where the user is.
+///
+/// This was the UTC date. In Bangkok that is yesterday until 07:00, so a
+/// page edited at 00:11 on the 20th was logged, stamped `updated:` and
+/// `verified:` on the 19th, and a research prompt written that morning told
+/// the model it was the day before. Every date the KMS writes comes through
+/// here, and the person reading those dates reads them on a local calendar.
 pub(crate) fn today_str() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    // Simple date calculation (no chrono dependency).
-    let days = secs / 86400;
-    let (y, m, d) = days_to_ymd(days);
-    format!("{y:04}-{m:02}-{d:02}")
+    chrono::Local::now().format("%Y-%m-%d").to_string()
 }
 
 fn epoch_secs() -> u64 {
@@ -283,13 +283,7 @@ pub fn append_usage_ledger(
     }
     let cost = crate::model_catalogue::EffectiveCatalogue::load().compute_cost_usd(
         model,
-        &crate::model_catalogue::TokenUsage {
-            prompt_tokens: usage.input_tokens,
-            completion_tokens: usage.output_tokens,
-            cached_input_tokens: usage.cache_read_input_tokens.unwrap_or(0),
-            cache_creation_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
-            reasoning_tokens: usage.reasoning_output_tokens.unwrap_or(0),
-        },
+        &crate::model_catalogue::TokenUsage::from_usage(usage),
     );
     let line = serde_json::json!({
         "type": "usage",
@@ -313,21 +307,6 @@ pub fn append_usage_ledger(
     {
         let _ = writeln!(f, "{line}");
     }
-}
-
-fn days_to_ymd(days: u64) -> (u64, u64, u64) {
-    // Algorithm from http://howardhinnant.github.io/date_algorithms.html
-    let z = days + 719468;
-    let era = z / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
 }
 
 #[cfg(test)]

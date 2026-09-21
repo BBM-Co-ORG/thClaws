@@ -355,9 +355,9 @@ pub async fn run_with_tools(
     // M6.39.7: shared (index, title, url) shape for the citation
     // helpers (ensure_sources_section + linkify_citations). Built
     // once per run; same for every page.
-    let sources_meta: Vec<(u32, String, String)> = sources
+    let sources_meta: Vec<(u32, String, String, String)> = sources
         .iter()
-        .map(|s| (s.index, s.title.clone(), s.url.clone()))
+        .map(|s| (s.index, s.title.clone(), s.url.clone(), String::new()))
         .collect();
     for (idx, body) in bodies {
         let page = &plan[idx];
@@ -741,17 +741,25 @@ fn parse_numbered_entry(line: &str) -> Option<(String, String)> {
     // Consume leading digits + dot.
     let mut last_digit_end = 0;
     let mut saw_digit = false;
+    let mut saw_dot = false;
     for (i, c) in iter.by_ref() {
         if c.is_ascii_digit() {
             last_digit_end = i + c.len_utf8();
             saw_digit = true;
         } else if c == '.' && saw_digit {
+            saw_dot = true;
             break;
         } else {
             return None;
         }
     }
-    if !saw_digit {
+    // The loop ends either on the dot or by running out of line, and only
+    // the first is a numbered entry. Without `saw_dot`, a line of nothing
+    // but digits fell through with `last_digit_end` at the end of the
+    // string and indexed one past it — `"11"` asked for byte 3 of 2. That
+    // panic unwound the whole research job, which then hung as Running
+    // with nothing to show for it.
+    if !saw_digit || !saw_dot {
         return None;
     }
     let after_dot = line[last_digit_end + 1..].trim_start();
@@ -1294,6 +1302,29 @@ mod tests {
         assert!(parse_numbered_entry("Hello world").is_none());
         assert!(parse_numbered_entry("- bullet (https://x.example)").is_none());
         assert!(parse_numbered_entry("1. no url here").is_none());
+    }
+
+    /// A line of nothing but digits used to index one byte past the end
+    /// of the line and panic. Because the digests all run on one task
+    /// under `join_all`, that panic took the whole research job with it —
+    /// and it unwound past the job's finalize, so the run sat `Running`
+    /// for hours with no error anywhere. Seen twice in one session on a
+    /// real search result: `byte index 3 is out of bounds of "11"`.
+    #[test]
+    fn a_line_of_only_digits_is_not_an_entry() {
+        for line in ["11", "3", "0", "999999", " 42 ", "7\t"] {
+            assert!(
+                parse_numbered_entry(line.trim()).is_none(),
+                "bare digits must not parse: {line:?}"
+            );
+        }
+        // The dot alone is not enough either — there has to be a URL.
+        assert!(parse_numbered_entry("11.").is_none());
+        assert!(parse_numbered_entry("11. ").is_none());
+        // And the normal shape still parses.
+        let (t, u) = parse_numbered_entry("11. Title (https://x.example)").unwrap();
+        assert_eq!(t, "Title");
+        assert_eq!(u, "https://x.example");
     }
 
     #[test]

@@ -71,8 +71,8 @@ pub use grep::GrepTool;
 pub use hal::{WebScrapeTool, YouTubeTranscriptTool};
 pub use image_gen::{ImageToImageTool, TextToImageTool};
 pub use kms::{
-    KmsAppendTool, KmsCreateTool, KmsDeleteTool, KmsReadTool, KmsSearchTool, KmsWriteSourceTool,
-    KmsWriteTool,
+    KmsAppendTool, KmsCreateTool, KmsDeleteTool, KmsEditTool, KmsReadTool, KmsSearchTool,
+    KmsWriteSourceTool, KmsWriteTool,
 };
 pub use ls::LsTool;
 pub use memory::{MemoryAppendTool, MemoryReadTool, MemoryWriteTool};
@@ -253,8 +253,22 @@ pub fn activate_gate(name: &str) {
         .insert(name.to_string());
 }
 
+/// dev-plan/64 P2.5: the tools that read and maintain a knowledge base
+/// are offered once there is one. Their definitions are ~6 KB of every
+/// request, and a user who has never made a KMS was paying it for tools
+/// that could only answer "no KMS named …". The gate is "one exists", not
+/// "one is attached": `/dream`, `/kms reconcile <name>`, scheduled presets
+/// and workflows all work on a base the conversation never attached.
+/// `KmsCreate` and `KmsWrite` stay ungated — they are how the first one
+/// gets made — and the rest appear on the very next request after that.
+pub const KMS_EXISTS_GATE: &str = "kms-exists";
+
 /// Whether a named gate is currently open.
 pub fn gate_is_active(name: &str) -> bool {
+    // Not a gate anything opens: it follows the disk. See [`KMS_EXISTS_GATE`].
+    if name == KMS_EXISTS_GATE {
+        return crate::kms::any_exists();
+    }
     open_gates()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -473,6 +487,11 @@ impl ToolRegistry {
             .get(name)
             .ok_or_else(|| Error::Tool(format!("unknown tool: {name}")))?;
         if !tool_is_available(tool.as_ref()) {
+            if tool.requires_gate() == Some(KMS_EXISTS_GATE) {
+                return Err(Error::Tool(format!(
+                    "tool '{name}' needs a knowledge base and there is none yet — make one with KmsCreate"
+                )));
+            }
             if let Some(gate) = tool.requires_gate().filter(|g| !gate_is_active(g)) {
                 return Err(Error::Tool(format!(
                     "tool '{name}' is gated behind '{gate}' — invoke the matching skill to enable it"

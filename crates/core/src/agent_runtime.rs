@@ -87,6 +87,7 @@ pub async fn build_runtime_with_provider(
     tool_registry.register(Arc::new(crate::tools::KmsWriteTool));
     tool_registry.register(Arc::new(crate::tools::KmsWriteSourceTool));
     tool_registry.register(Arc::new(crate::tools::KmsAppendTool));
+    tool_registry.register(Arc::new(crate::tools::KmsEditTool));
     tool_registry.register(Arc::new(crate::tools::KmsDeleteTool));
     tool_registry.register(Arc::new(crate::tools::KmsCreateTool));
     tool_registry.register(Arc::new(crate::tools::MemoryReadTool));

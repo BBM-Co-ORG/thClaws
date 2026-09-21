@@ -27,6 +27,7 @@
 
 pub mod digest;
 pub mod graph;
+pub mod jobs;
 pub mod kms_writer;
 pub mod llm_calls;
 pub mod pipeline;
@@ -40,9 +41,27 @@ pub mod write;
 
 use crate::cancel::CancelToken;
 use crate::error::Result;
+use futures::FutureExt;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
+
+/// How far past its time budget a job may run before the watchdog fails
+/// it. The pipeline deliberately lets the plan/write phases overrun — a
+/// late page beats discarding thirty digested sources — so the ceiling
+/// has to sit well above the budget to leave that room, while still
+/// being a ceiling.
+const BUDGET_GRACE: u32 = 3;
+
+/// Render a budget the way the error message wants to read it.
+fn format_budget(d: Duration) -> String {
+    let mins = d.as_secs() / 60;
+    if mins >= 60 {
+        format!("for over {}h", mins / 60)
+    } else {
+        format!("for over {mins}m")
+    }
+}
 
 /// Stable ID for a background research job. Format `research-<8-hex>`.
 pub type JobId = String;
@@ -153,6 +172,28 @@ pub struct JobConfig {
 /// writes search queries for last year's releases and reports them as
 /// current (a 2026 run on "Chinese AI companies" pinned every query to
 /// 2025 and never found DeepSeek V4 / Qwen 3.8).
+/// A prompt in two parts: what every call of one batch says, and what only
+/// this call says (dev-plan/64 P2.6).
+///
+/// A run writes ~25 child notes and digests ~25 sources, and each prompt
+/// used to open with its own item and end with ~6 KB of rules — so no two
+/// shared a prefix, and ≈150k of ≈185k input chars in a measured run were
+/// the same boilerplate billed 25 times at full price. `shared` goes out as
+/// the system prompt: Anthropic caches that block, and the providers that
+/// cache by prefix see an identical opening on every call after the first.
+/// It must therefore be byte-identical across the batch — nothing about
+/// the item may leak into it.
+pub struct SplitPrompt {
+    pub shared: String,
+    pub item: String,
+}
+
+impl SplitPrompt {
+    pub fn joined(&self) -> String {
+        format!("{}\n\n{}", self.shared, self.item)
+    }
+}
+
 pub fn today_context() -> String {
     let today = kms_writer::today_str();
     let year = today.get(..4).unwrap_or("");
@@ -167,6 +208,50 @@ pub fn today_context() -> String {
 /// Prompt sentence for the output language. Thai is the product default;
 /// technical vocabulary is kept in English in every language so notes
 /// stay searchable and don't transliterate model / API names.
+/// Which language a text is written in, as far as the writer needs to know:
+/// `th`, `en`, or `query` ("write in the language you were asked in") for
+/// anything else. Thai wins on a modest share of the letters — a Thai
+/// document about software is a third English by character count and is
+/// still a Thai document.
+pub fn detect_language(text: &str) -> &'static str {
+    let (mut thai, mut latin, mut other) = (0usize, 0usize, 0usize);
+    for c in text.chars().filter(|c| c.is_alphabetic()) {
+        match c {
+            '\u{0E00}'..='\u{0E7F}' => thai += 1,
+            c if c.is_ascii() => latin += 1,
+            _ => other += 1,
+        }
+    }
+    let letters = thai + latin + other;
+    if letters == 0 {
+        "query"
+    } else if thai * 100 >= letters * 15 {
+        "th"
+    } else if other * 100 >= letters * 15 {
+        "query"
+    } else {
+        "en"
+    }
+}
+
+/// dev-plan/64 D6: what `auto` means. It was the literal `th`, so an English
+/// paper added to a KMS came back as Thai notes. An explicit `--lang` never
+/// gets here; the `research_language` setting pins it; otherwise the
+/// document being ingested decides, or failing that the query.
+pub fn resolve_language(configured: &str, query: &str, document: Option<&str>) -> String {
+    let c = configured.trim().to_ascii_lowercase();
+    if !c.is_empty() && c != "auto" {
+        return c;
+    }
+    if let Some(pinned) = crate::config::AppConfig::load()
+        .ok()
+        .and_then(|cfg| cfg.research_language)
+    {
+        return pinned;
+    }
+    detect_language(document.unwrap_or(query)).to_string()
+}
+
 pub fn language_rule(lang: &str) -> String {
     let keep = "Keep technical terms, product and model names, API and \
                 code identifiers, and units in English — do not translate \
@@ -197,7 +282,7 @@ impl Default for JobConfig {
             dry_run: false,
             legacy: false,
             digest_model: None,
-            language: "th".into(),
+            language: "auto".into(),
             refresh_slug: None,
             local_source: None,
             topic_slug: None,
@@ -306,6 +391,29 @@ pub struct JobView {
     /// `2026-05-09-obon-festival.md`). `None` until completion.
     pub result_page: Option<String>,
     pub error: Option<String>,
+    /// dev-plan/64 P5.4: what this run has spent so far, refreshed as
+    /// it goes. `None` before the first model call returns.
+    ///
+    /// Priced here rather than in the GUI because only the engine has
+    /// the catalogue — and refreshed on a throttle, because pricing
+    /// re-parses the baseline catalogue and reads two files, which is
+    /// not something to do once per note.
+    pub cost_usd: Option<f64>,
+    /// dev-plan/64 P5.4: how many pages the run wrote. `None` until it
+    /// finishes, because a half-finished count invites reading a run
+    /// that died as a run that produced something.
+    pub pages_written: Option<u32>,
+    /// dev-plan/64 P5.5: the slash command that would run this job
+    /// again, built when it was registered.
+    ///
+    /// Built here rather than reconstructed by the GUI, which cannot:
+    /// a refresh's `query` is the display string `refresh: <title>`,
+    /// not anything you could type. `None` where a correct retry is
+    /// not expressible — an ingest whose file path the job never kept,
+    /// a page researched from a selection that lives in another page's
+    /// prose. A button that silently does the wrong thing is worse
+    /// than no button.
+    pub retry_command: Option<String>,
 }
 
 impl JobView {
@@ -323,6 +431,38 @@ impl JobView {
             format!("{m:02}:{sec:02}")
         }
     }
+}
+
+/// The command that would run this job again, or `None` when a
+/// correct one cannot be written.
+///
+/// A retry is cheap where it is possible at all — digests are cached
+/// per source, so a second attempt pays only for what the first never
+/// got to — which is exactly why it is worth offering, and exactly why
+/// it must re-run the *same* thing rather than something close to it.
+fn retry_command_for(query: &str, config: &JobConfig) -> Option<String> {
+    let kms = config.kms_target.as_deref();
+    if let Some(slug) = &config.refresh_slug {
+        let k = kms?;
+        return Some(format!(
+            "/research refresh {} {slug}",
+            crate::repl::quote_slash_arg(k)
+        ));
+    }
+    // An ingest kept the alias, not the path it was read from; a page
+    // researched from a selection needs the selection, which lives in
+    // another page's prose. Neither is reconstructible from here.
+    if config.local_source.is_some() || config.topic_slug.is_some() {
+        return None;
+    }
+    let q = query.trim();
+    if q.is_empty() {
+        return None;
+    }
+    Some(match kms {
+        Some(k) => format!("/research --kms {} {q}", crate::repl::quote_slash_arg(k)),
+        None => format!("/research {q}"),
+    })
 }
 
 /// Thread-safe registry of running + recently-completed jobs.
@@ -388,6 +528,7 @@ impl ResearchManager {
     /// then drives the pipeline asynchronously and reports progress
     /// via [`update_phase`] / [`finalize`].
     pub fn register(&self, query: String, config: &JobConfig) -> (JobId, CancelToken) {
+        let retry_command = retry_command_for(&query, config);
         let id = format!(
             "research-{}",
             uuid::Uuid::new_v4()
@@ -412,6 +553,9 @@ impl ResearchManager {
                 kms_target: config.kms_target.clone(),
                 result_page: None,
                 error: None,
+                cost_usd: None,
+                pages_written: None,
+                retry_command,
             },
             cancel: cancel.clone(),
             deadline: Instant::now() + config.time_budget,
@@ -421,7 +565,71 @@ impl ResearchManager {
             .unwrap()
             .insert(id.clone(), Arc::new(RwLock::new(inner)));
         self.broadcast();
+        self.spawn_watchdog(&id, config.time_budget);
         (id, cancel)
+    }
+
+    /// Fail a job that is still running long after its budget.
+    ///
+    /// `is_over_budget` is only ever *polled*, and the pipeline stops
+    /// polling it once it leaves the search rounds — deliberately, so a
+    /// run that already read thirty sources is not thrown away for
+    /// crossing a timer mid-write. The cost of that choice was a job with
+    /// no ceiling at all: a task that hangs, or panics and unwinds past
+    /// `run_job`'s finalize, leaves the job `Running` for as long as the
+    /// process lives. One sat for six and three-quarter hours on a
+    /// twenty-five minute budget, with nothing in the UI to say it had
+    /// stopped and no way to clear it.
+    ///
+    /// So the ceiling is the budget times [`BUDGET_GRACE`], not the
+    /// budget: late is still allowed, forever is not.
+    fn spawn_watchdog(&self, id: &JobId, budget: Duration) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            // No runtime (tests, sync REPL paths) — nothing to spawn on.
+            return;
+        };
+        let id = id.clone();
+        handle.spawn(async move {
+            tokio::time::sleep(budget.saturating_mul(BUDGET_GRACE)).await;
+            let mgr = manager();
+            if mgr.get(&id).is_some_and(|v| !v.status.is_terminal()) {
+                mgr.cancel(&id);
+                mgr.finalize(
+                    &id,
+                    JobStatus::Failed,
+                    None,
+                    Some(format!(
+                        "no progress {} after the time budget — giving up",
+                        format_budget(budget.saturating_mul(BUDGET_GRACE))
+                    )),
+                );
+            }
+        });
+    }
+
+    /// What the run has spent so far. Only ever moves forward, so a
+    /// late `None` (a ledger read that found nothing) cannot blank a
+    /// figure the owner has already seen.
+    pub fn update_cost(&self, id: &str, cost: Option<f64>) {
+        let Some(cost) = cost else { return };
+        let changed = if let Some(j) = self.jobs.read().unwrap().get(id).cloned() {
+            let mut g = j.write().unwrap();
+            let moved = g.view.cost_usd != Some(cost);
+            g.view.cost_usd = Some(cost);
+            moved
+        } else {
+            false
+        };
+        if changed {
+            self.broadcast();
+        }
+    }
+
+    /// How many pages the run wrote, recorded once, at the end.
+    pub fn record_pages_written(&self, id: &str, n: u32) {
+        if let Some(j) = self.jobs.read().unwrap().get(id).cloned() {
+            j.write().unwrap().view.pages_written = Some(n);
+        }
     }
 
     pub fn update_phase(&self, id: &str, phase: impl Into<String>) {
@@ -535,15 +743,24 @@ impl ResearchManager {
     /// each await point and exits as `JobStatus::Cancelled`. Returns
     /// `false` if the id isn't known or the job is already terminal.
     pub fn cancel(&self, id: &str) -> bool {
-        if let Some(j) = self.jobs.read().unwrap().get(id).cloned() {
+        let Some(j) = self.jobs.read().unwrap().get(id).cloned() else {
+            return false;
+        };
+        {
             let g = j.read().unwrap();
             if g.view.status.is_terminal() {
                 return false;
             }
             g.cancel.cancel();
-            return true;
         }
-        false
+        // Signalling the token is not enough on its own: it only lands if
+        // something is still awaiting on this job's behalf. When the task
+        // has already died, Cancel used to leave the job Running with no
+        // way for the user to clear it. `finalize` ignores an already
+        // terminal job, so the pipeline's own finalize still wins the race
+        // if it is alive and exits cleanly.
+        self.finalize(id, JobStatus::Cancelled, None, None);
+        true
     }
 
     /// True if the job has exceeded its wall-clock budget. Pipeline
@@ -667,25 +884,48 @@ async fn run_job(
         // v1 prompts carry whole source bodies; keep its old ceiling.
         cfg.llm_timeout = cfg.llm_timeout.max(Duration::from_secs(900));
     }
-    let outcome = if cfg.legacy {
-        pipeline::run(&id, query, cfg, provider, model, cancel.clone()).await
-    } else {
-        let tools = tools.unwrap_or_else(pipeline::production_tools);
-        let digest = digest_provider.map(|p| {
-            let m = cfg.digest_model.clone().unwrap_or_else(|| model.clone());
-            (p, m)
-        });
-        pipeline_v2::run_with_tools(
-            &id,
-            query,
-            cfg,
-            provider,
-            model,
-            cancel.clone(),
-            tools,
-            digest,
-        )
-        .await
+    // The viewer's "create page" writes a `status: researching` placeholder
+    // before the job starts, so the link it just made resolves at once.
+    let placeholder = cfg.kms_target.clone().zip(cfg.topic_slug.clone());
+    let run = async {
+        if cfg.legacy {
+            pipeline::run(&id, query, cfg, provider, model, cancel.clone()).await
+        } else {
+            let tools = tools.unwrap_or_else(pipeline::production_tools);
+            let digest = digest_provider.map(|p| {
+                let m = cfg.digest_model.clone().unwrap_or_else(|| model.clone());
+                (p, m)
+            });
+            pipeline_v2::run_with_tools(
+                &id,
+                query,
+                cfg,
+                provider,
+                model,
+                cancel.clone(),
+                tools,
+                digest,
+            )
+            .await
+        }
+    };
+    // A panic here used to unwind straight past the finalize below, so the
+    // job stayed `Running` forever — the pipeline's most confusing failure
+    // mode, because it looks exactly like a slow model and there is
+    // nothing to read. Turn it into a job that says what happened.
+    let run = llm_calls::track_usage(run);
+    let outcome = match std::panic::AssertUnwindSafe(run).catch_unwind().await {
+        Ok(outcome) => outcome,
+        Err(panic) => {
+            let what = panic
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "no message".into());
+            Err(crate::error::Error::Tool(format!(
+                "research pipeline panicked: {what}"
+            )))
+        }
     };
     match outcome {
         Ok(result_page) => {
@@ -699,7 +939,34 @@ async fn run_job(
                 JobStatus::Failed
             };
             manager().finalize(&id, status, None, Some(s));
+            if let Some((kms, slug)) = placeholder {
+                remove_abandoned_placeholder(&kms, &slug);
+            }
         }
+    }
+}
+
+/// Delete the placeholder page a run that did not finish left behind.
+///
+/// Nothing used to: `pages/herbert-simon.md` outlived the run that died
+/// writing it, sat in the index and the graph advertising "this page is
+/// being written by /research", and was read by every later planner as a
+/// note that already covered Herbert Simon. Only a page that still says
+/// `status: researching` is touched — a run that got as far as writing
+/// the real page has replaced that, and keeps its work.
+fn remove_abandoned_placeholder(kms: &str, slug: &str) {
+    let Some(kref) = crate::kms::resolve(kms) else {
+        return;
+    };
+    let Ok(path) = kref.page_path(slug) else {
+        return;
+    };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let (fm, _) = crate::kms::parse_frontmatter(&raw);
+    if fm.get("status").map(|s| s.trim()) == Some("researching") {
+        let _ = crate::kms::delete_page(&kref, slug);
     }
 }
 
@@ -789,6 +1056,90 @@ fn days_between(from_ymd: &str, to_ymd: &str) -> i64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// A retry has to re-run the same thing, not something close to
+    /// it — and say nothing where that is impossible.
+    #[test]
+    fn retry_command_re_runs_what_ran_or_offers_nothing() {
+        let base = JobConfig::default();
+
+        // A refresh: the query is the display string `refresh: <title>`,
+        // so the command has to come from the config's slug instead.
+        let mut refresh = base.clone();
+        refresh.kms_target = Some("Age of Abundance (v2)".into());
+        refresh.refresh_slug = Some("jevons-paradox".into());
+        assert_eq!(
+            retry_command_for(
+                "refresh: \u{e1b}\u{e0f}\u{e34}\u{e17}\u{e23}\u{e23}\u{e28}\u{e19}\u{e4c}",
+                &refresh
+            )
+            .as_deref(),
+            Some("/research refresh \"Age of Abundance (v2)\" jevons-paradox")
+        );
+        // A KMS name with spaces has to come back quoted, or the retry
+        // researches the first word and treats the rest as the query.
+        let mut plain = base.clone();
+        plain.kms_target = Some("Age of Abundance (v2)".into());
+        assert_eq!(
+            retry_command_for("what changed in 2026", &plain).as_deref(),
+            Some("/research --kms \"Age of Abundance (v2)\" what changed in 2026")
+        );
+
+        assert_eq!(
+            retry_command_for("loose query", &base).as_deref(),
+            Some("/research loose query")
+        );
+
+        // Neither of these can be written correctly from what the job
+        // kept, so neither gets a button.
+        let mut ingest = base.clone();
+        ingest.local_source = Some("some-alias".into());
+        assert!(retry_command_for("q", &ingest).is_none());
+        let mut selection = base.clone();
+        selection.topic_slug = Some("herbert-simon".into());
+        assert!(retry_command_for("q", &selection).is_none());
+        assert!(retry_command_for("   ", &base).is_none());
+    }
+    /// dev-plan/64 D6. `auto` was the literal `th`: an English paper added to
+    /// a KMS came back as Thai notes.
+    #[test]
+    fn research_writes_in_the_language_of_what_it_was_given() {
+        assert_eq!(
+            detect_language("ยุคที่ความฉลาดล้นเหลือ — เราจะรู้ได้อย่างไรว่าควรสร้างอะไร"),
+            "th"
+        );
+        // A Thai document about software is a third English and still Thai.
+        assert_eq!(
+            detect_language(
+                "Claude Code เปิดให้ subagent spawn subagent ของตัวเองใน v2.1.172 โดยมี cap ห้าชั้น"
+            ),
+            "th"
+        );
+        assert_eq!(
+            detect_language("The Use of Knowledge in Society, Hayek 1945"),
+            "en"
+        );
+        assert_eq!(detect_language("知識管理とは何か"), "query");
+        assert_eq!(detect_language("2026 — 51%"), "query");
+
+        // An explicit flag is never second-guessed; `auto` follows the
+        // document before the query.
+        assert_eq!(resolve_language("en", "ยุคที่ความฉลาดล้นเหลือ", None), "en");
+        assert_eq!(
+            resolve_language("auto", "hayek-1945", Some("ความรู้กระจายอยู่ในหัวของคนจำนวนมาก")),
+            "th"
+        );
+        assert_eq!(
+            resolve_language(
+                "auto",
+                "ครัวเรือนยากจนแฝง",
+                Some("Hidden poverty is measured by expenditure.")
+            ),
+            "en"
+        );
+        assert_eq!(JobConfig::default().language, "auto");
+    }
+
     use super::*;
 
     #[test]
@@ -897,7 +1248,9 @@ mod tests {
         assert_eq!(c.llm_timeout.as_secs(), 180);
         assert_eq!(c.time_budget.as_secs(), 25 * 60);
         assert!(!c.legacy && !c.append && !c.dry_run);
-        assert_eq!(c.language, "th");
+        // dev-plan/64 D6: not "th" — `auto`, resolved per run from the
+        // document or the query.
+        assert_eq!(c.language, "auto");
         let en = JobConfig::from_flags(StartFlags {
             language: Some(" EN ".into()),
             ..Default::default()

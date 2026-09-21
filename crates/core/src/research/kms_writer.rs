@@ -193,6 +193,77 @@ pub fn today_str() -> String {
     crate::usage::today_str()
 }
 
+/// Where a run keeps what it read and did not cite (dev-plan/64 D5).
+pub const UNCITED_DIR: &str = ".uncited";
+/// How long an uncited source is kept.
+pub const UNCITED_KEEP_DAYS: u64 = 90;
+
+/// Keep a source a run digested but no note cited.
+///
+/// It used to be thrown away, so the next run on the same subject fetched it
+/// again, nobody could see what the model had read and chosen not to use,
+/// and anything that looks for evidence — `/kms verify --ground`, a refresh —
+/// could only search what had already been cited. A dot-folder, so the
+/// source lister, the catalogue and the search index all pass over it: these
+/// are not part of the knowledge base, they are its reading pile. Pruned
+/// after [`UNCITED_KEEP_DAYS`]. Never overwrites a cited archive.
+pub fn write_uncited_source(
+    kms_name: &str,
+    query: &str,
+    today: &str,
+    title: &str,
+    url: &str,
+    body: &str,
+) -> Result<Option<std::path::PathBuf>> {
+    let kref = crate::kms::resolve(kms_name).ok_or_else(|| {
+        crate::error::Error::Tool(format!("KMS '{kms_name}' not found (write_uncited_source)"))
+    })?;
+    let filename = url_to_filename(url);
+    let sources = kref.root.join("sources");
+    if sources.join(format!("{filename}.md")).exists() || body.trim().is_empty() {
+        return Ok(None);
+    }
+    let dir = sources.join(UNCITED_DIR);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| crate::error::Error::Tool(format!("create {}: {e}", dir.display())))?;
+    let path = dir.join(format!("{filename}.md"));
+    let text = format!(
+        "---\ntype: research-source\ncited: false\ntitle: \"{}\"\nurl: \"{}\"\nfetched_for: \"{}\"\nfetched_at: {today}\n---\n\n# {}\n\n**Source:** [{}]({})\n\n{}\n",
+        escape_yaml_string(title),
+        escape_yaml_string(url),
+        escape_yaml_string(query),
+        title,
+        url,
+        url,
+        body.trim()
+    );
+    crate::kms::write_file(&path, text)
+        .map_err(|e| crate::error::Error::Tool(format!("write {}: {e}", path.display())))?;
+    Ok(Some(path))
+}
+
+/// Drop uncited sources older than [`UNCITED_KEEP_DAYS`]. Returns how many.
+pub fn prune_uncited_sources(kref: &crate::kms::KmsRef) -> usize {
+    let dir = kref.root.join("sources").join(UNCITED_DIR);
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return 0;
+    };
+    let keep = std::time::Duration::from_secs(UNCITED_KEEP_DAYS * 24 * 3600);
+    let mut gone = 0;
+    for e in rd.flatten() {
+        let old = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > keep);
+        if old && std::fs::remove_file(e.path()).is_ok() {
+            gone += 1;
+        }
+    }
+    gone
+}
+
 /// M6.39.5: persist a fetched source page into the KMS's `sources/`
 /// directory for offline provenance. Called once per cited source
 /// (those whose `[N]` index appears in the synthesized markdown) so
@@ -204,6 +275,10 @@ pub fn today_str() -> String {
 /// wins). Frontmatter carries the original URL + citation index +
 /// query so a user browsing `sources/` can trace which research run
 /// produced each cached page.
+///
+/// A source that a run read and no note cited goes to `sources/.uncited/`
+/// instead — see [`write_uncited_source`]. Citing it later promotes it:
+/// this writes the real archive and removes the uncited copy.
 pub fn write_source(
     kms_name: &str,
     query: &str,
@@ -244,8 +319,28 @@ pub fn write_source(
         url,
         body.trim()
     );
-    std::fs::write(&path, body_str)
+    crate::kms::write_file(&path, &body_str)
         .map_err(|e| crate::error::Error::Tool(format!("write {}: {e}", path.display())))?;
+    let _ = std::fs::remove_file(dir.join(UNCITED_DIR).join(format!("{filename}.md")));
+    // dev-plan/64 P3.7: tell the catalogue. Only `/kms ingest` did, so a
+    // vault built by `/research` had its sources on disk and not in the
+    // catalogue — 63 of 64 in the one this was found on — and everything
+    // that reads the catalogue (the index's source list, "uncited source"
+    // hints, dedupe by hash) saw one file. Best effort: the archive is
+    // written either way, and `/kms reindex` reconciles.
+    let _ = crate::kms_sources::upsert(
+        &kref,
+        crate::kms_sources::SourceRecord {
+            file: format!("{filename}.md"),
+            title: title.to_string(),
+            origin: crate::kms_sources::Origin::Research,
+            origin_ref: url.to_string(),
+            ingested: today.to_string(),
+            bytes: body_str.len() as u64,
+            sha256: crate::kms_sources::hash_file(&path),
+            converted_from: None,
+        },
+    );
     Ok(path)
 }
 
@@ -279,11 +374,37 @@ pub fn url_to_filename(url: &str) -> String {
         }
     }
     let trimmed = slug.trim_matches('-').to_string();
-    if trimmed.is_empty() {
-        "source".into()
-    } else {
-        trimmed.chars().take(80).collect()
+    // The slug is only a name when nothing was thrown away to make it.
+    // A Thai path has no ASCII to keep (three Thai Wikipedia articles all
+    // came out as `th-wikipedia-org-wiki`), a percent-encoded one turns
+    // into hex that the 80-char cut then truncates mid-title, and any two
+    // long URLs sharing a prefix met at the cut. Each of those put two
+    // documents in one archive file, with every citation pointing at
+    // whichever was written last. When the slug is lossy it carries a
+    // hash of the whole URL; a plain short URL keeps its old name, so
+    // existing archives and the links into them are untouched.
+    let lossy = stripped.chars().any(|c| !c.is_ascii() || c == '%') || trimmed.len() > 80;
+    if !lossy {
+        return if trimmed.is_empty() {
+            "source".into()
+        } else {
+            trimmed
+        };
     }
+    let head: String = trimmed.chars().take(71).collect();
+    let head = head.trim_matches('-');
+    let head = if head.is_empty() { "source" } else { head };
+    format!("{head}-{}", short_hash(url))
+}
+
+/// First eight hex digits of SHA-256 — enough to keep two documents out
+/// of one file, short enough to stay readable in a filename.
+pub fn short_hash(s: &str) -> String {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(s.as_bytes())[..4]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// M6.39.7: ensure each research page ends with a complete
@@ -315,7 +436,11 @@ pub fn url_to_filename(url: &str) -> String {
 /// share the same shape with [`linkify_citations`].
 pub fn ensure_sources_section(
     body: &str,
-    sources: &[(u32, String, String)], // (index, title, url)
+    // (index, title, url, origin — the address to print when `url` is
+    // not one, empty otherwise). An ingested source's url is
+    // `kms://<base>/sources/<alias>`: right for resolving the in-page
+    // link, useless to a reader who follows the citation to check it.
+    sources: &[(u32, String, String, String)],
 ) -> String {
     let cited = parse_citation_indices(body);
     if cited.is_empty() {
@@ -330,9 +455,16 @@ pub fn ensure_sources_section(
 
     let mut section = String::from("\n\n## Sources\n\n");
     for n in indices {
-        if let Some((_, title, url)) = sources.iter().find(|(i, _, _)| *i == n) {
+        if let Some((_, title, url, origin)) = sources.iter().find(|(i, _, _, _)| *i == n) {
+            // The link resolves against the archive; the address printed
+            // after it is the one a reader can open.
             let rel = format!("../sources/{}.md", url_to_filename(url));
-            section.push_str(&format!("{n}. [{title}]({rel}) — {url}\n"));
+            let shown = if origin.trim().is_empty() {
+                url
+            } else {
+                origin
+            };
+            section.push_str(&format!("{n}. [{title}]({rel}) — {shown}\n"));
         } else {
             // Resolves to nothing — surface it explicitly rather
             // than silently dropping. Should be rare; would mean
@@ -362,7 +494,7 @@ pub fn ensure_sources_section(
 /// - `[non-numeric]` → not a citation, leave alone
 ///
 /// Idempotent — already-linkified citations are detected and skipped.
-pub fn linkify_citations(body: &str, sources: &[(u32, String, String)]) -> String {
+pub fn linkify_citations(body: &str, sources: &[(u32, String, String, String)]) -> String {
     let mut out = String::with_capacity(body.len() + 256);
     let bytes = body.as_bytes();
     let mut i = 0;
@@ -389,7 +521,7 @@ pub fn linkify_citations(body: &str, sources: &[(u32, String, String)]) -> Strin
 fn try_rewrite_citation_at(
     body: &str,
     pos: usize,
-    sources: &[(u32, String, String)],
+    sources: &[(u32, String, String, String)],
 ) -> Option<(String, usize)> {
     let bytes = body.as_bytes();
     debug_assert_eq!(bytes[pos], b'[');
@@ -414,7 +546,7 @@ fn try_rewrite_citation_at(
     // unambiguous single-link rewrite; leave it for the user to read
     // alongside the canonical `## Sources` section.
     let n: u32 = inner.trim().parse().ok()?;
-    let (_, _, url) = sources.iter().find(|(i, _, _)| *i == n)?;
+    let (_, _, url, _) = sources.iter().find(|(i, _, _, _)| *i == n)?;
     let rel = format!("../sources/{}.md", url_to_filename(url));
     let rewritten = format!("[{n}]({rel})");
     let consumed = after_close - pos; // bytes from `[` through `]`
@@ -770,8 +902,8 @@ mod tests {
 
     // ── linkify_citations + ensure_sources_section (M6.39.7) ──────
 
-    fn meta(idx: u32, title: &str, url: &str) -> (u32, String, String) {
-        (idx, title.into(), url.into())
+    fn meta(idx: u32, title: &str, url: &str) -> (u32, String, String, String) {
+        (idx, title.into(), url.into(), String::new())
     }
 
     #[test]
@@ -866,6 +998,43 @@ mod tests {
         assert!(out.contains("3. [Title Three]"));
         // [2] not cited → not in Sources section.
         assert!(!out.contains("Title Two"));
+    }
+
+    #[test]
+    fn an_ingested_source_is_cited_by_its_origin_not_its_kms_path() {
+        let body = "Cite [1] and [2].";
+        let sources = vec![
+            // Fetched by a run: the url IS the address.
+            meta(1, "Wikipedia: Obon", "https://en.wikipedia.org/wiki/Obon"),
+            // Ingested by the user: the url resolves the archive, the
+            // origin is what a reader can open.
+            (
+                2u32,
+                "Jevons paradox - Wikipedia".to_string(),
+                "kms://Age of Abundance (v2)/sources/Jevons_paradox".to_string(),
+                "https://en.wikipedia.org/wiki/Jevons_paradox".to_string(),
+            ),
+        ];
+        let out = ensure_sources_section(body, &sources);
+        // The link still resolves against the archived copy...
+        assert!(
+            out.contains("[Jevons paradox - Wikipedia](../sources/Jevons_paradox.md)"),
+            "{out}"
+        );
+        // ...and the address printed after it is one a browser opens.
+        assert!(
+            out.contains("— https://en.wikipedia.org/wiki/Jevons_paradox"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("— kms://"),
+            "a kms:// path must never be printed as a citation's address: {out}"
+        );
+        // A source with no origin is unaffected.
+        assert!(
+            out.contains("— https://en.wikipedia.org/wiki/Obon"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -1144,6 +1313,35 @@ mod tests {
         assert!(slug.len() <= 80);
     }
 
+    /// Two documents must never share an archive file. Every Thai
+    /// Wikipedia article used to map to `th-wikipedia-org-wiki`, so a
+    /// Thai research run cited one overwritten file for all of them.
+    #[test]
+    fn different_urls_never_share_a_filename() {
+        let urls = [
+            "https://th.wikipedia.org/wiki/ประเทศไทย",
+            "https://th.wikipedia.org/wiki/กรุงเทพมหานคร",
+            "https://th.wikipedia.org/wiki/เศรษฐกิจไทย",
+            // The same thing as a browser copies it.
+            "https://th.wikipedia.org/wiki/%E0%B8%9B%E0%B8%A3%E0%B8%B0%E0%B9%80%E0%B8%97%E0%B8%A8",
+            "https://th.wikipedia.org/wiki/%E0%B8%81%E0%B8%A3%E0%B8%B8%E0%B8%87%E0%B9%80%E0%B8%97%E0%B8%9E",
+        ];
+        // Two long URLs that agree on their first 80 characters.
+        let stem = format!("https://example.gov/reports/{}", "a".repeat(90));
+        let long = [format!("{stem}/2025"), format!("{stem}/2026")];
+
+        let mut names: Vec<String> = urls.iter().map(|u| url_to_filename(u)).collect();
+        names.extend(long.iter().map(|u| url_to_filename(u)));
+        let unique: std::collections::HashSet<&String> = names.iter().collect();
+        assert_eq!(unique.len(), names.len(), "collision: {names:?}");
+        for n in &names {
+            assert!(n.len() <= 80, "{n} is {} bytes", n.len());
+            assert!(n.is_ascii(), "archive names stay portable: {n}");
+        }
+        // Stable: the same URL always names the same file.
+        assert_eq!(url_to_filename(urls[0]), url_to_filename(urls[0]));
+    }
+
     #[test]
     fn url_to_filename_falls_back_for_empty() {
         assert_eq!(url_to_filename(""), "source");
@@ -1151,6 +1349,60 @@ mod tests {
     }
 
     // ── write_source integration ───────────────────────────────────
+
+    /// dev-plan/64 D5. What a run read and did not cite is kept, out of the
+    /// way of everything that lists the knowledge base, and becomes a real
+    /// source the moment something cites it.
+    #[test]
+    fn an_uncited_source_is_kept_aside_and_promoted_when_cited() {
+        let _g = scoped_home();
+        let k = crate::kms::create("uncited-kms", crate::kms::KmsScope::Project).unwrap();
+        let url = "https://www.oecd.org/th/รายงาน-ผลิตภาพ";
+        let kept = write_uncited_source(
+            "uncited-kms",
+            "q",
+            "2026-09-20",
+            "OECD",
+            url,
+            "เนื้อหาที่อ่านแล้วไม่ได้อ้าง",
+        )
+        .unwrap()
+        .expect("kept");
+        assert!(
+            kept.to_string_lossy().contains("/sources/.uncited/"),
+            "{}",
+            kept.display()
+        );
+        assert!(std::fs::read_to_string(&kept)
+            .unwrap()
+            .contains("cited: false"));
+        // Not a source of the knowledge base: not listed, not catalogued.
+        assert!(crate::kms::list_sources(&k).is_empty());
+        assert!(crate::kms_sources::load(&k).entries.is_empty());
+        // An empty body is not worth keeping.
+        assert!(write_uncited_source(
+            "uncited-kms",
+            "q",
+            "2026-09-20",
+            "T",
+            "https://x.test/a",
+            "  "
+        )
+        .unwrap()
+        .is_none());
+
+        let cited =
+            write_source("uncited-kms", "q", "2026-09-21", 4, "OECD", url, "เนื้อหา").unwrap();
+        assert!(cited.exists() && !kept.exists(), "citing it promotes it");
+        assert_eq!(crate::kms::list_sources(&k).len(), 1);
+        // And a cited archive is never shadowed by an uncited copy.
+        assert!(
+            write_uncited_source("uncited-kms", "q", "2026-09-22", "OECD", url, "อีกรอบ")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(prune_uncited_sources(&k), 0, "nothing is old yet");
+    }
 
     #[test]
     fn write_source_creates_file_in_sources_dir() {
@@ -1177,6 +1429,27 @@ mod tests {
         assert!(body.contains("citation_index: 3"));
         assert!(body.contains("https://en.wikipedia.org/wiki/Obon"));
         assert!(body.contains("Body content of the wikipedia"));
+
+        // dev-plan/64 P3.7: the archive is in the catalogue, under its own
+        // name, as research — and archiving it again is one record, not two.
+        let kref = crate::kms::resolve("test-kms").unwrap();
+        let cat = crate::kms_sources::load(&kref);
+        let file = path.file_name().unwrap().to_string_lossy().into_owned();
+        let rec = cat.entries.get(&file).expect("catalogued");
+        assert_eq!(rec.origin_ref, "https://en.wikipedia.org/wiki/Obon");
+        assert_eq!(rec.origin.as_str(), "research");
+        assert_eq!(rec.sha256, crate::kms_sources::hash_file(&path));
+        write_source(
+            "test-kms",
+            "what is OBON",
+            "2026-05-10",
+            3,
+            "Obon Festival - Wikipedia",
+            "https://en.wikipedia.org/wiki/Obon",
+            "Body content, refreshed.",
+        )
+        .unwrap();
+        assert_eq!(crate::kms_sources::load(&kref).entries.len(), 1);
     }
 
     #[test]

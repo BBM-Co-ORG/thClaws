@@ -25,6 +25,7 @@ impl WebFetchTool {
     pub fn new() -> Self {
         let client = reqwest::Client::builder()
             .timeout(WEB_FETCH_TIMEOUT)
+            .user_agent(crate::version::WEB_USER_AGENT)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         // Reuse hal's builder so the timeout / TLS settings stay in

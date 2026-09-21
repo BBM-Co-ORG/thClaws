@@ -1237,7 +1237,36 @@ pub fn spawn_with_roots(
 /// Re-firing ReloadConfig when a write was triggered by our own code
 /// (e.g. sidebar model picker → `ProjectConfig::set_model`) is
 /// harmless: the handler is idempotent.
+/// Watch `.thclaws/settings.json` and reload on change.
+///
+/// The setup runs on its own thread, and that is load-bearing rather
+/// than tidiness. `notify`'s macOS backend starts a CFRunLoop thread
+/// and `watch()` blocks on a channel until that thread reports itself
+/// ready; when the run loop never gets going, `watch()` never returns
+/// and never errors. Called inline — as it was — that parks whichever
+/// thread is building the session, so the engine hangs at startup with
+/// no message, and the careful `eprintln!` + `return` below never gets
+/// the chance to run.
+///
+/// Observed on the owner's machine 2026-09-21: every test that builds a
+/// session parked here forever, one thread at a time, on either volume,
+/// sandboxed or not. It took the whole `--lib` suite with it, which is
+/// a release gate.
+///
+/// Nothing waits on this watcher — it already leaks its debouncer on
+/// purpose — so moving it off the caller's thread costs nothing and
+/// turns a startup hang into a watcher that quietly never arms.
 fn spawn_settings_watcher(input_tx: mpsc::Sender<ShellInput>) {
+    std::thread::Builder::new()
+        .name("settings-watch".into())
+        .spawn(move || settings_watcher_thread(input_tx))
+        .map(|_| ())
+        .unwrap_or_else(|e| {
+            eprintln!("\x1b[33m[settings-watch] could not start thread: {e}\x1b[0m");
+        });
+}
+
+fn settings_watcher_thread(input_tx: mpsc::Sender<ShellInput>) {
     use notify_debouncer_mini::new_debouncer;
     use notify_debouncer_mini::notify::RecursiveMode;
 
@@ -1528,6 +1557,7 @@ async fn run_worker(
     tools.register(std::sync::Arc::new(crate::tools::KmsWriteTool));
     tools.register(std::sync::Arc::new(crate::tools::KmsWriteSourceTool));
     tools.register(std::sync::Arc::new(crate::tools::KmsAppendTool));
+    tools.register(std::sync::Arc::new(crate::tools::KmsEditTool));
     tools.register(std::sync::Arc::new(crate::tools::KmsDeleteTool));
     // KmsCreate bootstraps the dedicated `dreams` KMS used by
     // /dream's Pass 4 audit page — defense-in-depth so a stale
@@ -5183,13 +5213,7 @@ async fn drive_turn_stream_inner(
                         state.session_cost_usd = 0.0;
                     }
                 }
-                let token_usage = crate::model_catalogue::TokenUsage {
-                    prompt_tokens: usage.input_tokens,
-                    completion_tokens: usage.output_tokens,
-                    cached_input_tokens: usage.cache_read_input_tokens.unwrap_or(0),
-                    cache_creation_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
-                    reasoning_tokens: usage.reasoning_output_tokens.unwrap_or(0),
-                };
+                let token_usage = crate::model_catalogue::TokenUsage::from_usage(&usage);
                 let catalogue = crate::model_catalogue::EffectiveCatalogue::load();
                 if let Some(c) = catalogue.compute_cost_usd(&state.config.model, &token_usage) {
                     state.session_cost_usd += c;
@@ -5219,13 +5243,7 @@ async fn drive_turn_stream_inner(
                 )));
 
                 // Per-turn usage footer (GUI parity with the CLI REPL).
-                let cache_info = match (
-                    usage.cache_creation_input_tokens,
-                    usage.cache_read_input_tokens,
-                ) {
-                    (Some(c), Some(r)) if c > 0 || r > 0 => format!(" · cache: +{c}w/{r}r"),
-                    _ => String::new(),
-                };
+                let cache_info = usage.cache_note();
                 let cost_str = if state.session_cost_usd > 0.0 {
                     format!(" · ${:.4} session", state.session_cost_usd)
                 } else {

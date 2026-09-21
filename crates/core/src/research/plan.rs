@@ -3,7 +3,7 @@
 
 use super::digest::{sanitize_slug, Claim, Digest};
 use super::graph::KnownNote;
-use super::llm_calls::oneshot;
+use super::llm_calls::{oneshot, oneshot_planning};
 use crate::cancel::CancelToken;
 use crate::error::Result;
 use crate::providers::Provider;
@@ -149,6 +149,10 @@ pub fn build_tables(digests: &[Digest]) -> Tables {
     t
 }
 
+/// Bounds on the existing-notes block of the plan prompt.
+const KNOWN_NOTE_ROWS: usize = 150;
+const KNOWN_NOTE_BYTES: usize = 24 * 1024;
+
 pub fn build_plan_prompt(
     query: &str,
     tables: &Tables,
@@ -175,8 +179,36 @@ pub fn build_plan_prompt(
     ));
     if !known.is_empty() {
         s.push_str("=== Notes that ALREADY EXIST (slug — title — summary). Prefer `update` over a new near-duplicate ===\n");
-        for k in known.iter().take(150) {
-            s.push_str(&format!("- {} — {} — {}\n", k.slug, k.title, k.summary));
+        // Most relevant first, then cut — by rows and by bytes, since a
+        // Thai summary is three bytes a character and 150 of them were
+        // ~100 KB of every plan prompt.
+        let entity_slugs: std::collections::HashSet<&str> =
+            tables.entities.keys().map(String::as_str).collect();
+        let about = format!(
+            "{query} {}",
+            tables
+                .entities
+                .values()
+                .map(|e| e.0.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let ranked = super::graph::rank_known(known, &about, &entity_slugs);
+        let (mut shown, mut bytes) = (0usize, 0usize);
+        for k in &ranked {
+            let row = format!("- {} — {} — {}\n", k.slug, k.title, k.summary);
+            if shown == KNOWN_NOTE_ROWS || bytes + row.len() > KNOWN_NOTE_BYTES {
+                break;
+            }
+            bytes += row.len();
+            shown += 1;
+            s.push_str(&row);
+        }
+        if shown < ranked.len() {
+            s.push_str(&format!(
+                "… {} more existing notes, less related to this run, are not listed — a slug you invent may already exist.\n",
+                ranked.len() - shown
+            ));
         }
         s.push('\n');
     }
@@ -227,9 +259,10 @@ pub fn build_plan_prompt(
             .map(|k| k.title.as_str())
             .unwrap_or(a);
         s.push_str(&format!(
-            "=== REFRESH MODE ===\nThis run refreshes the EXISTING note `{a}` ({title}). It must appear in the plan \
-             with action `update` and receive every claim that concerns it (newest facts first). Do NOT create a MOC. \
-             Other notes only if a claim clearly belongs elsewhere.\n\n"
+            "=== REFRESH MODE ===\nThis run refreshes ONE existing note: `{a}` ({title}). Plan exactly that note, \
+             action `update`, and give it every claim that concerns it (newest facts first). Do NOT create a MOC and \
+             do NOT plan any other note — a refresh adds references and citations to the page it was asked about; \
+             it does not grow the knowledge base.\n\n"
         ));
     }
     s.push_str(&format!(
@@ -241,6 +274,11 @@ pub fn build_plan_prompt(
            page needs to link it. Below that, fold it into its parent (a model into its maker, a person into their company).\n\
          - When the query is about organisations or people, one note per organisation/person comes first; a product or \
            model gets a separate note only when it has ≥ 4 claims of its own.\n\
+         - A slug names what the note is ABOUT, at the scope the note actually covers, and agrees with its title: if the \
+           title needed a qualifier, so does the slug. The plain name of a thing is reserved for a note about that thing. \
+           A note covering one aspect of it scopes the slug to that aspect — `claude-code-subagent-nesting`, never \
+           `claude-code`, for a note about how deeply Claude Code nests subagents. Slugs are permanent, so a note that \
+           takes the plain name leaves the thing itself nowhere to live later.\n\
          - Do NOT drop a well-sourced entity to stay under the cap of {max_notes} notes INCLUDING the topic page; \
            merge thin ones instead.\n\
          - `role` = one clause (title language) saying why the topic page links to this note.\n\
@@ -409,7 +447,8 @@ pub fn parse_plan_report(
     let mut moc: Option<NotePlan> = None;
     for r in parsed {
         let slug = sanitize_slug(&r.slug);
-        if slug.is_empty() || !seen.insert(slug.clone()) {
+        if slug.is_empty() || crate::kms::is_reserved_page_stem(&slug) || !seen.insert(slug.clone())
+        {
             continue;
         }
         let kind = NoteKind::parse(&r.kind);
@@ -534,8 +573,14 @@ pub fn parse_plan_report(
         .map(|c| c.id.clone())
         .collect();
     if let Some(a) = anchor {
-        // Refresh mode: the anchored note absorbs the orphans and is
-        // forced to `update`; no MOC is synthesised.
+        // Refresh mode: the anchored note is the only note. Owner's rule
+        // (2026-09-20): "refresh should only refresh — no new pages, just
+        // references and citations." One refresh of `jevons-paradox` had
+        // written ten pages, nine of them new (Nvidia, DeepSeek, Nadella),
+        // and a vault about abundance began turning into AI-compute news.
+        // Every other planned note is dropped here, whatever the model
+        // planned; its claims fall to the anchor with the other orphans,
+        // so nothing the run learned is lost — it is cited where asked.
         let a = sanitize_slug(a);
         let title = known
             .iter()
@@ -570,18 +615,39 @@ pub fn parse_plan_report(
                 anchor_note.claim_ids.push(id);
             }
         }
-        for n in &notes {
-            if !anchor_note.related.contains(&n.slug) {
-                anchor_note.related.push(n.slug.clone());
+        let dropped: Vec<String> = notes
+            .iter()
+            .filter(|n| n.slug != a)
+            .map(|n| n.slug.clone())
+            .collect();
+        for n in notes.iter().filter(|n| n.slug != a) {
+            for id in &n.claim_ids {
+                if !anchor_note.claim_ids.contains(id) {
+                    anchor_note.claim_ids.push(id.clone());
+                }
             }
         }
-        notes.retain(|n| n.slug != a);
-        notes.push(anchor_note);
+        if !dropped.is_empty() {
+            let w = format!(
+                "refresh writes only `{a}`: {} other planned note(s) were not created, and their claims went to it — {}",
+                dropped.len(),
+                dropped.join(", ")
+            );
+            eprintln!("[research] {w}");
+            warnings.push(w);
+        }
+        let mut notes = vec![anchor_note];
+        // Links only to notes that exist: nothing new is being written.
         prune_related(&mut notes, &known_slugs);
         return (notes, warnings);
     }
+    // `topic_slug` arrives as a page name the caller already resolved —
+    // for an ingest run it is the alias of the stub at `pages/<alias>.md`
+    // that this MOC is about to become. Re-slugging it here is how a Thai
+    // topic page ended up named "", and it would still fold an alias's
+    // '_' to '-' and miss the stub. Take it as given.
     let mut moc = moc.unwrap_or_else(|| NotePlan {
-        slug: sanitize_slug(topic_slug),
+        slug: topic_slug.to_string(),
         kind: NoteKind::Moc,
         title: topic_title.to_string(),
         action: Action::Create,
@@ -590,7 +656,7 @@ pub fn parse_plan_report(
         role: String::new(),
         outline: Vec::new(),
     });
-    moc.slug = sanitize_slug(topic_slug);
+    moc.slug = topic_slug.to_string();
     moc.kind = NoteKind::Moc;
     moc.claim_ids = tables.claims.iter().map(|c| c.id.clone()).collect();
     moc.action = if known_slugs.contains(moc.slug.as_str()) {
@@ -678,12 +744,11 @@ fn alias_to_known(notes: &mut Vec<NotePlan>, known: &[KnownNote]) {
     *notes = merged;
 }
 
+/// Notes are merged on this key, so it must never make two different
+/// titles equal — see [`crate::kms::fold_for_compare`] for how the old
+/// `is_alphanumeric` filter did exactly that to Thai.
 fn normalize_title(t: &str) -> String {
-    t.trim()
-        .to_lowercase()
-        .chars()
-        .filter(|c| c.is_alphanumeric())
-        .collect()
+    crate::kms::fold_for_compare(t)
 }
 
 /// Drop `related` slugs that neither this plan nor the KMS will have —
@@ -706,12 +771,11 @@ fn fallback_notes(
     cap: usize,
 ) -> Vec<NotePlan> {
     let known_slugs: HashSet<&str> = known.iter().map(|k| k.slug.as_str()).collect();
-    let topic = sanitize_slug(topic_slug);
     let mut ents: Vec<(&String, &(String, String, u32, u32))> = tables
         .entities
         .iter()
         .filter(|(slug, (_, _, claims, sources))| {
-            **slug != topic && (*sources >= 2 || *claims >= 3)
+            **slug != topic_slug && (*sources >= 2 || *claims >= 3)
         })
         .collect();
     ents.sort_by(|a, b| (b.1 .3, b.1 .2).cmp(&(a.1 .3, a.1 .2)).then(a.0.cmp(b.0)));
@@ -781,8 +845,8 @@ pub async fn plan_notes(
     let prompt = build_plan_prompt(
         query, tables, known, topic_slug, max_notes, language, anchor,
     );
-    let raw = oneshot(provider, model, prompt, timeout, cancel).await?;
-    let (notes, warnings) = parse_plan_report(
+    let raw = oneshot_planning(provider, model, prompt, timeout, cancel).await?;
+    let (mut notes, warnings) = parse_plan_report(
         &raw,
         tables,
         known,
@@ -791,6 +855,18 @@ pub async fn plan_notes(
         max_notes,
         anchor,
     );
+    // dev-plan/64 P4.3: a child note's `role` says why the topic page
+    // links to it, and becomes its `topic:`. The topic page has no
+    // parent to be linked from, so the question it answers is the
+    // nearest true thing — and it is the page in a run most worth
+    // describing in the index. Not its title, which `topic:` must not
+    // restate. Set here because this is where the query is; the prompt
+    // builder skips a MOC's role, so nothing else changes.
+    for n in &mut notes {
+        if n.kind == NoteKind::Moc && n.role.trim().is_empty() {
+            n.role = query.trim().to_string();
+        }
+    }
     Ok(PlanOutcome {
         notes,
         warnings,
@@ -977,6 +1053,128 @@ mod tests {
             "topic page gets every claim, orphans included"
         );
         assert_eq!(moc.related, vec!["overtime-pay"]);
+    }
+
+    /// A Thai topic page must survive planning under its own name.
+    ///
+    /// This is where ingesting a Thai document actually died: the run had
+    /// already resolved a good topic slug, and `parse_plan` re-slugged it
+    /// through an ASCII-only sanitiser that returned "" — then wrote the
+    /// MOC to a page called nothing, and the KMS refused it. Testing the
+    /// slug helper alone passed while the feature stayed broken, so this
+    /// pins the stage that failed.
+    /// Owner's rule: a refresh only refreshes. Whatever the model plans, one
+    /// page is written — the one asked about — and everything the run
+    /// learned is cited there. A real refresh of one page had written ten.
+    #[test]
+    fn a_refresh_writes_only_the_page_it_was_asked_about() {
+        let t = build_tables(&[
+            digest(
+                1,
+                &[("jevons-paradox", "Jevons")],
+                &[("rebound over 50%", &["jevons-paradox"])],
+            ),
+            digest(
+                2,
+                &[("satya-nadella", "Nadella"), ("nvidia", "Nvidia")],
+                &[
+                    ("Nadella cited Jevons", &["satya-nadella"]),
+                    ("Nvidia fell 17%", &["nvidia"]),
+                ],
+            ),
+        ]);
+        let known = vec![
+            KnownNote {
+                slug: "jevons-paradox".into(),
+                title: "Jevons Paradox".into(),
+                summary: String::new(),
+                kind: "concept".into(),
+                updated: None,
+            },
+            KnownNote {
+                slug: "theory-of-constraints".into(),
+                title: "ToC".into(),
+                summary: String::new(),
+                kind: "concept".into(),
+                updated: None,
+            },
+        ];
+        // The model ignores the instruction and plans a small encyclopedia.
+        let raw = r#"[
+          {"slug":"jevons-paradox","kind":"concept","title":"Jevons","action":"update","entities":["jevons-paradox"],"related":["satya-nadella","theory-of-constraints"]},
+          {"slug":"satya-nadella","kind":"entity","title":"Nadella","action":"create","entities":["satya-nadella"]},
+          {"slug":"nvidia-ai-compute-dominance","kind":"entity","title":"Nvidia","action":"create","entities":["nvidia"]}
+        ]"#;
+        let (plan, warnings) = parse_plan_report(
+            raw,
+            &t,
+            &known,
+            "refresh-jevons-paradox",
+            "Jevons",
+            30,
+            Some("jevons-paradox"),
+        );
+        assert_eq!(plan.len(), 1, "{plan:?}");
+        let n = &plan[0];
+        assert_eq!(
+            (n.slug.as_str(), n.action),
+            ("jevons-paradox", Action::Update)
+        );
+        assert_eq!(
+            n.claim_ids.len(),
+            3,
+            "every claim of the run is cited here: {:?}",
+            n.claim_ids
+        );
+        assert_eq!(
+            n.related,
+            vec!["theory-of-constraints"],
+            "links only to notes that exist"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("satya-nadella") && w.contains("not created")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn a_thai_topic_page_keeps_its_name_through_planning() {
+        let t = build_tables(&[digest(
+            1,
+            &[("ยุคที่ความฉลาดล้นเหลือ", "ยุคที่ความฉลาดล้นเหลือ")],
+            &[("a", &["ยุคที่ความฉลาดล้นเหลือ"])],
+        )]);
+        let topic = "ยุคที่ความฉลาดล้นเหลือ";
+
+        // The model answers in Thai, including for the topic page itself.
+        let raw = r#"[
+          {"slug":"เศรษฐศาสตร์ของความอุดมสมบูรณ์","kind":"concept","title":"เศรษฐศาสตร์","action":"create","claim_ids":["s1c1"],"related":[]}
+        ]"#;
+        let plan = parse_plan(raw, &t, &[], topic, "ยุคที่ความฉลาดล้นเหลือ", 12, None);
+
+        let moc = plan.iter().find(|n| n.kind == NoteKind::Moc).expect("moc");
+        assert_eq!(moc.slug, topic, "the MOC must keep the name it was given");
+        assert!(
+            plan.iter().any(|n| n.slug == "เศรษฐศาสตร์ของความอุดมสมบูรณ์"),
+            "a Thai note slug must not be dropped: {plan:?}"
+        );
+
+        // Every planned name has to be one the KMS will actually take.
+        let kref = crate::kms::KmsRef {
+            name: "t".into(),
+            scope: crate::kms::KmsScope::Project,
+            root: std::env::temp_dir().join("thclaws-thai-plan-test"),
+        };
+        for n in &plan {
+            assert!(!n.slug.is_empty(), "empty slug in {n:?}");
+            assert!(
+                crate::kms::writable_page_path(&kref, &n.slug).is_ok(),
+                "KMS refused {:?}",
+                n.slug
+            );
+        }
     }
 
     #[test]

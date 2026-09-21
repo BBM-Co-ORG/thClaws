@@ -36,7 +36,7 @@ impl SourceRegistry {
             std::fs::create_dir_all(d)
                 .map_err(|e| crate::error::Error::Tool(format!("create {}: {e}", d.display())))?;
         }
-        std::fs::write(&p, serde_json::to_string_pretty(self).unwrap_or_default())
+        crate::kms::write_file(&p, serde_json::to_string_pretty(self).unwrap_or_default())
             .map_err(|e| crate::error::Error::Tool(format!("write {}: {e}", p.display())))
     }
 

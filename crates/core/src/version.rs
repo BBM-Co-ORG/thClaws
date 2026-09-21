@@ -5,6 +5,15 @@
 
 /// Cargo package version (e.g. "0.1.0").
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Sent on every request to a site we do not own. reqwest sends no
+/// User-Agent at all by default, and a bare request is refused outright
+/// by GitHub and by Wikipedia, whose policy requires one — so a missing
+/// header is not a politeness issue, it is a 403.
+pub const WEB_USER_AGENT: &str = concat!(
+    "thclaws/",
+    env!("CARGO_PKG_VERSION"),
+    " (+https://thclaws.ai)"
+);
 /// Short git commit hash at build time (e.g. "a1b2c3d"), or "unknown".
 pub const GIT_SHA: &str = env!("THCLAWS_GIT_SHA");
 /// Branch that was checked out at build time, or "unknown".

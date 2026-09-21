@@ -205,6 +205,7 @@ mod tests {
         r.register(Arc::new(crate::tools::KmsWriteTool));
         r.register(Arc::new(crate::tools::KmsWriteSourceTool));
         r.register(Arc::new(crate::tools::KmsAppendTool));
+        r.register(Arc::new(crate::tools::KmsEditTool));
         r.register(Arc::new(crate::tools::KmsDeleteTool));
         r.register(Arc::new(crate::tools::KmsCreateTool));
         Arc::new(r)

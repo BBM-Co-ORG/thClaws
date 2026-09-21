@@ -682,6 +682,7 @@ where
                 continue;
             }
             eprintln!("\x1b[2m[bot:{}]\x1b[0m {line}", bot.slug);
+            crate::util::copy_to_engine_log(&format!("[bot:{}] {line}", bot.slug));
             if is_stderr {
                 let mut tail = bot.stderr_tail.lock().expect("bot stderr tail");
                 if tail.len() == STDERR_TAIL_LINES {

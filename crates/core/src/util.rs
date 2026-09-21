@@ -122,12 +122,215 @@ pub fn panic_is_print_failure(text: &str) -> bool {
     text.contains("failed printing to")
 }
 
+/// Largest `engine.log` we keep before rolling it to `engine.log.1`.
+const ENGINE_LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Send this process's stderr to `<workspace>/.thclaws/state/logs/engine.log`
+/// when there is no terminal to read it.
+///
+/// The engine narrates itself over stderr — each research round, each
+/// digest and its timing, each provider fallback — and that narration is
+/// the first thing anyone wants when a run misbehaves. Started from a
+/// shell it reaches the shell. Double-clicked as a desktop app it reaches
+/// nothing, which is why a research job that stopped dead left only the
+/// line its panic hook managed to save, and one that stopped *without*
+/// panicking would have left nothing at all.
+///
+/// Call this from the desktop window only. Every other surface has a
+/// reader: a supervised `--serve` child's stderr is read by the window
+/// itself, which relays it prefixed and keeps a tail that is the only
+/// account of a child that dies before it serves. Taking that away to
+/// write a file would trade one blindness for another — and is
+/// unnecessary, since the window's own log already receives those relayed
+/// lines.
+///
+/// Does nothing under a terminal. Entirely best effort otherwise: any
+/// failure leaves the original stderr alone, because losing the log is
+/// better than failing to start.
+pub fn redirect_stderr_to_log() {
+    use std::io::IsTerminal as _;
+    if std::io::stderr().is_terminal() {
+        return;
+    }
+    let dir = log_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = dir.join("engine.log");
+    // One generation back is enough to cover "what happened just before
+    // the restart" without letting a chatty run fill the disk.
+    if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > ENGINE_LOG_MAX_BYTES {
+        let _ = std::fs::rename(&path, dir.join("engine.log.1"));
+    }
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        return;
+    };
+
+    // Every process in a host workspace — the window and one `--serve`
+    // child per agent — appends to this one file, so each start stamps who
+    // it is. O_APPEND keeps a line from landing inside another's.
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd as _;
+        // dup2 duplicates the descriptor, so dropping `file` afterwards
+        // leaves fd 2 pointing at the log.
+        if unsafe { libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO) } < 0 {
+            return;
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::System::Console::{SetStdHandle, STD_ERROR_HANDLE};
+        if unsafe { SetStdHandle(STD_ERROR_HANDLE, file.as_raw_handle() as _) } == 0 {
+            return;
+        }
+        // SetStdHandle does not take ownership; the handle must outlive it.
+        std::mem::forget(file);
+    }
+
+    log_line(&format!(
+        "\n=== thclaws {} pid {} — {} — {}",
+        env!("CARGO_PKG_VERSION"),
+        std::process::id(),
+        chrono::Utc::now().to_rfc3339(),
+        std::env::args().collect::<Vec<_>>().join(" ")
+    ));
+}
+
+/// Keep a copy of an agent's line in `engine.log` when the window was
+/// started from a terminal. There stderr is the shell, which is right for
+/// whoever is watching it and useless to `/logs` — asked from the chat
+/// tab, by someone who cannot see that shell. When stderr is already the
+/// log file this does nothing, or every line would land twice.
+pub fn copy_to_engine_log(line: &str) {
+    use std::io::{IsTerminal as _, Write as _};
+    static OPEN: std::sync::Mutex<Option<(PathBuf, std::fs::File)>> = std::sync::Mutex::new(None);
+    if !std::io::stderr().is_terminal() {
+        return;
+    }
+    let dir = log_dir();
+    let mut open = OPEN.lock().unwrap_or_else(|e| e.into_inner());
+    // The window can be pointed at another workspace while it runs.
+    if open.as_ref().map(|(d, _)| d != &dir).unwrap_or(true) {
+        *open = None;
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        let path = dir.join("engine.log");
+        if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > ENGINE_LOG_MAX_BYTES {
+            let _ = std::fs::rename(&path, dir.join("engine.log.1"));
+        }
+        let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        else {
+            return;
+        };
+        let _ = writeln!(
+            file,
+            "\n=== thclaws {} pid {} — {} — agent output, window started from a terminal",
+            env!("CARGO_PKG_VERSION"),
+            std::process::id(),
+            chrono::Utc::now().to_rfc3339(),
+        );
+        *open = Some((dir, file));
+    }
+    if let Some((_, file)) = open.as_mut() {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+/// `<workspace>/.thclaws/state/logs`, where both log files live.
+pub fn log_dir() -> PathBuf {
+    crate::workdir::workspace_root().join(".thclaws/state/logs")
+}
+
+/// Render the tail of one of the engine's logs for `/logs`.
+///
+/// `panic` picks `panic.log` over `engine.log`. The panic log is short and
+/// precious, so it is never truncated by this; `lines` applies to the
+/// engine log.
+///
+/// The point of the command is that these files are findable at all. A
+/// research job once sat dead for the better part of a day with the answer
+/// sitting in `panic.log`, because nothing in the product ever mentioned
+/// that the file exists — so the engine-log view always ends by saying
+/// whether there are panics to go and read.
+pub fn tail_log(panic: bool, lines: usize) -> String {
+    let dir = log_dir();
+    let path = dir.join(if panic { "panic.log" } else { "engine.log" });
+    let mut out = String::new();
+
+    let Ok(body) = std::fs::read_to_string(&path) else {
+        out.push_str(&format!("no log at {}\n", path.display()));
+        if !panic {
+            out.push_str(
+                "\nNothing has been logged in this workspace yet. A `thclaws --cli` or\n\
+                 `--serve` started from a shell logs to that shell, not to this file.\n",
+            );
+        }
+        return out;
+    };
+
+    let all: Vec<&str> = body.lines().collect();
+    let shown = if panic {
+        all.len()
+    } else {
+        lines.min(all.len())
+    };
+    let skipped = all.len() - shown;
+    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    out.push_str(&format!(
+        "{} — {}, {} line(s){}\n\n",
+        path.display(),
+        human_bytes(size),
+        all.len(),
+        if skipped > 0 {
+            format!(", showing the last {shown}")
+        } else {
+            String::new()
+        }
+    ));
+    for line in &all[skipped..] {
+        out.push_str(line);
+        out.push('\n');
+    }
+
+    if !panic {
+        let panics = std::fs::read_to_string(dir.join("panic.log"))
+            .map(|p| p.lines().filter(|l| !l.trim().is_empty()).count())
+            .unwrap_or(0);
+        if panics > 0 {
+            out.push_str(&format!(
+                "\n\x1b[33m⚠ {panics} panic(s) recorded — /logs panic\x1b[0m\n"
+            ));
+        }
+    }
+    out
+}
+
+fn human_bytes(n: u64) -> String {
+    if n >= 1024 * 1024 {
+        format!("{:.1} MB", n as f64 / (1024.0 * 1024.0))
+    } else if n >= 1024 {
+        format!("{} KB", n / 1024)
+    } else {
+        format!("{n} B")
+    }
+}
+
 /// Keep a panic where a dead stderr cannot swallow it: append it to
 /// `<workspace>/.thclaws/state/logs/panic.log`. Best effort by design — a
 /// panic handler that can itself fail is how #210 became an abort.
 pub fn write_panic_log(text: &str) {
     use std::io::Write as _;
-    let dir = crate::workdir::workspace_root().join(".thclaws/state/logs");
+    let dir = log_dir();
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }

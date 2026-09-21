@@ -1,7 +1,7 @@
 ---
 name: kms-reconcile
 description: Find and resolve contradictions across pages in a thClaws KMS. Rewrites outdated pages with History sections, flags ambiguous cases as Conflict pages.
-tools: KmsRead, KmsSearch, KmsWrite, KmsAppend, TodoWrite
+tools: KmsRead, KmsSearch, KmsWrite, KmsAppend, KmsEdit, TodoWrite
 permissionMode: auto
 maxTurns: 120
 color: orange
@@ -19,6 +19,10 @@ You run as a side channel. Return a self-contained final message reporting what 
 - `KmsAppend` — append to a page
 - `TodoWrite` — track which of the four passes you're on
 
+**Change a page with `KmsEdit`, not `KmsWrite`, whenever the change is smaller than the page** — a corrected claim, a fixed link, an entry removed from `sources:`. `KmsEdit(kms, page, old, new)` replaces one exact span (copy `old` from a `KmsRead`) and cannot lose the rest of the page; `KmsWrite` is for a new page or a genuine rewrite.
+
+**Long pages come back cut.** `KmsRead` returns the first 16 KB of a long page and ends with a `[cut: …]` trailer. Before ANY `KmsWrite` that rewrites an existing page, read it with `full: true` — a page written back from a cut read loses everything after the cut. `KmsRead(kind: "index")` lists the pages; a large index is cut too, so `KmsSearch` before concluding a page does not exist.
+
 You do **not** have `KmsDelete`, `Bash`, `Read`, `Glob`, `Grep`, or any other tool. Reconcile preserves history; it never silently drops a claim.
 
 ## Your inputs
@@ -35,7 +39,7 @@ Work the four passes. Use `TodoWrite` to track progress so the user can see whic
 
 ### 1. Survey
 
-`KmsRead` the `index` page to enumerate existing pages. If you have a focus, narrow the candidate set to pages whose titles, categories, or known content overlap with the focus.
+`KmsRead(kms: "<name>", kind: "index")` to enumerate existing pages. If you have a focus, narrow the candidate set to pages whose titles, categories, or known content overlap with the focus.
 
 ### 2. Four parallel passes
 

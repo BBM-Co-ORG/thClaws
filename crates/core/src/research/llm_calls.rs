@@ -919,24 +919,17 @@ fn clamp01(v: f32) -> f32 {
     }
 }
 
+/// The `--legacy` pipeline's page slug. It kept ASCII only and fell back to
+/// the literal `research`, so every Thai, Chinese or Arabic page of a run
+/// was named `research` and each one overwrote the last (dev-plan/64
+/// P3.10). Same rules as the v2 slugger now; the fallback is only for a
+/// name with nothing usable in it at all.
 fn sanitize_slug(raw: &str) -> String {
-    let lower = raw.trim().to_ascii_lowercase();
-    let mut out = String::new();
-    let mut prev_dash = true;
-    for c in lower.chars() {
-        if c.is_ascii_alphanumeric() {
-            out.push(c);
-            prev_dash = false;
-        } else if (c == '-' || c == ' ' || c == '_') && !prev_dash {
-            out.push('-');
-            prev_dash = true;
-        }
-    }
-    let trimmed = out.trim_matches('-').to_string();
-    if trimmed.is_empty() {
+    let slug = super::digest::sanitize_slug(&raw.replace('_', " "));
+    if slug.is_empty() {
         "research".into()
     } else {
-        trimmed
+        slug
     }
 }
 
@@ -1071,6 +1064,149 @@ pub async fn oneshot_pub(
     oneshot(provider, model, prompt, timeout, cancel).await
 }
 
+/// What a run's LLM calls came to, per model — a run uses up to two (the
+/// worker and the digest model), priced differently.
+#[derive(Debug, Default, Clone)]
+pub struct RunUsage {
+    pub by_model: std::collections::BTreeMap<String, ModelUsage>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ModelUsage {
+    pub calls: u32,
+    /// Uncached input, as providers report it.
+    pub input: u64,
+    pub cached: u64,
+    pub cache_written: u64,
+    pub output: u64,
+}
+
+impl RunUsage {
+    fn add(&mut self, model: &str, u: &crate::providers::Usage) {
+        let m = self.by_model.entry(model.to_string()).or_default();
+        m.calls += 1;
+        m.input += u.input_tokens as u64;
+        m.cached += u.cache_read_input_tokens.unwrap_or(0) as u64;
+        m.cache_written += u.cache_creation_input_tokens.unwrap_or(0) as u64;
+        m.output += u.output_tokens as u64;
+    }
+
+    pub fn calls(&self) -> u32 {
+        self.by_model.values().map(|m| m.calls).sum()
+    }
+
+    /// `None` when any model that was used has no price — a partial sum
+    /// would read as the cost of the run.
+    pub fn cost_usd(&self) -> Option<f64> {
+        let catalogue = crate::model_catalogue::EffectiveCatalogue::load();
+        let cap = |n: u64| n.min(u32::MAX as u64) as u32;
+        self.by_model
+            .iter()
+            .map(|(model, m)| {
+                catalogue.compute_cost_usd(
+                    model,
+                    &crate::model_catalogue::TokenUsage {
+                        prompt_tokens: cap(m.input + m.cached),
+                        completion_tokens: cap(m.output),
+                        cached_input_tokens: cap(m.cached),
+                        cache_creation_tokens: cap(m.cache_written),
+                        reasoning_tokens: 0,
+                    },
+                )
+            })
+            .sum()
+    }
+
+    /// Frontmatter lines for the run log; empty when nothing was recorded.
+    pub fn frontmatter(&self) -> String {
+        if self.by_model.is_empty() {
+            return String::new();
+        }
+        let (mut input, mut cached, mut output) = (0u64, 0u64, 0u64);
+        for m in self.by_model.values() {
+            input += m.input;
+            cached += m.cached;
+            output += m.output;
+        }
+        let mut s = format!(
+            "llm_calls: {}\ninput_tokens: {input}\ncached_input_tokens: {cached}\noutput_tokens: {output}\n",
+            self.calls()
+        );
+        if let Some(c) = self.cost_usd() {
+            s.push_str(&format!("cost_usd: {c:.4}\n"));
+        }
+        s
+    }
+}
+
+tokio::task_local! {
+    static RUN_USAGE: std::sync::Arc<std::sync::Mutex<RunUsage>>;
+}
+
+/// Run `fut` with a usage ledger that every `oneshot` inside it adds to.
+/// Task-local, so it follows the run through `join_all` and
+/// `buffer_unordered` (same task) without a parameter on every call; a call
+/// made outside any ledger — a test, another feature — records nothing.
+pub async fn track_usage<F: std::future::Future>(fut: F) -> F::Output {
+    RUN_USAGE
+        .scope(
+            std::sync::Arc::new(std::sync::Mutex::new(RunUsage::default())),
+            fut,
+        )
+        .await
+}
+
+/// The ledger so far, for the run log.
+pub fn usage_so_far() -> RunUsage {
+    RUN_USAGE
+        .try_with(|u| u.lock().map(|g| g.clone()).unwrap_or_default())
+        .unwrap_or_default()
+}
+
+/// What a call is for, which decides whether the model thinks first.
+///
+/// Every research call ran with thinking off, on one measurement: a digest
+/// took 77–89 s and 5–13k reasoning tokens with it, 4–7 s without. True of
+/// digests — extraction is mechanical, and there are twenty of them. It was
+/// then applied to calls that are nothing like a digest. An auditor forced
+/// to answer without thinking flagged different sentences on every run,
+/// agreed with itself on 1 sentence of 18, and twice listed a sentence as
+/// unsupported while its own reason concluded "so it is supported".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallKind {
+    /// Extraction: digests, slugs, queries. Never thinks.
+    Mechanical,
+    /// A verdict on text that already exists: an audit finding, a grounding
+    /// proposal. Thinks unless `research_thinking` is `off`.
+    Judgement,
+    /// The note plan. It is a judgement, and it was given thinking with the
+    /// others — and one plan call went from 48.7 s to 357 s, on a refresh
+    /// whose plan the code overrides anyway. Thinks only when
+    /// `research_thinking` is `all`, like a note body.
+    Planning,
+    /// A note body. Thinks only when `research_thinking` is `all`.
+    Writing,
+}
+
+impl CallKind {
+    fn thinking_budget(self) -> u32 {
+        let setting = crate::config::AppConfig::load()
+            .ok()
+            .and_then(|c| c.research_thinking)
+            .unwrap_or_else(|| "judgement".into());
+        let on = match (self, setting.as_str()) {
+            (Self::Mechanical, _) | (_, "off") => false,
+            (Self::Judgement, _) => true,
+            (Self::Planning | Self::Writing, s) => s == "all",
+        };
+        if on {
+            crate::providers::ThinkingLevel::LOW_BUDGET
+        } else {
+            0
+        }
+    }
+}
+
 pub(super) async fn oneshot(
     provider: &dyn Provider,
     model: &str,
@@ -1078,16 +1214,98 @@ pub(super) async fn oneshot(
     timeout: Duration,
     cancel: &CancelToken,
 ) -> Result<String> {
+    oneshot_with_system(
+        provider,
+        model,
+        None,
+        prompt,
+        timeout,
+        cancel,
+        CallKind::Mechanical,
+    )
+    .await
+}
+
+/// The note plan. See [`CallKind::Planning`].
+pub(super) async fn oneshot_planning(
+    provider: &dyn Provider,
+    model: &str,
+    prompt: String,
+    timeout: Duration,
+    cancel: &CancelToken,
+) -> Result<String> {
+    oneshot_with_system(
+        provider,
+        model,
+        None,
+        prompt,
+        timeout,
+        cancel,
+        CallKind::Planning,
+    )
+    .await
+}
+
+/// One call whose answer is a judgement. See [`CallKind`].
+pub async fn oneshot_judgement(
+    provider: &dyn Provider,
+    model: &str,
+    prompt: String,
+    timeout: Duration,
+    cancel: &CancelToken,
+) -> Result<String> {
+    oneshot_with_system(
+        provider,
+        model,
+        None,
+        prompt,
+        timeout,
+        cancel,
+        CallKind::Judgement,
+    )
+    .await
+}
+
+/// One call of a batch whose calls share an opening. See [`SplitPrompt`].
+pub async fn oneshot_split(
+    provider: &dyn Provider,
+    model: &str,
+    prompt: super::SplitPrompt,
+    timeout: Duration,
+    cancel: &CancelToken,
+    kind: CallKind,
+) -> Result<String> {
+    oneshot_with_system(
+        provider,
+        model,
+        Some(prompt.shared),
+        prompt.item,
+        timeout,
+        cancel,
+        kind,
+    )
+    .await
+}
+
+async fn oneshot_with_system(
+    provider: &dyn Provider,
+    model: &str,
+    system: Option<String>,
+    prompt: String,
+    timeout: Duration,
+    cancel: &CancelToken,
+    kind: CallKind,
+) -> Result<String> {
     let req = StreamRequest {
         model: model.to_string(),
-        system: None,
+        system,
         messages: vec![Message::user(prompt)],
         tools: Vec::new(),
         max_tokens: 16384,
-        // Extraction / planning / note writing are mechanical: on
-        // deepseek-v4 a digest spent 5–13k reasoning tokens (77–89 s)
-        // with thinking on versus 4–7 s off. See StreamRequest docs.
-        thinking_budget: Some(0),
+        // Per call kind — see [`CallKind`]. A digest on deepseek-v4 spent
+        // 5–13k reasoning tokens (77–89 s) thinking versus 4–7 s not, which
+        // is why mechanical calls never do.
+        thinking_budget: Some(kind.thinking_budget()),
         // Research synthesizes long pages — the model may go silent
         // for minutes mid-stream. Force the per-chunk idle ceiling to
         // the pipeline's `llm_timeout` (default 900s) regardless of
@@ -1118,7 +1336,16 @@ pub(super) async fn oneshot(
         };
         match next {
             Ok(Some(Ok(ProviderEvent::TextDelta(s)))) => text.push_str(&s),
-            Ok(Some(Ok(ProviderEvent::MessageStop { .. }))) => break,
+            Ok(Some(Ok(ProviderEvent::MessageStop { usage, .. }))) => {
+                if let Some(u) = usage {
+                    let _ = RUN_USAGE.try_with(|l| {
+                        if let Ok(mut g) = l.lock() {
+                            g.add(model, &u);
+                        }
+                    });
+                }
+                break;
+            }
             Ok(Some(Ok(_))) => {} // ignore non-text events (tool use, thinking, etc.)
             Ok(Some(Err(e))) => return Err(e),
             Ok(None) => break, // stream ended without explicit MessageStop
@@ -1136,6 +1363,35 @@ pub(super) async fn oneshot(
 
 #[cfg(test)]
 mod tests {
+    /// Thinking is decided by what the call is for. Digests never think; a
+    /// judgement does unless told not to; a note body only when asked.
+    #[test]
+    fn a_judgement_thinks_and_a_digest_does_not() {
+        let _h = crate::research::test_helpers::scoped_home();
+        let low = crate::providers::ThinkingLevel::LOW_BUDGET;
+        assert_eq!(CallKind::Mechanical.thinking_budget(), 0);
+        assert_eq!(CallKind::Judgement.thinking_budget(), low);
+        assert_eq!(CallKind::Writing.thinking_budget(), 0);
+        assert_eq!(
+            CallKind::Planning.thinking_budget(),
+            0,
+            "a plan that thinks took 357 s"
+        );
+
+        let dir = std::env::current_dir().unwrap().join(".thclaws");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("settings.json"), r#"{"research_thinking":"all"}"#).unwrap();
+        assert_eq!(CallKind::Writing.thinking_budget(), low);
+        assert_eq!(CallKind::Planning.thinking_budget(), low);
+        assert_eq!(
+            CallKind::Mechanical.thinking_budget(),
+            0,
+            "never, whatever the setting"
+        );
+        std::fs::write(dir.join("settings.json"), r#"{"research_thinking":"off"}"#).unwrap();
+        assert_eq!(CallKind::Judgement.thinking_budget(), 0);
+    }
+
     use super::*;
 
     // ── parse_bulleted_list ────────────────────────────────────────
@@ -1347,7 +1603,10 @@ mod tests {
     fn slug_handles_thai_to_default() {
         // LLM SHOULD return ASCII; if it doesn't, we degrade to
         // "research" rather than emit non-ASCII filenames.
-        assert_eq!(sanitize_slug("ค้นหาข่าว"), "research");
+        // This asserted `"research"` — the bug, written down as the spec.
+        assert_eq!(sanitize_slug("ค้นหาข่าว"), "ค้นหาข่าว");
+        assert_ne!(sanitize_slug("ค้นหาข่าว"), sanitize_slug("ราคาทองคำ"));
+        assert_eq!(sanitize_slug("   "), "research");
     }
 
     #[test]
@@ -1511,11 +1770,16 @@ mod tests {
 
     #[test]
     fn parse_page_plan_skips_unparseable_slug_fallback() {
-        // sanitize_slug returns "research" for non-ASCII-only input;
-        // that's a meaningless fallback, not a real page topic.
+        // A slug with nothing usable in it falls back to "research", which
+        // names no topic, and is skipped.
+        let raw = r#"[{"slug":"!!! ???","title":"X","topic":"","source_indices":[1]}]"#;
+        assert!(parse_page_plan(raw, 7, 3).is_empty());
+        // This test used to feed a Thai slug here and require the plan to be
+        // empty: a `--legacy` run planned no page for any non-ASCII topic.
         let raw = r#"[{"slug":"ค้นหา","title":"X","topic":"","source_indices":[1]}]"#;
         let plan = parse_page_plan(raw, 7, 3);
-        assert!(plan.is_empty());
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].slug, "ค้นหา");
     }
 
     /// M6.39.5: pin the synthesize prompt's "lead with abstract"

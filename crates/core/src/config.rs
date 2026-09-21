@@ -349,6 +349,17 @@ pub struct AppConfig {
     /// their own rather than a generic map.
     #[serde(default)]
     pub translator_subagent_model: Option<String>,
+    /// dev-plan/64 D6: the language `/research` and "Add to KMS" write in
+    /// when no `--lang` is given. `None` — the default — follows the
+    /// document or the query. `"th"`, `"en"`, or any language code pins it.
+    #[serde(default)]
+    pub research_language: Option<String>,
+    /// Which `/research` and `/kms verify` calls think before answering:
+    /// `"judgement"` (default) — planning, auditing and grounding; `"all"` —
+    /// note writing too; `"off"` — none. Digests never do: extraction is
+    /// mechanical and thinking made it ten times slower.
+    #[serde(default)]
+    pub research_thinking: Option<String>,
 
     /// Default target URL for the `/deploy` slash command (dev-plan/28).
     /// Paired with the `remote-agent-token` keychain entry. Both can be
@@ -632,6 +643,8 @@ impl Default for AppConfig {
             extract_save_skill_models: None,
             skill_model_fallback: Some(DEFAULT_SKILL_MODEL_FALLBACK.to_string()),
             translator_subagent_model: None,
+            research_language: None,
+            research_thinking: None,
             remote_agent_url: None,
             gui_shell: None,
             openrouter_fusion: FusionConfig::default(),
@@ -764,6 +777,12 @@ pub struct ProjectConfig {
         alias = "translatorSubagentModel"
     )]
     pub translator_subagent_model: Option<String>,
+    /// See `AppConfig::research_language`.
+    #[serde(rename = "research_language", alias = "researchLanguage")]
+    pub research_language: Option<String>,
+    /// See `AppConfig::research_thinking`.
+    #[serde(rename = "research_thinking", alias = "researchThinking")]
+    pub research_thinking: Option<String>,
     #[serde(rename = "thinkingBudget")]
     pub thinking_budget: Option<u32>,
     #[serde(rename = "searchEngine")]
@@ -989,6 +1008,8 @@ impl Default for ProjectConfig {
             extract_save_skill_models: None,
             skill_model_fallback: None,
             translator_subagent_model: None,
+            research_language: None,
+            research_thinking: None,
             thinking_budget: None,
             search_engine: None,
             allowed_tools: None,
@@ -1255,6 +1276,10 @@ impl ProjectConfig {
   "extract_save_skill_models": null,
   "skill_model_fallback": "gpt-4.1-mini",
   "translator_subagent_model": null,
+  "_doc_research_language": "null = /research and 'Add to KMS' write in the language of the document or the query. Set \"th\", \"en\" or another code to pin it; --lang on the command still wins.",
+  "research_language": null,
+  "_doc_research_thinking": "Which /research and /kms verify calls think before answering. null or \"judgement\" = planning, auditing and grounding (default). \"all\" = note writing too (slower, costs more). \"off\" = none. Source digests never think.",
+  "research_thinking": null,
   "claude_md_compat": false,
   "openrouterFreeOnly": false,
   "kms": { "active": [] }
@@ -1741,6 +1766,12 @@ impl ProjectConfig {
         }
         if let Some(ref m) = self.translator_subagent_model {
             config.translator_subagent_model = Some(m.clone());
+        }
+        if let Some(ref l) = self.research_language {
+            config.research_language = (!l.trim().is_empty()).then(|| l.trim().to_lowercase());
+        }
+        if let Some(ref t) = self.research_thinking {
+            config.research_thinking = (!t.trim().is_empty()).then(|| t.trim().to_lowercase());
         }
         if let Some(b) = self.openrouter_free_only {
             config.openrouter_free_only = b;

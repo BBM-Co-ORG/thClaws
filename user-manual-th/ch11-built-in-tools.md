@@ -295,7 +295,7 @@ register เฉพาะตอนมี `/goal` รันอยู่ — ลู
 |---|---|---|
 | `KmsRead` | auto | อ่านหน้าเดียวจากฐานความรู้ที่ผูกไว้ (prepend banner `[note: …]` เมื่อ `verified:` ขาดหรือเก่ากว่า 90 วัน) |
 | `KmsSearch` | auto | Grep ทุกหน้าใน knowledge base ตัวเดียว |
-| `KmsWrite` | prompt | สร้างหรือเขียนทับหน้า; auto-inject `# {title}\nDescription: {topic}\n---` header; warn เมื่อขาด `sources:` frontmatter |
+| `KmsWrite` | prompt | สร้างหรือเขียนทับหน้า; auto-inject หัวเรื่อง `# {title}`; warn เมื่อขาด `sources:` frontmatter |
 | `KmsAppend` | prompt | ต่อท้ายหน้าที่มีอยู่ |
 | `KmsDelete` | prompt | ลบหน้า (ทางสุดท้าย; prefer KmsWrite สำหรับ merge หรือ supersede) |
 | `KmsCreate` | auto | Ensure ว่า KMS มีอยู่ (idempotent) `/dream` ใช้ bootstrap `dreams` audit KMS |
