@@ -84,6 +84,62 @@ pub fn cdp_active() -> bool {
     state().lock().unwrap().is_some()
 }
 
+/// Is the engine-owned Chromium answering right now? `false` both when CDP
+/// is off and when it is armed but Chromium has not been launched yet (it is
+/// lazy), so callers that care about the difference should read
+/// [`cdp_active`] too.
+pub fn chromium_alive() -> bool {
+    let endpoint = {
+        let guard = state().lock().unwrap();
+        match guard.as_ref() {
+            Some(s) if s.launched => s.endpoint.clone(),
+            _ => return false,
+        }
+    };
+    endpoint_alive(&endpoint)
+}
+
+/// One-line browser health summary for `/doctor`. The subsystem shipped with
+/// no diagnostic at all, so a live view that had silently fallen back to
+/// screenshots — `arm()` returns `None` when no Playwright Chromium is
+/// installed, with one dim stderr line a GUI user never sees — looked like a
+/// missing feature rather than a missing install (dev-plan/65 #8).
+pub fn doctor_summary() -> String {
+    let cfg = crate::config::AppConfig::load().ok();
+    let enabled = cfg.as_ref().map(|c| c.browser_enabled).unwrap_or(false);
+    if !enabled {
+        return "disabled (browserEnabled=false)".into();
+    }
+    let server = crate::config::AppConfig::browser_mcp_config(cfg.and_then(|c| c.browser_headless));
+    let headless = server.args.iter().any(|a| a == "--headless");
+    let mut parts = vec![format!(
+        "enabled ({})",
+        if headless { "headless" } else { "headed" }
+    )];
+    parts.push(if crate::config::command_on_path(&server.command) {
+        format!("{} ✓", server.command)
+    } else {
+        format!("{} NOT ON PATH ✗", server.command)
+    });
+    parts.push(match find_chromium() {
+        Some(p) => format!("chromium {} ✓", p.display()),
+        None => "chromium NOT FOUND ✗ — `npx playwright install chromium` \
+                 for the live view + takeover"
+            .into(),
+    });
+    let (vw, vh) = crate::config::AppConfig::browser_viewport();
+    parts.push(format!("viewport {vw}×{vh}"));
+    parts.push(
+        match (cdp_active(), chromium_alive()) {
+            (false, _) => "live view off (playwright-mcp drives its own browser)",
+            (true, true) => "live view armed, chromium up",
+            (true, false) => "live view armed, chromium not started yet",
+        }
+        .to_string(),
+    );
+    parts.join(" · ")
+}
+
 // ── Chromium discovery + launch ──────────────────────────────────────
 
 /// Find a Chromium/Chrome executable, in order of preference:
@@ -175,6 +231,16 @@ fn newest_classic_chromium(root: &std::path::Path) -> Option<PathBuf> {
     for (_, dir) in revs {
         let subpaths: &[&str] = if cfg!(target_os = "macos") {
             &[
+                // Playwright ships Chrome for Testing now, so the bundle is
+                // named after it rather than "Chromium.app". A fresh
+                // `npx playwright install chromium` on macOS arm64 lays down
+                // chromium-1243/chrome-mac-arm64/Google Chrome for Testing.app
+                // — under the old list the live view stayed off even after
+                // the user ran the exact command we told them to run
+                // (dev-plan/65 #8).
+                "chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+                "chrome-mac-x64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+                "chrome-mac/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
                 "chrome-mac/Chromium.app/Contents/MacOS/Chromium",
                 "chrome-mac-arm64/Chromium.app/Contents/MacOS/Chromium",
             ]
@@ -189,7 +255,41 @@ fn newest_classic_chromium(root: &std::path::Path) -> Option<PathBuf> {
                 return Some(exe);
             }
         }
+        // Nothing matched a name we know. Rather than report "no chromium" on
+        // the next rename, find the app bundle and take the binary inside it:
+        // on macOS the executable is named after the bundle.
+        if let Some(exe) = mac_app_bundle_exe(&dir) {
+            return Some(exe);
+        }
     }
+    None
+}
+
+/// `<rev>/<platform>/<Something>.app/Contents/MacOS/<Something>` — one level
+/// of platform dir, whatever the bundle is called this year.
+#[cfg(target_os = "macos")]
+fn mac_app_bundle_exe(rev_dir: &std::path::Path) -> Option<PathBuf> {
+    for platform in std::fs::read_dir(rev_dir).ok()?.flatten() {
+        if !platform.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        for app in std::fs::read_dir(platform.path()).ok()?.flatten() {
+            let path = app.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("app") {
+                continue;
+            }
+            let stem = path.file_stem()?.to_string_lossy().to_string();
+            let exe = path.join("Contents/MacOS").join(&stem);
+            if exe.is_file() {
+                return Some(exe);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+fn mac_app_bundle_exe(_rev_dir: &std::path::Path) -> Option<PathBuf> {
     None
 }
 
@@ -337,18 +437,71 @@ fn hard_kill(pid: i32) {
 #[cfg(not(unix))]
 fn hard_kill(_pid: i32) {}
 
+/// How long a successful liveness probe is trusted. `ensure_up` runs before
+/// every browser tool call and `endpoint_alive` costs up to ~800 ms on a
+/// dead port, so the answer is cached for a couple of seconds — long enough
+/// to keep a burst of tool calls cheap, short enough that a closed window is
+/// noticed on the next one.
+const LIVENESS_CACHE_MS: u64 = 2_000;
+
+/// Milliseconds since the first call, +1 so that 0 can mean "never".
+fn since_start_ms() -> u64 {
+    static T0: OnceLock<std::time::Instant> = OnceLock::new();
+    T0.get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+        + 1
+}
+
+static LAST_ALIVE_MS: AtomicU64 = AtomicU64::new(0);
+
+fn mark_alive() {
+    LAST_ALIVE_MS.store(since_start_ms(), Ordering::Relaxed);
+}
+
+fn recently_alive() -> bool {
+    let last = LAST_ALIVE_MS.load(Ordering::Relaxed);
+    last != 0 && since_start_ms().saturating_sub(last) < LIVENESS_CACHE_MS
+}
+
 /// Launch Chromium if it isn't up yet (lazy half of [`arm`]).
 /// Blocking — call via `spawn_blocking` from async contexts. Cheap
 /// fast-path when already launched.
 pub fn ensure_up() -> Result<(), String> {
-    let (port, headless, endpoint) = {
+    let (port, headless, endpoint, launched) = {
         let guard = state().lock().unwrap();
         let s = guard.as_ref().ok_or("CDP mode not armed")?;
-        if s.launched {
+        (s.port, s.headless, s.endpoint.clone(), s.launched)
+    };
+
+    // `launched` used to be trusted outright, and nothing ever cleared it:
+    // once the user closed the headed window (which the manual invites), or
+    // the OOM killer took Chromium on a small runner, every browser tool call
+    // and the live view failed for the rest of the session with an error that
+    // read like a bug somewhere else. Probe instead — cached, because this
+    // runs before every browser tool call.
+    if launched {
+        if recently_alive() {
             return Ok(());
         }
-        (s.port, s.headless, s.endpoint.clone())
-    };
+        if endpoint_alive(&endpoint) {
+            mark_alive();
+            return Ok(());
+        }
+        eprintln!("\x1b[2m[browser-cdp] chromium at {endpoint} is gone — relaunching\x1b[0m");
+        *page_slot().lock().unwrap() = None;
+        if let Some(s) = state().lock().unwrap().as_mut() {
+            s.launched = false;
+            if let Some(child) = s.child.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            s.child = None;
+        }
+        // The relaunch below reuses the SAME port, which is the endpoint
+        // playwright-mcp was spawned with — so the agent's own tools recover
+        // too, as soon as it re-dials.
+    }
 
     let exe = find_chromium().ok_or("no chromium executable")?;
     let profile = profile_dir();
@@ -361,8 +514,17 @@ pub fn ensure_up() -> Result<(), String> {
     let _ = std::fs::create_dir_all(&profile);
 
     let mut cmd = std::process::Command::new(&exe);
+    let (vw, vh) = crate::config::AppConfig::browser_viewport();
     cmd.arg(format!("--remote-debugging-port={port}"))
         .arg(format!("--user-data-dir={}", profile.display()))
+        // playwright-mcp's `--viewport-size` is IGNORED when it is handed
+        // `--cdp-endpoint`: it adopts the page THIS process opened, so the
+        // page was whatever Chromium's default window happened to be —
+        // measured 756×469 against a requested 1920×1080. Every hosted
+        // workspace browsed at that size, which is why pages came back in
+        // mobile layouts and took several snapshots to read. The engine owns
+        // the window, so the engine sizes it (dev-plan/65 #1).
+        .arg(format!("--window-size={vw},{vh}"))
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
         .stdout(std::process::Stdio::null())
@@ -404,6 +566,7 @@ pub fn ensure_up() -> Result<(), String> {
         if headless { "headless" } else { "headed" }
     );
     let _ = std::fs::write(&endpoint_file, &endpoint);
+    mark_alive();
     {
         let mut guard = state().lock().unwrap();
         if let Some(s) = guard.as_mut() {
@@ -496,10 +659,15 @@ async fn snapshot_cookies(endpoint: &str) -> Result<(), String> {
     let result = browser_call(endpoint, "Storage.getCookies", json!({})).await?;
     let cookies = result.get("cookies").cloned().unwrap_or(json!([]));
     let n = cookies.as_array().map(|a| a.len()).unwrap_or(0);
-    if n == 0 {
-        return Ok(()); // nothing to persist; don't clobber a prior snapshot
-    }
     let path = cookies_path();
+    // An empty jar means two different things. With no snapshot on disk it is
+    // "no session yet", and writing would only create an empty file. With one
+    // already there it is "the user logged out" — and the old guard skipped
+    // the write in BOTH cases, so the stale snapshot survived and the next
+    // launch restored the session they had just ended (dev-plan/65 #4).
+    if n == 0 && !path.exists() {
+        return Ok(());
+    }
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -678,6 +846,34 @@ impl PageSession {
     }
 }
 
+/// Build the `browser_frame` envelope from one `Page.screencastFrame`.
+///
+/// `w`/`h` are the PAGE's own CSS-pixel size, taken from the frame metadata —
+/// the space `Input.dispatchMouseEvent` works in. Chromium scales the JPEG
+/// down to the `startScreencast` cap, so the image's pixel size is a
+/// different space, and the tab used to map clicks through the image. The two
+/// agreed only while the viewport was smaller than the cap, which is why that
+/// looked correct until the window was sized properly (dev-plan/65 #1).
+/// Metadata is always present in practice; if it ever isn't, the fields are
+/// omitted and the tab falls back to the image's own size.
+fn frame_envelope(params: &Value) -> String {
+    let mut out = json!({
+        "type": "browser_frame",
+        "data": params.get("data").and_then(Value::as_str).unwrap_or(""),
+    });
+    for (key, ptr) in [
+        ("w", "/metadata/deviceWidth"),
+        ("h", "/metadata/deviceHeight"),
+    ] {
+        if let Some(n) = params.pointer(ptr).and_then(Value::as_f64) {
+            if n > 0.0 {
+                out[key] = json!(n);
+            }
+        }
+    }
+    out.to_string()
+}
+
 /// Pick the most recently opened page target from `/json/list`.
 async fn page_ws_url(endpoint: &str) -> Result<String, String> {
     let body = reqwest::get(format!("{endpoint}/json/list"))
@@ -735,12 +931,8 @@ async fn attach_and_start(endpoint: String, dispatch: Dispatch) -> Result<(), St
             match v.get("method").and_then(Value::as_str) {
                 Some("Page.screencastFrame") => {
                     let p = v.get("params").cloned().unwrap_or(Value::Null);
-                    if let Some(data) = p.get("data").and_then(Value::as_str) {
-                        d2(json!({
-                            "type": "browser_frame",
-                            "data": data,
-                        })
-                        .to_string());
+                    if p.get("data").and_then(Value::as_str).is_some() {
+                        d2(frame_envelope(&p));
                     }
                     if let Some(sid) = p.get("sessionId") {
                         // Ack AFTER forwarding — natural backpressure —
@@ -851,8 +1043,9 @@ pub fn screencast_stop() {
 }
 
 /// Native input on the live page. `kind`: click | move | wheel |
-/// text | key. Coordinates are page CSS pixels (the screencast frame's
-/// own space).
+/// text | key. Coordinates are page CSS pixels — NOT the screencast frame's
+/// pixels, which are a scaled-down version of that space. The tab converts
+/// using the `w`/`h` each frame carries (see [`frame_envelope`]).
 pub fn input(kind: &str, args: &Value) -> Result<(), String> {
     let session = page_slot()
         .lock()
@@ -1037,6 +1230,42 @@ mod tests {
         assert!(r.is_err());
     }
 
+    /// The takeover's coordinate space rides on these two fields. A frame
+    /// without them sends every click through the scaled image instead of the
+    /// page, which mis-aims all of them — silently, and plausibly enough to
+    /// pass a visual check (dev-plan/65 #1).
+    #[test]
+    fn frame_envelope_carries_the_pages_own_size() {
+        let params = json!({
+            "data": "AAAA",
+            "metadata": {
+                "deviceWidth": 1920.0,
+                "deviceHeight": 1080.0,
+                "pageScaleFactor": 1,
+                "offsetTop": 0,
+                "scrollOffsetX": 0,
+                "scrollOffsetY": 480,
+            },
+        });
+        let v: Value = serde_json::from_str(&frame_envelope(&params)).unwrap();
+        assert_eq!(v["type"], "browser_frame");
+        assert_eq!(v["data"], "AAAA");
+        assert_eq!(v["w"], 1920.0, "page width, not the scaled frame's");
+        assert_eq!(v["h"], 1080.0);
+
+        // No metadata, or a zero dimension: omit rather than send a 0 the tab
+        // would divide by.
+        let bare: Value =
+            serde_json::from_str(&frame_envelope(&json!({ "data": "BBBB" }))).unwrap();
+        assert!(bare.get("w").is_none() && bare.get("h").is_none());
+        let zero: Value = serde_json::from_str(&frame_envelope(&json!({
+            "data": "CCCC",
+            "metadata": { "deviceWidth": 0, "deviceHeight": 0 },
+        })))
+        .unwrap();
+        assert!(zero.get("w").is_none() && zero.get("h").is_none());
+    }
+
     #[test]
     fn classic_layout_discovery_picks_highest_revision() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1062,6 +1291,37 @@ mod tests {
         }
         let found = newest_classic_chromium(root).expect("found");
         assert!(found.to_string_lossy().contains("chromium-1226"));
+    }
+
+    /// What `npx playwright install chromium` ACTUALLY lays down today: a
+    /// Chrome-for-Testing bundle, not `Chromium.app`. Discovery missed it, so
+    /// a user who ran the command our own error message gives them still got
+    /// no live view (dev-plan/65 #8). Verified against a real install:
+    /// `chromium-1243/chrome-mac-arm64/Google Chrome for Testing.app`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn discovery_finds_chrome_for_testing_bundles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let dir = root
+            .join("chromium-1243/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Google Chrome for Testing"), b"x").unwrap();
+        let found = newest_classic_chromium(root).expect("Chrome for Testing must be found");
+        assert!(found.ends_with("Google Chrome for Testing"), "{found:?}");
+
+        // And a bundle under a name nobody has used yet still resolves, so the
+        // next rename is a non-event instead of a silent regression.
+        let tmp2 = tempfile::tempdir().unwrap();
+        let d2 = tmp2
+            .path()
+            .join("chromium-1300/chrome-mac-arm64/Some Future Browser.app/Contents/MacOS");
+        std::fs::create_dir_all(&d2).unwrap();
+        std::fs::write(d2.join("Some Future Browser"), b"x").unwrap();
+        assert!(
+            newest_classic_chromium(tmp2.path()).is_some(),
+            "bundle scan fallback"
+        );
     }
 
     #[test]

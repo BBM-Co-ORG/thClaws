@@ -2151,7 +2151,7 @@ impl Agent {
                         let req = ApprovalRequest {
                             tool_name: name.clone(),
                             input: input.clone(),
-                            summary: None,
+                            summary: tool.approval_summary(input),
                             // The agent's origin (Main / SideChannel /
                             // Subagent) flows through every approval
                             // request so the GUI modal can attribute

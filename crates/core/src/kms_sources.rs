@@ -347,11 +347,7 @@ pub fn citation_map(kref: &KmsRef) -> BTreeMap<String, Vec<String>> {
         // Declared provenance (`sources:` frontmatter, the ingest
         // convention).
         if let Some(v) = fm.get("sources") {
-            for token in v
-                .split(|c: char| c == ',' || c.is_whitespace())
-                .map(|s| s.trim().trim_matches('"'))
-                .filter(|s| !s.is_empty())
-            {
+            for token in crate::kms::sources_entries(v) {
                 if by_file.contains(token) {
                     hit(token, &mut out);
                 } else if let Some(file) = by_stem.get(token) {

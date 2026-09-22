@@ -9686,6 +9686,10 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                         }
                     );
                     println!(
+                        "{COLOR_DIM}browser:    {}{COLOR_RESET}",
+                        crate::browser_cdp::doctor_summary()
+                    );
+                    println!(
                         "{COLOR_DIM}tools:      {} registered{COLOR_RESET}",
                         tool_registry.names().len()
                     );

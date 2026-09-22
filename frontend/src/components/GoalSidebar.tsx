@@ -79,10 +79,13 @@ export function GoalSidebar() {
 
   if (!goal) return null;
 
-  const elapsedSecs = Math.max(
-    0,
-    Math.floor(Date.now() / 1000) - goal.started_at,
-  );
+  // A wall clock read during render, re-rendered by the 10s tick above
+  // only while the goal is active — so elapsed advances on a running
+  // goal and freezes on a finished one. `useSyncExternalStore` is the
+  // idiomatic alternative, but a snapshot that changes every second can
+  // trip its "should be cached" guard, so this stays.
+  // eslint-disable-next-line react-hooks/purity
+  const elapsedSecs = Math.max(0, Math.floor(Date.now() / 1000) - goal.started_at);
   const statusColor = STATUS_COLOR[goal.status];
   const statusLabel = STATUS_LABEL[goal.status];
   const budgetPct =

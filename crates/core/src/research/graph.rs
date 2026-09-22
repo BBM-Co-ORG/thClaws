@@ -19,6 +19,13 @@ pub struct KnownNote {
     pub kind: String,
     /// `updated:` frontmatter (`YYYY-MM-DD`) when present.
     pub updated: Option<String>,
+    /// Whether `related:` names anything — i.e. whether this page is a
+    /// hub other pages hang off. `kind: moc` is not the same question:
+    /// a one-page ingest is written through the topic-page branch and
+    /// carries that label with an empty `related:`, and reading the
+    /// label instead of the list is what hid every such page from
+    /// `related-refresh`.
+    pub has_children: bool,
 }
 
 /// What a text is "about", cheaply: lower-cased words of three letters or
@@ -115,6 +122,15 @@ pub fn load_known(kref: &KmsRef) -> Vec<KnownNote> {
             summary: first_prose_line(&body),
             kind: fm.get("kind").cloned().unwrap_or_default(),
             updated: fm.get("updated").cloned().filter(|u| !u.is_empty()),
+            has_children: fm
+                .get("related")
+                .map(|r| {
+                    r.trim()
+                        .trim_start_matches('[')
+                        .trim_end_matches(']')
+                        .trim()
+                })
+                .is_some_and(|r| !r.is_empty()),
         });
     }
     out.sort_by(|a, b| a.slug.cmp(&b.slug));
@@ -217,6 +233,7 @@ mod tests {
             summary: String::new(),
             kind: String::new(),
             updated: None,
+            has_children: false,
         };
         let mut known: Vec<KnownNote> = (0..200)
             .map(|i| note(&format!("aaa-filler-{i:03}"), "Unrelated filler"))

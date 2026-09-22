@@ -992,7 +992,13 @@ pub async fn start_refresh(
     let targets: Vec<&graph::KnownNote> = if slugs.is_empty() {
         known
             .iter()
-            .filter(|k| k.kind != "moc" && !k.slug.starts_with('_'))
+            // A hub, not a label. `kind: moc` also lands on a one-page
+            // ingest — the topic-page branch writes it with an empty
+            // `related:` — and filtering on the label hid every such
+            // page from a refresh for good. What this wants to skip is
+            // a page other pages hang off, which is the list, not the
+            // name.
+            .filter(|k| !k.has_children && !k.slug.starts_with('_'))
             .filter(|k| match &k.updated {
                 Some(u) => days_between(u, &today) >= older_than_days as i64,
                 None => true,

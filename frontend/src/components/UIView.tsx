@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { botQuery, send, subscribe } from "../hooks/useIPC";
+import { botQuery, send, subscribe, type IPCMessage } from "../hooks/useIPC";
 import { useTheme } from "../hooks/useTheme";
 
 // dev-plan/33 Tier 1: render a GUI Shell inside a sandboxed iframe.
@@ -118,25 +118,22 @@ export function UIView({ active, shellId, fullscreen = false }: UIViewProps) {
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [shellId, fullscreen, theme]);
 
   // Forward full-screen state changes into the iframe.
   useEffect(() => {
     sendFullscreen(fullscreen);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fullscreen]);
 
   // Forward theme changes into the iframe so the shell re-themes live
   // when the user switches Light/Dark/System in the main UI.
   useEffect(() => {
     sendTheme(theme);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [theme]);
 
   useEffect(() => {
     // backend -> iframe: forward gui_shell_event dispatches.
-    const unsub = subscribe((msg: any) => {
+    const unsub = subscribe((msg: IPCMessage) => {
       const target = iframeRef.current?.contentWindow;
       if (!target) return;
       if (msg?.type === "gui_shell_event") {

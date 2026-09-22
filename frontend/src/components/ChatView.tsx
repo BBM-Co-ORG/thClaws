@@ -11,11 +11,8 @@ import { useVersion } from "../hooks/useVersion";
 import logoDark from "../assets/thClaws-logo-dark.png";
 import logoLight from "../assets/thClaws-logo-light.png";
 import { WorkflowReviewBubble } from "./WorkflowReviewBubble";
-import {
-  SlashCommandPopup,
-  filterCommands,
-  type SlashCommandInfo,
-} from "./SlashCommandPopup";
+import { SlashCommandPopup } from "./SlashCommandPopup";
+import { filterCommands, type SlashCommandInfo } from "./slashCommands";
 import { McpAppIframe } from "./McpAppIframe";
 
 type ChatMessage = {

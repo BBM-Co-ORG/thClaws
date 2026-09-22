@@ -145,6 +145,15 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// One short line the approval prompt shows alongside the tool name, for
+    /// the case where the tool name alone does not tell the user what they
+    /// are agreeing to. `PdfRead` uses it to say that the file is about to
+    /// leave the machine (dev-plan/66) — "PdfRead: contract.pdf" reads like a
+    /// local read, which is exactly what it usually is.
+    fn approval_summary(&self, _input: &Value) -> Option<String> {
+        None
+    }
+
     /// Audit classification (RFC 0001). Builtins are the default; MCP
     /// and workflow tools override.
     fn audit_kind(&self) -> crate::audit::AuditToolKind {

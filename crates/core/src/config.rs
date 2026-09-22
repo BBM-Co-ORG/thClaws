@@ -296,6 +296,16 @@ pub struct AppConfig {
     #[serde(default, alias = "browserHeadless")]
     pub browser_headless: Option<bool>,
 
+    /// May `PdfRead` fall back to the public `pdf.thclaws.cloud` service
+    /// when `pdftotext` is not installed locally (dev-plan/66)? ON by
+    /// default, because the alternative for a user without poppler is
+    /// that reading a PDF simply does not work — but the file leaves
+    /// their machine, so the fallback is approval-gated and says so, and
+    /// this flag (or `THCLAWS_PDF_CLOUD=0`) turns it off outright.
+    /// Enterprise / on-prem should set it false in the policy default.
+    #[serde(default = "default_pdf_cloud_fallback", alias = "pdfCloudFallback")]
+    pub pdf_cloud_fallback: bool,
+
     /// Per-provider gateway routing. Each entry is a provider name
     /// (lowercase, matches the gateway path segment): `openai`,
     /// `anthropic`, `google`, `openrouter`. When the active model's
@@ -570,6 +580,19 @@ fn default_browser_enabled() -> bool {
     )
 }
 
+/// `PdfRead`'s cloud fallback default — ON, with `THCLAWS_PDF_CLOUD=0` as
+/// the fleet-wide off switch (see [`AppConfig::pdf_cloud_fallback`]).
+fn default_pdf_cloud_fallback() -> bool {
+    !matches!(
+        std::env::var("THCLAWS_PDF_CLOUD")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "off" | "no"
+    )
+}
+
 /// Resolve a launch command on PATH (or as an absolute path). Shared
 /// by the browser-MCP injection guard and the `browser_status_get`
 /// IPC arm so both agree on whether the managed browser can start.
@@ -638,6 +661,7 @@ impl Default for AppConfig {
             sensitive_enabled: false,
             browser_enabled: default_browser_enabled(),
             browser_headless: None,
+            pdf_cloud_fallback: default_pdf_cloud_fallback(),
             gateway_use_for: Vec::new(),
             gateway_proxy: false,
             extract_save_skill_models: None,
@@ -864,6 +888,10 @@ pub struct ProjectConfig {
     /// [`AppConfig::browser_headless`].
     #[serde(rename = "browserHeadless")]
     pub browser_headless: Option<bool>,
+    /// Opt out of `PdfRead`'s public-service fallback. See
+    /// [`AppConfig::pdf_cloud_fallback`].
+    #[serde(rename = "pdfCloudFallback")]
+    pub pdf_cloud_fallback: Option<bool>,
     /// Show the desktop SSO sign-in button (Google / enterprise IdP). Off by
     /// default — the sign-in flow isn't wired to a usable feature yet, so the
     /// button stays hidden until this is set true in `.thclaws/settings.json`.
@@ -1025,6 +1053,7 @@ impl Default for ProjectConfig {
             sensitive: None,
             browser_enabled: None,
             browser_headless: None,
+            pdf_cloud_fallback: None,
             sso_sign_in_enabled: None,
             show_raw_response: None,
             kms: None,
@@ -1793,6 +1822,9 @@ impl ProjectConfig {
         if let Some(b) = self.browser_headless {
             config.browser_headless = Some(b);
         }
+        if let Some(b) = self.pdf_cloud_fallback {
+            config.pdf_cloud_fallback = b;
+        }
         // Proxy toggle. Explicit `gatewayProxy` wins; otherwise migrate a
         // legacy non-empty `gatewayUseFor` list to "proxy on". The effective
         // `gateway_use_for` is DERIVED from this flag in `load()`, so we set
@@ -2472,6 +2504,24 @@ impl AppConfig {
     }
 
     /// The synthetic engine-managed Playwright MCP server config that
+    /// Managed-browser viewport in CSS pixels, from
+    /// `THCLAWS_BROWSER_VIEWPORT="W,H"` (default 1920×1080). One source for
+    /// two consumers that must not drift: playwright-mcp's
+    /// `--viewport-size` (self-launch path) and the engine's own
+    /// `--window-size` (CDP path, where the former is ignored).
+    pub fn browser_viewport() -> (u32, u32) {
+        let parsed = std::env::var("THCLAWS_BROWSER_VIEWPORT")
+            .ok()
+            .and_then(|s| {
+                let (w, h) = s.trim().split_once(',')?;
+                let w: u32 = w.trim().parse().ok()?;
+                let h: u32 = h.trim().parse().ok()?;
+                // A zero or absurd dimension is a typo, not a request.
+                (w >= 320 && h >= 240 && w <= 7680 && h <= 4320).then_some((w, h))
+            });
+        parsed.unwrap_or((1920, 1080))
+    }
+
     /// `browserEnabled` injects. Headed/headless: explicit override
     /// wins; otherwise auto — headless on cloud runners
     /// (`THCLAWS_USES_GATEWAY=1`) and displayless Linux, headed
@@ -2522,17 +2572,20 @@ impl AppConfig {
         // default is a narrow 1280×720, which renders pages mobile-ish.
         // Override with THCLAWS_BROWSER_VIEWPORT="W,H" (or pin
         // --viewport-size / --device via THCLAWS_BROWSER_MCP_CMD).
+        //
+        // NOTE this only takes effect when playwright-mcp launches the
+        // browser ITSELF. Handed `--cdp-endpoint`, it adopts the engine's
+        // existing page and ignores the flag — measured 756×469 against a
+        // requested 1920×1080 (dev-plan/65 #1). The engine therefore sizes
+        // its own Chromium window from the same value; see
+        // `browser_cdp::ensure_up`.
         if !args
             .iter()
             .any(|a| a.starts_with("--viewport-size") || a == "--device")
         {
-            let viewport = std::env::var("THCLAWS_BROWSER_VIEWPORT")
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "1920,1080".to_string());
+            let (w, h) = Self::browser_viewport();
             args.push("--viewport-size".into());
-            args.push(viewport);
+            args.push(format!("{w},{h}"));
         }
         crate::mcp::McpServerConfig {
             name: "browser".into(),

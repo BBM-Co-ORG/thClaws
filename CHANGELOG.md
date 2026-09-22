@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.135.0] — 2026-09-22
+
+**A reading release.** A PDF is read whether or not poppler is installed and whether or not there is an account, the live browser view is the size of a real screen and notices when its browser dies, and a model is asked what thinking it takes instead of guessed at.
+
+### Added
+- **A PDF is read without installing anything.** With poppler installed the file never leaves the machine, as before. Without it, the text is extracted through a public thClaws service that needs no account and no key — after you approve it, naming the file and where it is going. Install poppler and the question stops being asked; `"pdfCloudFallback": false` switches the offer off for good.
+- **A PDF becomes a markdown sibling from the Files tab.** Right-click a PDF, get the text beside it as `.md` — no model, no cost, no waiting on a turn. This never uploads: without poppler it says what to install instead.
+- **Hosted workspaces read PDFs.** poppler ships in the engine image, so a hosted workspace reads PDFs — including scanned ones, through the page-rendering path — where before it answered every PDF with an install instruction it could not act on.
+- **`/doctor` reports the browser.** Whether it is on, what will launch it, whether the Chromium the live view needs is installed and where, the resolved viewport, and whether the browser is up.
+- **Four ways in sit behind one row.** The four ways a document comes in sit behind one row in Files.
+
+### Fixed
+- **The live view is the size of a real screen.** Turning it on used to shrink every page to roughly 800×600, because the flag that set the viewport is ignored in exactly that mode. The engine now sizes its own window, and takeover clicks land where you click them.
+- **A browser that dies comes back.** Closing the browser window, or an out-of-memory kill, used to break every browser tool and the live view until the app was restarted.
+- **The browser finds the Chromium that `playwright install` installs.** On macOS the live view stayed off even after running the command we tell you to run.
+- **A logout stays logged out.** Signing out of a site is no longer undone the next time the browser starts.
+- **Sessions survive a hosted pause.** Cookies are flushed when a hosted workspace stops, not left to a timer that a stop can beat.
+- **The Browser switch says what the engine is doing.** It could read ON while the browser was off.
+- **A shared workspace no longer seeds one member's browser profile to another.** The owner's cookies, sessions and knowledge base were copied into each member's workspace.
+- **A model is asked what thinking it takes.** Each model is asked what thinking it takes instead of guessed from its id.
+- **A `*-realtime` model is not a chat row.** They speak a protocol the engine has no path for, so they no longer appear as chat models.
+
 ## [0.134.0] — 2026-09-21
 
 **A knowledge-management release.** The knowledge base now takes a document in four ways, a citation can be hovered and clicked, and an audit removes only what nothing supports — plus a long tail of research-run and GUI fixes.

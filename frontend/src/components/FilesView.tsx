@@ -168,6 +168,69 @@ function fileToBase64(file: File): Promise<string> {
 // across themes — the old `hover:bg-white/10` was invisible on the light
 // theme. `danger` paints the resting state red (e.g. Delete); hovering any
 // row fills it with the accent and flips the text to the accent foreground.
+/// A panel beside the context menu, not below it.
+///
+/// The menu it hangs off is `position: fixed` at the click point with no
+/// edge handling of its own, so this measures the menu's box and opens
+/// to the left when the right edge is too close, and lifts itself when
+/// the bottom is. Absolute inside the hovered row: the row is the
+/// positioning context, which keeps the panel glued to it while the
+/// menu's own height changes between file types.
+///
+/// Placement is written onto the node from a callback ref rather than
+/// held in state. Measuring needs a real layout, and `useEffect` +
+/// `setState` would mean a second render every time the panel opens —
+/// plus the cascading-render lint this codebase already trips ten times
+/// elsewhere. The caller remounts the panel (via `key`) when its
+/// contents change height, which is what re-runs this.
+function SubMenu({
+  anchorRef,
+  children,
+}: {
+  anchorRef: React.RefObject<HTMLDivElement | null>;
+  children: React.ReactNode;
+}) {
+  const place = useCallback(
+    (node: HTMLDivElement | null) => {
+      if (!node) return;
+      const menu = anchorRef.current?.getBoundingClientRect();
+      const panel = node.getBoundingClientRect();
+      if (!menu) return;
+      if (menu.right + panel.width > window.innerWidth - 8) {
+        node.style.left = "auto";
+        node.style.right = "100%";
+      } else {
+        node.style.right = "auto";
+        node.style.left = "100%";
+      }
+      // `panel.bottom` is where it sits now; anything past the viewport
+      // comes back as a negative offset rather than a scrollbar.
+      const over = panel.bottom - (window.innerHeight - 8);
+      node.style.top = over > 0 ? `${-over}px` : "0px";
+    },
+    [anchorRef],
+  );
+  return (
+    <div
+      ref={place}
+      className="absolute rounded border shadow-lg text-xs py-1"
+      style={{
+        top: 0,
+        left: "100%",
+        minWidth: "180px",
+        maxHeight: "60vh",
+        overflowY: "auto",
+        zIndex: 57,
+        background: "var(--bg-primary)",
+        borderColor: "var(--border)",
+        color: "var(--text-primary)",
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
 function MenuItem({
   icon,
   label,
@@ -329,14 +392,19 @@ export function FilesView({ active }: Props) {
   // KMS list (name/scope) for the entry menu's "Add to KMS" submenu.
   // Kept in sync via `kms_update` broadcasts; requested once on mount.
   const [kmsList, setKmsList] = useState<{ name: string; scope: string }[]>([]);
-  // Whether the entry menu's "Add to KMS" row is expanded into its KMS
-  // picker (only used when more than one KMS exists). Reset when the menu
-  // opens/closes so it never leaks between right-clicks.
-  const [kmsPick, setKmsPick] = useState(false);
-  // Which "Add to KMS" flavour the expanded picker is for: `summary`
-  // (agent curates the stub page) or `atomic` (research job splits the
-  // document into a topic page + one note per idea).
-  const [kmsPickMode, setKmsPickMode] = useState<IngestMode>(DEFAULT_INGEST_MODE);
+  // The "Add to knowledge base" flyout. The four modes used to be four
+  // flat rows in a menu that already has eleven, and picking one with
+  // several bases expanded a list *below* them, so the menu grew twice
+  // over on the commonest file type. One row now, one panel beside it.
+  //
+  // `kmsPickMode` doubles as the panel's depth: null shows the modes,
+  // a mode shows the bases for it. Only ever one panel — a second
+  // flyout would need its own edge-flip against the first one's box.
+  const [kmsFlyout, setKmsFlyout] = useState(false);
+  const [kmsPickMode, setKmsPickMode] = useState<IngestMode | null>(null);
+  // Measured so the panel can open to the left when the menu was
+  // right-clicked near the right edge. The menu itself has no flip.
+  const entryMenuRef = useRef<HTMLDivElement | null>(null);
   // New file / folder name modal. null = closed; otherwise which kind.
   const [createKind, setCreateKind] = useState<"file" | "folder" | null>(null);
   const [createName, setCreateName] = useState("");
@@ -631,10 +699,11 @@ export function FilesView({ active }: Props) {
     return unsub;
   }, []);
 
-  // Collapse the "Add to KMS" picker whenever the entry menu opens or
-  // closes, so a stale expansion never carries into the next right-click.
+  // Close the flyout whenever the entry menu opens or closes, so a
+  // stale panel never carries into the next right-click.
   useEffect(() => {
-    setKmsPick(false);
+    setKmsFlyout(false);
+    setKmsPickMode(null);
   }, [entryMenu]);
 
   // Ingest a .md file into the named KMS (Files-tab "Add to KMS"). Mirrors
@@ -1841,6 +1910,7 @@ export function FilesView({ active }: Props) {
             }}
           />
           <div
+            ref={entryMenuRef}
             className="fixed z-[56] rounded border shadow-lg text-xs py-1"
             style={{
               left: entryMenu.x,
@@ -1882,57 +1952,142 @@ export function FilesView({ active }: Props) {
                 }}
               />
             )}
-            {/* Markdown-only: ingest into a KMS. One KMS → ingest
-                straight away; several → expand an inline picker; none →
-                a hint toast. */}
+            {/* PDF-only: a markdown sibling, extracted not generated.
+                No model, no cost, no waiting on a turn — the backend
+                shells out to poppler and repairs Thai marks. */}
+            {!entryMenu.isDir && /\.pdf$/i.test(entryMenu.name) && (
+              <MenuItem
+                icon={<FileText size={13} />}
+                label="Convert to markdown"
+                title="Extract the text beside the PDF as .md — no model, no cost"
+                onClick={() => {
+                  const m = entryMenu;
+                  setEntryMenu(null);
+                  setSaveToast(`converting ${m.name}…`);
+                  // One-shot, like the upload path: the long-lived
+                  // subscription up top has `[]` deps, so `currentPath`
+                  // read from inside it would be whatever it was on
+                  // mount and the tree would refresh the wrong folder.
+                  const unsub = subscribe((msg) => {
+                    if (
+                      msg.type !== "pdf_to_markdown_result" ||
+                      msg.path !== m.path
+                    ) {
+                      return;
+                    }
+                    unsub();
+                    if (msg.ok) {
+                      setSaveToast(
+                        `wrote ${String(msg.out ?? "").split("/").pop()}`,
+                      );
+                      send({
+                        type: "file_list",
+                        path: currentPath,
+                        show_hidden: showHidden,
+                      });
+                    } else {
+                      setSaveToast(
+                        `convert failed: ${msg.error ?? "unknown error"}`,
+                      );
+                    }
+                    setTimeout(() => setSaveToast(null), 4000);
+                  });
+                  send({ type: "pdf_to_markdown", path: m.path });
+                }}
+              />
+            )}
+            {/* Markdown-only: ingest into a knowledge base. One row that
+                opens a panel beside the menu — the four modes, then the
+                bases when there is more than one to choose from. */}
             {!entryMenu.isDir && /\.(md|markdown)$/i.test(entryMenu.name) && (
-              <>
-                {INGEST_MODES.map(({ id: mode, label, hint }) => {
-                  const open = kmsPick && kmsPickMode === mode;
-                  return (
-                    <MenuItem
-                      key={`add-${mode}`}
-                      icon={<Library size={13} />}
-                      title={hint}
-                      label={
-                        kmsList.length > 1
-                          ? `${label}${open ? " ▾" : " ▸"}`
-                          : label
-                      }
-                      onClick={() => {
-                        const m = entryMenu;
-                        if (kmsList.length === 0) {
-                          setEntryMenu(null);
-                          setSaveToast("no KMS yet — create one first");
-                          setTimeout(() => setSaveToast(null), 3000);
-                        } else if (kmsList.length === 1) {
-                          setEntryMenu(null);
-                          addToKms(m.path, m.name, kmsList[0].name, false, mode);
-                        } else if (open) {
-                          setKmsPick(false);
-                        } else {
-                          setKmsPickMode(mode);
-                          setKmsPick(true);
-                        }
-                      }}
-                    />
-                  );
-                })}
-                {kmsPick &&
-                  kmsList.length > 1 &&
-                  kmsList.map((k) => (
-                    <MenuItem
-                      key={`${k.scope}:${k.name}`}
-                      icon={<Library size={12} />}
-                      label={`↳ ${k.name}`}
-                      onClick={() => {
-                        const m = entryMenu;
-                        setEntryMenu(null);
-                        addToKms(m.path, m.name, k.name, false, kmsPickMode);
-                      }}
-                    />
-                  ))}
-              </>
+              <div
+                style={{ position: "relative" }}
+                onMouseEnter={() => kmsList.length > 0 && setKmsFlyout(true)}
+                onMouseLeave={() => {
+                  setKmsFlyout(false);
+                  setKmsPickMode(null);
+                }}
+              >
+                <MenuItem
+                  icon={<Library size={13} />}
+                  label="Add to knowledge base ▸"
+                  title={
+                    kmsList.length === 0
+                      ? "No knowledge base yet — create one first"
+                      : "Archive it, summarise it, or break it into cited notes"
+                  }
+                  onClick={() => {
+                    if (kmsList.length === 0) {
+                      setEntryMenu(null);
+                      setSaveToast("no KMS yet — create one first");
+                      setTimeout(() => setSaveToast(null), 3000);
+                      return;
+                    }
+                    setKmsFlyout((open) => !open);
+                  }}
+                />
+                {kmsFlyout && kmsList.length > 0 && (
+                  <SubMenu
+                    key={kmsPickMode ?? "modes"}
+                    anchorRef={entryMenuRef}
+                  >
+                    {kmsPickMode === null
+                      ? INGEST_MODES.map(({ id: mode, label, hint }) => (
+                          <MenuItem
+                            key={`add-${mode}`}
+                            icon={<Library size={13} />}
+                            title={hint}
+                            label={
+                              kmsList.length > 1 ? `${label}…` : label
+                            }
+                            onClick={() => {
+                              const m = entryMenu;
+                              // One base is the common case: no second
+                              // choice to make, so do not ask for one.
+                              if (kmsList.length === 1) {
+                                setEntryMenu(null);
+                                addToKms(
+                                  m.path,
+                                  m.name,
+                                  kmsList[0].name,
+                                  false,
+                                  mode,
+                                );
+                              } else {
+                                setKmsPickMode(mode);
+                              }
+                            }}
+                          />
+                        ))
+                      : [
+                          <MenuItem
+                            key="back"
+                            icon={<span style={{ width: 13 }}>‹</span>}
+                            label="Back"
+                            onClick={() => setKmsPickMode(null)}
+                          />,
+                          ...kmsList.map((k) => (
+                            <MenuItem
+                              key={`${k.scope}:${k.name}`}
+                              icon={<Library size={12} />}
+                              label={k.name}
+                              onClick={() => {
+                                const m = entryMenu;
+                                setEntryMenu(null);
+                                addToKms(
+                                  m.path,
+                                  m.name,
+                                  k.name,
+                                  false,
+                                  kmsPickMode,
+                                );
+                              }}
+                            />
+                          )),
+                        ]}
+                  </SubMenu>
+                )}
+              </div>
             )}
             {/* Markdown-only: translate or summarize into a chosen language,
                 saved as a `<stem>-<code>.md` / `<stem>-<code>-sum.md` sibling. */}

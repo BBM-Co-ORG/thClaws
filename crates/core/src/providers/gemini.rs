@@ -239,13 +239,8 @@ impl GeminiProvider {
         // `thinkingLevel: low|high`. Gemma has no thinking config.
         if let Some(level) = super::ThinkingLevel::from_budget(req.thinking_budget) {
             let m = req.model.to_ascii_lowercase();
-            if m.starts_with("gemini-3") {
-                let lvl = if matches!(level, super::ThinkingLevel::Off | super::ThinkingLevel::Low)
-                {
-                    "low"
-                } else {
-                    "high"
-                };
+            if let Some(accepted) = gemini_thinking_levels(&m) {
+                let lvl = gemini_nearest_level(level, accepted);
                 body["generationConfig"]["thinkingConfig"] = json!({"thinkingLevel": lvl});
             } else if m.starts_with("gemini") {
                 let mut budget = level.to_budget();
@@ -835,8 +830,88 @@ impl ThinkFilter {
     }
 }
 
+/// The `thinkingLevel` values a Gemini model accepts, or `None` when it
+/// wants a `thinkingBudget` instead.
+///
+/// Measured against the live API on 2026-09-21. Two things the ids do
+/// not tell you: `gemini-flash-latest` and `gemini-pro-latest` take a
+/// level despite not saying `3`, and the 3.x family splits — the newer
+/// models dropped `minimal`. No Gemini model accepts `none`, `xhigh` or
+/// `max`.
+///
+/// This replaces a `starts_with("gemini-3")` test that collapsed our
+/// four levels onto `low|high`, so a user asking for medium silently got
+/// high — the specific thing a reporter corrected us on in #213.
+fn gemini_thinking_levels(model_lower: &str) -> Option<&'static [&'static str]> {
+    const WITH_MINIMAL: &[&str] = &["minimal", "low", "medium", "high"];
+    const NO_MINIMAL: &[&str] = &["low", "medium", "high"];
+    let id = model_lower.rsplit('/').next().unwrap_or(model_lower);
+    Some(match id {
+        "gemini-3-flash-preview"
+        | "gemini-3.1-flash-lite"
+        | "gemini-3.1-flash-lite-preview"
+        | "gemini-3.5-flash"
+        | "gemini-3.5-flash-lite"
+        | "gemini-3.6-flash" => WITH_MINIMAL,
+        "gemini-3.1-pro-preview"
+        | "gemini-3.1-pro-preview-customtools"
+        | "gemini-3.7-flash"
+        | "gemini-3.8-flash"
+        | "gemini-flash-latest"
+        | "gemini-flash-lite-latest"
+        | "gemini-pro-latest" => NO_MINIMAL,
+        // An unmeasured 3.x still takes a level; the conservative set is
+        // the one every measured 3.x shares.
+        other if other.starts_with("gemini-3") => NO_MINIMAL,
+        _ => return None,
+    })
+}
+
+/// Our level on the set this model actually offers.
+fn gemini_nearest_level(level: super::ThinkingLevel, accepted: &[&'static str]) -> &'static str {
+    use super::ThinkingLevel as L;
+    let wanted: &[&str] = match level {
+        L::Off => &["minimal", "low"],
+        L::Low => &["low", "minimal"],
+        L::Medium => &["medium", "high"],
+        L::High => &["high", "medium"],
+    };
+    for w in wanted {
+        if let Some(found) = accepted.iter().find(|a| *a == w) {
+            return found;
+        }
+    }
+    accepted.first().copied().unwrap_or("medium")
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn medium_reaches_the_models_that_have_a_medium() {
+        use crate::providers::ThinkingLevel as L;
+        let lvl = |model: &str, level| {
+            super::gemini_thinking_levels(model).map(|a| super::gemini_nearest_level(level, a))
+        };
+        // The reported bug: our four levels were collapsed onto
+        // `low|high`, so asking for medium silently got high.
+        assert_eq!(lvl("gemini-3.8-flash", L::Medium), Some("medium"));
+        assert_eq!(lvl("gemini-3.5-flash", L::Medium), Some("medium"));
+
+        // `minimal` exists on some 3.x and not others; "off" takes the
+        // lowest rung the model actually has.
+        assert_eq!(lvl("gemini-3.5-flash", L::Off), Some("minimal"));
+        assert_eq!(lvl("gemini-3.8-flash", L::Off), Some("low"));
+
+        // These take a level despite ids that do not say 3.x — they used
+        // to be handed a token budget instead.
+        assert_eq!(lvl("gemini-flash-latest", L::Medium), Some("medium"));
+        assert_eq!(lvl("gemini-pro-latest", L::High), Some("high"));
+
+        // 2.x is a budget, not a level.
+        assert_eq!(lvl("gemini-2.5-pro", L::Medium), None);
+        assert_eq!(lvl("gemini-2.0-flash", L::High), None);
+    }
     use super::*;
     use crate::providers::{assemble, collect_turn};
     use crate::types::Message;

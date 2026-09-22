@@ -127,11 +127,9 @@ pub fn cited_indices(body: &str) -> BTreeSet<u32> {
 fn frontmatter_sources(fm: &BTreeMap<String, String>) -> BTreeSet<u32> {
     fm.get("sources")
         .map(|raw| {
-            raw.trim()
-                .trim_start_matches('[')
-                .trim_end_matches(']')
-                .split(|c: char| c == ',' || c.is_whitespace())
-                .filter_map(|t| t.trim().trim_matches('"').parse::<u32>().ok())
+            crate::kms::sources_entries(raw)
+                .into_iter()
+                .filter_map(|t| t.parse::<u32>().ok())
                 .collect()
         })
         .unwrap_or_default()

@@ -2126,16 +2126,8 @@ fn mark_dependent_pages_stale(kref: &KmsRef, changed_alias: &str) -> Result<usiz
             Some(s) => s.clone(),
             None => continue,
         };
-        // `sources:` is a flow list as often as a bare list, and the old
-        // comparison kept the brackets and quotes on each item — so
-        // `["alias"]` never matched `alias`.
-        let mentions = sources_field
-            .split(',')
-            .map(|s| {
-                s.trim()
-                    .trim_matches(|c| matches!(c, '[' | ']' | '"' | '\''))
-                    .trim()
-            })
+        let mentions = sources_entries(&sources_field)
+            .into_iter()
             .any(|s| s == changed_alias || indices.iter().any(|i| i == s));
         if !mentions {
             continue;
@@ -2529,32 +2521,11 @@ pub async fn ingest_pdf(
             "alias derived from PDF is empty — pass --alias"
         )));
     }
-    // Run pdftotext in a blocking task — same shape PdfReadTool uses.
-    let pdf_owned = pdf_path.to_path_buf();
-    let extracted = tokio::task::spawn_blocking(move || -> Result<String> {
-        let output = std::process::Command::new("pdftotext")
-            .args(["-layout", "-enc", "UTF-8"])
-            .arg(&pdf_owned)
-            .arg("-") // stdout
-            .output()
-            .map_err(|e| Error::Tool(format!("pdftotext (is poppler installed?): {e}")))?;
-        if !output.status.success() {
-            return Err(Error::Tool(format!(
-                "pdftotext exited {}: {}",
-                output.status.code().unwrap_or(-1),
-                String::from_utf8_lossy(&output.stderr).trim()
-            )));
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-    })
-    .await
-    .map_err(|e| Error::Tool(format!("pdftotext join: {e}")))??;
-
-    // Apply the SAME Thai repair PdfReadTool uses — `pdftotext -layout`
-    // orphans Thai vowel/tone marks behind spaces, and without this the
-    // ingested page keeps that fragmentation. (Pre-fix this path copied the
-    // pdftotext call but not the normalization step.)
-    let extracted = crate::tools::pdf_read::normalize_thai_spacing(&extracted);
+    // Extraction and the Thai repair travel together in one function
+    // now. They used to be a copy here that carried the first and not
+    // the second, which is how an ingested Thai paper kept the
+    // vowel/tone fragmentation `-layout` introduces.
+    let extracted = crate::tools::pdf_read::extract_text(pdf_path, None, None).await?;
 
     let tmp_dir = std::env::temp_dir();
     let tmp_path = tmp_dir.join(format!("kms-pdf-{alias_clean}.md"));
@@ -3463,6 +3434,54 @@ fn quote_fm_item(item: &str) -> String {
 /// insertion order via Vec under the hood (BTreeMap is fine — keys
 /// are conventional and small). Returns `(empty, original)` when no
 /// frontmatter delimiter present.
+/// The entries of a `sources:` frontmatter value.
+///
+/// One parser, because there were four, and they disagreed. The field
+/// carries three different vocabularies depending on who wrote the page
+/// — registry indices from `/research` (`sources: [3, 7]`), session ids
+/// from `/dream` (`sources: ["sess-abc"]`), and a bare archive alias
+/// from an ingest (`sources: my-paper`) — and each reader hand-rolled a
+/// tokeniser for the shape it expected. `kms_sources` stripped quotes
+/// but not brackets, so the first entry of every flow list reached it as
+/// `["sess-abc` and matched nothing.
+///
+/// Brackets come off the value once, then entries split on commas and
+/// whitespace, then quotes and any stray bracket come off each entry.
+/// Skip what nothing can check with [`source_entry_is_external_provenance`].
+pub fn sources_entries(raw: &str) -> Vec<&str> {
+    raw.trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .map(|t| {
+            t.trim()
+                .trim_matches(|c| matches!(c, '"' | '\'' | '[' | ']'))
+                .trim()
+        })
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+/// Is this `sources:` entry provenance that no archive and no registry
+/// can be expected to know?
+///
+/// A URL, a `session-`/`sess-` id and the literal `memory` are all
+/// legitimate values that name nothing on disk, and reporting them as
+/// missing archives is how `/kms lint` used to cry wolf on a vault
+/// `/dream` had written to.
+///
+/// A citation index is deliberately NOT external: it is checkable, just
+/// against `.research/sources.json` rather than the `sources/` folder,
+/// and the caller does that. Folding "is it a file?" and "should I look
+/// at it at all?" into one predicate is what made lint stop reporting an
+/// index the registry had never heard of.
+pub fn source_entry_is_external_provenance(entry: &str) -> bool {
+    entry.starts_with("http")
+        || entry.starts_with("session-")
+        || entry.starts_with("sess-")
+        || entry == "memory"
+}
+
 pub fn parse_frontmatter(s: &str) -> (std::collections::BTreeMap<String, String>, String) {
     let mut map = std::collections::BTreeMap::new();
     let trimmed = s.trim_start_matches('\u{FEFF}');
@@ -3738,6 +3757,18 @@ fn ensure_writable(kref: &KmsRef) -> Result<()> {
     Ok(())
 }
 
+/// Is the page on disk one an ingest wrote and nobody has touched?
+///
+/// `status: derived` is the ingest's marker for "not curated yet"; a
+/// write that replaces the body drops it. Used to decide whether an
+/// overwrite is worth keeping a copy of.
+fn page_is_uncurated_stub(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|raw| parse_frontmatter(&raw).0.get("status").map(|s| s.trim()) == Some("derived"))
+        .unwrap_or(false)
+}
+
 pub fn write_page(kref: &KmsRef, page_name: &str, content: &str) -> Result<PathBuf> {
     ensure_writable(kref)?;
     let path = writable_page_path(kref, page_name)?;
@@ -3789,7 +3820,16 @@ pub fn write_page(kref: &KmsRef, page_name: &str, content: &str) -> Result<PathB
     // detects the previously-injected `# title` and skips re-injection.
     let canonical_body = maybe_inject_canonical_header(&body, &stem, &fm);
     let serialized = write_frontmatter(&fm, &canonical_body);
-    if existed {
+    // Keep the version being replaced — unless it is an uncurated stub.
+    //
+    // An ingest writes `pages/<alias>.md` with `status: derived` and the
+    // research pipeline then overwrites it with the real page seconds
+    // later, so every ingest used to leave the user a Trash row for a
+    // version they never saw and would never want back. A stub is
+    // derived entirely from a source file that is still archived, so
+    // nothing is lost by not keeping it; and a page a person has edited
+    // drops the marker on that write, so their work is kept as before.
+    if existed && !page_is_uncurated_stub(&path) {
         crate::kms_trash::keep_before_overwrite(
             kref,
             &format!("pages/{stem}.md"),
@@ -7266,14 +7306,8 @@ pub fn lint(kref: &KmsRef) -> Result<LintReport> {
         // the orphan-source pass below can tell dead archives from live
         // ones.
         if let Some(raw) = fm.get("sources") {
-            for token in raw
-                .split(|c: char| c == ',' || c.is_whitespace())
-                .map(|s| s.trim().trim_matches(|c| c == '[' || c == ']' || c == '"'))
-                .filter(|s| !s.is_empty())
-            {
-                // `session-…` / `memory` / bare URLs are legitimate
-                // non-file provenance values, not missing archives.
-                if token.starts_with("http") || token.starts_with("session-") || token == "memory" {
+            for token in sources_entries(raw) {
+                if source_entry_is_external_provenance(token) {
                     continue;
                 }
                 // A citation index: good if the registry knows it, and its
@@ -7770,6 +7804,85 @@ mod tests {
     use super::*;
 
     // ─── sources as a first-class layer ───────────────────────────────
+
+    #[test]
+    fn an_uncurated_stub_is_not_kept_in_the_trash() {
+        let _home = scoped_home();
+        let kref = create("stub-trash-rt", KmsScope::Project).unwrap();
+        let before = crate::kms_trash::list_rows(&kref).len();
+
+        // What an ingest writes: a page nobody has curated.
+        write_page(&kref, "paper", "---\nstatus: derived\n---\n\nstub body\n").unwrap();
+        // What the research pipeline writes over it moments later.
+        write_page(
+            &kref,
+            "paper",
+            "---\ntitle: \"Paper\"\n---\n\nthe real page\n",
+        )
+        .unwrap();
+        assert_eq!(
+            crate::kms_trash::list_rows(&kref).len(),
+            before,
+            "a stub the user never saw must not become a row they have to read"
+        );
+
+        // A page someone has written is kept, as before — an edit drops
+        // the `derived` marker, which is exactly the signal used here.
+        write_page(
+            &kref,
+            "paper",
+            "---\ntitle: \"Paper\"\n---\n\nedited again\n",
+        )
+        .unwrap();
+        assert_eq!(
+            crate::kms_trash::list_rows(&kref).len(),
+            before + 1,
+            "overwriting a real page still keeps the version it replaced"
+        );
+    }
+
+    #[test]
+    fn one_sources_parser_reads_all_three_vocabularies() {
+        // `/research` writes indices, `/dream` writes session ids, an
+        // ingest writes a bare alias. All three arrive at the same
+        // readers and all three have to survive the same parse.
+        assert_eq!(sources_entries("[3, 7]"), vec!["3", "7"]);
+        assert_eq!(
+            sources_entries(r#"["sess-abc", "sess-def"]"#),
+            vec!["sess-abc", "sess-def"]
+        );
+        assert_eq!(sources_entries("my-paper"), vec!["my-paper"]);
+
+        // The regression this consolidation closes: `kms_sources`
+        // stripped quotes but not brackets, so the FIRST entry of a flow
+        // list reached it as `["sess-abc` and matched nothing.
+        assert_eq!(
+            sources_entries(r#"["sess-abc"]"#).first().copied(),
+            Some("sess-abc"),
+            "the opening bracket must not ride along on the first entry"
+        );
+
+        // Empty and absent both mean "nothing declared", not one entry
+        // of empty string.
+        assert!(sources_entries("[]").is_empty());
+        assert!(sources_entries("").is_empty());
+        assert!(sources_entries("   ").is_empty());
+
+        // Provenance that names nothing checkable is skipped; an alias
+        // and an index are both checkable, against the `sources/` folder
+        // and the citation registry respectively, so neither is
+        // "external" — folding those two together made `/kms lint` stop
+        // reporting an index the registry had never heard of.
+        assert!(source_entry_is_external_provenance("sess-abc"));
+        assert!(source_entry_is_external_provenance("session-abc"));
+        assert!(source_entry_is_external_provenance("memory"));
+        assert!(source_entry_is_external_provenance("https://example.com/x"));
+        assert!(!source_entry_is_external_provenance("my-paper"));
+        assert!(
+            !source_entry_is_external_provenance("3"),
+            "a citation index is checkable against the registry"
+        );
+    }
 
     #[test]
     fn source_path_resolves_every_supported_extension() {
