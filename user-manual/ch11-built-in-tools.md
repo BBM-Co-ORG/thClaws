@@ -305,7 +305,7 @@ them to report progress and decide when to stop.
 |---|---|---|
 | `KmsRead` | auto | Read a single page from an attached knowledge base (prepends a `[note: …]` staleness banner when `verified:` is missing or > 90 days old) |
 | `KmsSearch` | auto | Grep across all pages in one knowledge base |
-| `KmsWrite` | prompt | Create or replace a page; auto-injects `# {title}\nDescription: {topic}\n---` header; warns when `sources:` frontmatter is missing |
+| `KmsWrite` | prompt | Create or replace a page; auto-injects a `# {title}` heading; warns when `sources:` frontmatter is missing |
 | `KmsAppend` | prompt | Append content to an existing page |
 | `KmsDelete` | prompt | Remove a page (last resort; prefer KmsWrite to merge or supersede) |
 | `KmsCreate` | auto | Ensure a KMS exists (idempotent). Used by `/dream` to bootstrap the `dreams` audit KMS. |

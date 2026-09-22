@@ -4,7 +4,8 @@
 //! contents and a `log.md` change history. Two scopes:
 //!
 //! - **User**: `~/.config/thclaws/kms/<name>/`
-//! - **Project**: `.thclaws/state/kms/<name>/`
+//! - **Project**: `<workspace>/.thclaws/state/kms/<name>/` — shared by every
+//!   agent in the workspace (dev-plan/64 D1)
 //!
 //! Users mark any subset of KMS as "active" in `.thclaws/settings.json`'s
 //! `kms.active` array. When a chat turn runs, each active KMS's
@@ -155,11 +156,18 @@ impl KmsRef {
                 candidate.display()
             ))
         })?;
-        let canon_scope = scope_root(self.scope)
-            .and_then(|p| std::fs::canonicalize(&p).ok())
-            .ok_or_else(|| Error::Tool("kms scope root not resolvable".into()))?;
-        let canon_kms_root = canon_scope.join(&self.name);
-        if !canon_candidate.starts_with(&canon_kms_root) {
+        let canon_kms_roots: Vec<PathBuf> = scope_roots(self.scope)
+            .iter()
+            .filter_map(|p| std::fs::canonicalize(p).ok())
+            .map(|p| p.join(&self.name))
+            .collect();
+        if canon_kms_roots.is_empty() {
+            return Err(Error::Tool("kms scope root not resolvable".into()));
+        }
+        if !canon_kms_roots
+            .iter()
+            .any(|r| canon_candidate.starts_with(r))
+        {
             return Err(Error::Tool(format!(
                 "page '{page}' resolves outside the KMS directory — symlink escape rejected"
             )));
@@ -202,16 +210,183 @@ pub struct KmsManifest {
 
 pub const KMS_SCHEMA_VERSION: &str = "1.0";
 
+/// What a new KMS's `SCHEMA.md` says. A schema still equal to this is not
+/// worth a line of system prompt — see [`system_prompt_section`].
+pub const SCHEMA_TEMPLATE: &str = "# Schema\n\n\
+         Describe the shape of pages in this KMS — required sections, naming\n\
+         conventions, cross-link style.\n\
+         \n\
+         ## Canonical page shape\n\
+         \n\
+         Write frontmatter + body. `title:`, `topic:`, and `sources:` are\n\
+         the three keys every page should carry. `KmsWrite` auto-injects\n\
+         a `# {title}` heading between the frontmatter and the body when\n\
+         the body doesn't already start with a `# heading`.\n\
+         \n\
+         ```\n\
+         ---\n\
+         title: Human-readable title\n\
+         topic: One-line description of what this page covers\n\
+         sources: [\"https://…\", \"session-XYZ\", \"memory\"]   # required: provenance\n\
+         category: optional grouping for the index\n\
+         tags: [optional, free-form]\n\
+         ---\n\
+         \n\
+         (body content)\n\
+         ```\n\
+         \n\
+         `sources:` values: external URLs for web-sourced facts,\n\
+         `session-<id>` for facts learned in a chat session, `memory`\n\
+         for stable user-supplied context, or `[]` for opinion /\n\
+         convention pages that genuinely have no external source\n\
+         (still write the empty list — it's an explicit ack, not an\n\
+         omission).\n\
+         \n\
+         Pages with no `verified:` frontmatter pick up a soft warning\n\
+         when read; pages with `verified:` older than 90 days get a\n\
+         staleness banner. The research pipeline stamps `verified:` on\n\
+         every page it writes — manual `KmsWrite` callers can stamp it\n\
+         too when they've checked the source against current reality.\n";
+
+/// dev-plan/64 P3.2: replace a file in one step. `std::fs::write` truncates
+/// and then writes, so a crash, a kill or a full disk between the two leaves
+/// an empty or half-written page where a whole one was — and a reader in
+/// another process (every agent in a workspace shares these files since D1)
+/// can see that half. The bytes go to a sibling temp file, are flushed, and
+/// are renamed over the target: a reader sees the old file or the new one.
+///
+/// The temp name starts with a dot and does not end in `.md`, so nothing
+/// that lists `pages/` or `sources/` mistakes it for content.
+pub(crate) fn write_file<P: AsRef<Path>, C: AsRef<[u8]>>(
+    path: P,
+    contents: C,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let path = path.as_ref();
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no file name"))?
+        .to_string_lossy();
+    let tmp = path.with_file_name(format!(
+        ".{name}.tmp{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let written = (|| {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(contents.as_ref())?;
+        f.sync_all()?;
+        // A page that was read-only, or 0600, stays that way.
+        if let Ok(meta) = std::fs::metadata(path) {
+            let _ = std::fs::set_permissions(&tmp, meta.permissions());
+        }
+        std::fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
+}
+
+/// Hold a KMS's advisory lock for the length of `f`.
+///
+/// For the small JSON files that are read, changed and written back —
+/// the source catalogue, the manifest. Since D1 every agent in a workspace
+/// shares one vault, and two ingests finishing together each read the
+/// catalogue, add their own record, and write: the second write silently
+/// drops the first record. [`write_file`] makes each write whole; this
+/// makes the read-change-write one step.
+///
+/// A lock file made with `create_new`, which is atomic on every platform.
+/// A holder that died leaves it behind, so one older than [`LOCK_STALE`]
+/// is taken over. Waiting is bounded: past [`LOCK_WAIT`] the work goes
+/// ahead unlocked, because a lost catalogue row is recoverable
+/// (`/kms reindex` rebuilds it) and a command that hangs is not.
+pub(crate) fn with_kms_lock<T>(kref: &KmsRef, f: impl FnOnce() -> T) -> T {
+    const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+    const LOCK_STALE: std::time::Duration = std::time::Duration::from_secs(30);
+    let path = kref.root.join(".lock");
+    let started = std::time::Instant::now();
+    let mut held = false;
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => {
+                held = true;
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .is_some_and(|age| age > LOCK_STALE);
+                if stale {
+                    let _ = std::fs::remove_file(&path);
+                    continue;
+                }
+                if started.elapsed() > LOCK_WAIT {
+                    eprintln!(
+                        "[kms] '{}' stayed locked — going ahead without it",
+                        kref.name
+                    );
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(15));
+            }
+            // No vault folder, read-only media: nothing to serialise against.
+            Err(_) => break,
+        }
+    }
+    let out = f();
+    if held {
+        let _ = std::fs::remove_file(&path);
+    }
+    out
+}
+
 fn user_root() -> Option<PathBuf> {
     crate::util::home_dir().map(|h| h.join(".config/thclaws/kms"))
 }
 
+const PROJECT_KMS_DIR: &str = ".thclaws/state/kms";
+
+/// dev-plan/64 D1: a project knowledge base belongs to the workspace, not
+/// to the agent that happened to create it. Under a workspace host every
+/// agent runs from its own folder, and the project root used to follow
+/// the process cwd — so a vault built by one agent did not exist for the
+/// next. Outside a host `workspace_root()` IS the cwd, so nothing moves.
 fn project_root() -> PathBuf {
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(".thclaws/state/kms")
+    crate::workdir::workspace_root().join(PROJECT_KMS_DIR)
 }
 
+/// Where this agent's project vaults lived before D1, when that is a
+/// different place. After [`migrate_legacy_project_kms`] it holds only
+/// what could not move — a vault whose name another agent's vault took
+/// first — and that one stays reachable to the agent that owns it.
+fn legacy_project_root() -> Option<PathBuf> {
+    let legacy = std::env::current_dir().ok()?.join(PROJECT_KMS_DIR);
+    let shared = project_root();
+    let same = match (legacy.canonicalize(), shared.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => legacy == shared,
+    };
+    (!same && legacy.is_dir()).then_some(legacy)
+}
+
+/// The scope folders a user can create and drop bases in, project first.
+pub fn writable_scope_roots() -> Vec<PathBuf> {
+    [KmsScope::Project, KmsScope::User]
+        .into_iter()
+        .filter_map(scope_root)
+        .collect()
+}
+
+/// Where new vaults in a scope are created.
 fn scope_root(scope: KmsScope) -> Option<PathBuf> {
     match scope {
         KmsScope::User => user_root(),
@@ -220,15 +395,123 @@ fn scope_root(scope: KmsScope) -> Option<PathBuf> {
     }
 }
 
+/// Every directory a scope's vaults are read from, highest priority
+/// first. Only the project scope has more than one: an agent's own
+/// unmoved vault shadows the workspace's same-named one, which is what
+/// that agent saw before D1 and loses nothing.
+fn scope_roots(scope: KmsScope) -> Vec<PathBuf> {
+    if scope == KmsScope::Project {
+        migrate_legacy_project_kms();
+        let mut roots: Vec<PathBuf> = legacy_project_root().into_iter().collect();
+        roots.push(project_root());
+        return roots;
+    }
+    scope_root(scope).into_iter().collect()
+}
+
+/// Move every agent's project vaults up to the workspace. Runs once per
+/// workspace per process, from whichever agent touches the KMS first.
+///
+/// Only ever a `rename`, and only onto a name that is free: a collision,
+/// a cross-device move or a permission error leaves the vault exactly
+/// where it was, still served through [`legacy_project_root`]. Agents
+/// starting together may race for one name; `rename` onto a non-empty
+/// directory fails, so the loser lands in the same "left in place" case.
+fn migrate_legacy_project_kms() {
+    static DONE: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+    let ws = crate::workdir::workspace_root();
+    {
+        let mut done = DONE.lock().unwrap_or_else(|e| e.into_inner());
+        if done.contains(&ws) {
+            return;
+        }
+        done.push(ws.clone());
+    }
+    for line in migrate_project_kms_in(&ws) {
+        eprintln!("[kms] {line}");
+    }
+}
+
+fn migrate_project_kms_in(ws: &Path) -> Vec<String> {
+    let mut report = Vec::new();
+    let Ok(bots) = std::fs::read_dir(ws.join(".thclaws/bots")) else {
+        return report;
+    };
+    let mut bots: Vec<PathBuf> = bots.flatten().map(|e| e.path()).collect();
+    // `main` is the workspace's own agent from before there were others;
+    // when two agents hold the same name, its vault is the one that moves.
+    bots.sort_by_key(|p| (p.file_name().map(|n| n != "main"), p.clone()));
+    let target_root = ws.join(PROJECT_KMS_DIR);
+    for bot in bots {
+        let slug = bot
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let legacy = bot.join(PROJECT_KMS_DIR);
+        let Ok(vaults) = std::fs::read_dir(&legacy) else {
+            continue;
+        };
+        let mut vaults: Vec<_> = vaults.flatten().collect();
+        vaults.sort_by_key(|e| e.file_name());
+        for v in vaults {
+            let name = v.file_name().to_string_lossy().into_owned();
+            let is_vault = v.file_type().map(|t| t.is_dir() && !t.is_symlink());
+            if name.starts_with('.') || !is_vault.unwrap_or(false) {
+                continue;
+            }
+            let to = target_root.join(&name);
+            if std::fs::symlink_metadata(&to).is_ok() {
+                report.push(format!(
+                    "'{name}' stays with agent '{slug}' — the workspace already has a knowledge base by that name. Rename one of them to share it."
+                ));
+                continue;
+            }
+            if let Err(e) = std::fs::create_dir_all(&target_root) {
+                report.push(format!("'{name}' stays with agent '{slug}': {e}"));
+                continue;
+            }
+            match std::fs::rename(v.path(), &to) {
+                Ok(()) => {
+                    report.push(format!(
+                        "'{name}' moved from agent '{slug}' to the workspace — every agent here can use it now"
+                    ));
+                    let kref = KmsRef {
+                        name,
+                        scope: KmsScope::Project,
+                        root: to,
+                    };
+                    let _ = append_log_header(
+                        &kref,
+                        "moved",
+                        &format!("from agent '{slug}' to the workspace"),
+                    );
+                }
+                Err(e) => report.push(format!("'{name}' stays with agent '{slug}': {e}")),
+            }
+        }
+    }
+    report
+}
+
 /// Enumerate KMS directories under one scope. Silently ignores missing
 /// roots — fresh installs have neither. Symlinks are intentionally
 /// skipped: a user can't turn a KMS directory into a symlink to `/etc`
 /// and have thClaws enumerate it.
 fn list_in(scope: KmsScope) -> Vec<KmsRef> {
-    let Some(root) = scope_root(scope) else {
-        return Vec::new();
-    };
-    let Ok(entries) = std::fs::read_dir(&root) else {
+    let mut out: Vec<KmsRef> = Vec::new();
+    for root in scope_roots(scope) {
+        for kref in list_dir(scope, &root) {
+            if !out.iter().any(|k| k.name == kref.name) {
+                out.push(kref);
+            }
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+fn list_dir(scope: KmsScope, root: &Path) -> Vec<KmsRef> {
+    let Ok(entries) = std::fs::read_dir(root) else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -256,6 +539,14 @@ fn list_in(scope: KmsScope) -> Vec<KmsRef> {
     out
 }
 
+/// Is there a knowledge base at all, in any scope? Cheaper than
+/// [`list_all`] where it matters — it stops at the first one.
+pub fn any_exists() -> bool {
+    [KmsScope::Project, KmsScope::User, KmsScope::Shared]
+        .into_iter()
+        .any(|scope| !list_in(scope).is_empty())
+}
+
 /// List every KMS visible to this process — project entries first, then
 /// user. If the same name exists in both scopes, both are returned;
 /// callers that need to pick one treat project as higher priority.
@@ -273,9 +564,67 @@ pub fn list_all() -> Vec<KmsRef> {
 /// shadows the company one. Returns `None` when no KMS by that name
 /// exists, or when the matching directory is a symlink (symlinks are
 /// rejected to prevent `ln -s /etc <kms-name>` style exfiltration).
+/// Find a KMS by name: the exact name first, and failing that, the one
+/// KMS whose name reads the same once case, spaces and punctuation are
+/// ignored — so `age-of-abundance`, `age_of_abundance` and
+/// `AgeOfAbundance` all find "Age of Abundance".
+///
+/// A KMS has no slug; its name is its folder, exactly as typed at
+/// creation. That made a name with a space awkward on every command line,
+/// and it is how a model usually asks for one anyway (`kms:
+/// "age-of-abundance"` → "no KMS named"). The returned [`KmsRef::name`]
+/// is always the real folder name, never the spelling that found it, so
+/// nothing downstream records a second name for the same base.
 pub fn resolve(name: &str) -> Option<KmsRef> {
+    resolve_exact(name).or_else(|| resolve_folded(name))
+}
+
+/// Loose lookup. Scope order matches [`resolve_exact`]. Two bases in one
+/// scope that fold to the same key are ambiguous, and an ambiguous name
+/// finds nothing rather than guessing which base to write into.
+fn resolve_folded(name: &str) -> Option<KmsRef> {
+    let want = fold_for_compare(name);
+    if want.is_empty() {
+        return None;
+    }
     for scope in [KmsScope::Project, KmsScope::User, KmsScope::Shared] {
-        if let Some(root) = scope_root(scope) {
+        // One name held in both of a scope's folders is one base, not two.
+        let mut hits: Vec<String> = scope_roots(scope)
+            .iter()
+            .filter_map(|root| std::fs::read_dir(root).ok())
+            .flat_map(|rd| rd.flatten())
+            .filter(|e| {
+                // Same rule as the exact path: a real directory, never a symlink.
+                std::fs::symlink_metadata(e.path())
+                    .map(|m| m.is_dir() && !m.is_symlink())
+                    .unwrap_or(false)
+            })
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| !n.starts_with('.') && fold_for_compare(n) == want)
+            .collect();
+        hits.sort();
+        hits.dedup();
+        match hits.len() {
+            0 => continue,
+            1 => return resolve_exact(&hits.remove(0)),
+            _ => {
+                hits.sort();
+                eprintln!(
+                    "[kms] '{name}' is ambiguous — it matches {} — use the exact name",
+                    hits.join(", ")
+                );
+                return None;
+            }
+        }
+    }
+    None
+}
+
+/// The name exactly as given. For callers that must not be helped — the
+/// slash-command parser uses it to decide where a name ends.
+pub fn resolve_exact(name: &str) -> Option<KmsRef> {
+    for scope in [KmsScope::Project, KmsScope::User, KmsScope::Shared] {
+        for root in scope_roots(scope) {
             let candidate = root.join(name);
             // symlink_metadata doesn't follow the symlink.
             let Ok(meta) = std::fs::symlink_metadata(&candidate) else {
@@ -284,10 +633,21 @@ pub fn resolve(name: &str) -> Option<KmsRef> {
             if meta.is_symlink() || !meta.is_dir() {
                 continue;
             }
+            // On a case-insensitive disk (macOS by default) this lookup
+            // succeeds for `AGE OF ABUNDANCE` too. Ask the filesystem what
+            // the folder is really called, so the name and the path a
+            // caller gets back are the base's own and not the spelling
+            // that happened to find it — otherwise `/kms use age of
+            // abundance` records a second name for a base already attached.
+            let real = candidate
+                .canonicalize()
+                .ok()
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| name.to_string());
             return Some(KmsRef {
-                name: name.to_string(),
+                root: candidate.with_file_name(&real),
+                name: real,
                 scope,
-                root: candidate,
             });
         }
     }
@@ -412,6 +772,8 @@ pub fn rename(old: &str, new: &str) -> Result<KmsRef> {
             new_root.display()
         )));
     }
+    drop_search_handle(&kref);
+    drop_search_index(&kref);
     std::fs::rename(&kref.root, &new_root).map_err(|e| {
         Error::Tool(format!(
             "rename {} → {}: {e}",
@@ -448,15 +810,15 @@ pub fn create(name: &str, scope: KmsScope) -> Result<KmsRef> {
         scope,
         root,
     };
-    std::fs::write(
+    write_file(
         kref.index_path(),
         format!("# {name}\n\nKnowledge base index — list each page with a one-line summary.\n"),
     )?;
-    std::fs::write(
+    write_file(
         kref.log_path(),
         "# Change log\n\nAppend-only list of ingests / edits / lints.\n",
     )?;
-    std::fs::write(
+    write_file(
         kref.schema_path(),
         // Concise schema template (audit finding C): the previous
         // version duplicated the "Final on-disk shape" example, which
@@ -464,49 +826,14 @@ pub fn create(name: &str, scope: KmsScope) -> Result<KmsRef> {
         // write). Showing only the input shape saves ~300 bytes per
         // KMS in the system prompt. Human authors editing this file
         // directly can extend it with project-specific conventions.
-        "# Schema\n\n\
-         Describe the shape of pages in this KMS — required sections, naming\n\
-         conventions, cross-link style.\n\
-         \n\
-         ## Canonical page shape\n\
-         \n\
-         Write frontmatter + body. `title:`, `topic:`, and `sources:` are\n\
-         the three keys every page should carry. `KmsWrite` auto-injects\n\
-         the `# {title}` / `Description: {topic}` / `---` header block\n\
-         between the frontmatter and the body when the body doesn't\n\
-         already start with a `# heading`.\n\
-         \n\
-         ```\n\
-         ---\n\
-         title: Human-readable title\n\
-         topic: One-line description of what this page covers\n\
-         sources: [\"https://…\", \"session-XYZ\", \"memory\"]   # required: provenance\n\
-         category: optional grouping for the index\n\
-         tags: [optional, free-form]\n\
-         ---\n\
-         \n\
-         (body content)\n\
-         ```\n\
-         \n\
-         `sources:` values: external URLs for web-sourced facts,\n\
-         `session-<id>` for facts learned in a chat session, `memory`\n\
-         for stable user-supplied context, or `[]` for opinion /\n\
-         convention pages that genuinely have no external source\n\
-         (still write the empty list — it's an explicit ack, not an\n\
-         omission).\n\
-         \n\
-         Pages with no `verified:` frontmatter pick up a soft warning\n\
-         when read; pages with `verified:` older than 90 days get a\n\
-         staleness banner. The research pipeline stamps `verified:` on\n\
-         every page it writes — manual `KmsWrite` callers can stamp it\n\
-         too when they've checked the source against current reality.\n",
+        SCHEMA_TEMPLATE,
     )?;
     let manifest = KmsManifest {
         schema_version: KMS_SCHEMA_VERSION.into(),
         frontmatter_required: std::collections::BTreeMap::new(),
         entry: None,
     };
-    std::fs::write(
+    write_file(
         kref.manifest_path(),
         serde_json::to_string_pretty(&manifest).unwrap_or_else(|_| "{}".into()),
     )?;
@@ -519,6 +846,70 @@ pub fn create(name: &str, scope: KmsScope) -> Result<KmsRef> {
 /// formats (PDF, images, archives) are rejected with a hint to convert
 /// them to markdown first — we'd rather make the user choose the
 /// conversion than silently store a blob the model can't read.
+/// What to do with a document once it is archived (dev-plan/64 P4.9).
+///
+/// These are not four flavours of the same thing — they buy different
+/// guarantees at different prices, and the choice belongs to whoever
+/// knows how much the document matters:
+///
+/// - `Archive`: keep the source, write nothing. It is searchable and
+///   citable by hand. Costs nothing.
+/// - `Summary`: the main agent reads it and writes a page. One turn,
+///   cheap, and the page carries **no claims, no quotes, no `[N]`
+///   citations, no `uncited:` and no `verified:`** — the trust strip
+///   and `/kms verify` have nothing to work with. It looks like a
+///   checkable page and is not one.
+/// - `Cited`: the research pipeline digests it into claims, checks
+///   every quote against the archived text, and writes **one** page
+///   with real citations and every trust key stamped. Several model
+///   calls and minutes rather than one turn.
+/// - `Atomic`: the same pipeline without the one-page cap — a topic
+///   page and a note per idea.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngestMode {
+    Archive,
+    Summary,
+    Cited,
+    Atomic,
+}
+
+impl IngestMode {
+    /// Anything unrecognised is `Summary`, which is what every caller
+    /// that predates this meant by sending nothing.
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "archive" | "none" | "raw" => IngestMode::Archive,
+            "cited" | "sourced" => IngestMode::Cited,
+            "atomic" | "notes" => IngestMode::Atomic,
+            _ => IngestMode::Summary,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IngestMode::Archive => "archive",
+            IngestMode::Summary => "summary",
+            IngestMode::Cited => "cited",
+            IngestMode::Atomic => "atomic",
+        }
+    }
+
+    /// The cap to put on the research pipeline. Only consulted when
+    /// [`is_research`](Self::is_research); `None` means "leave the run's
+    /// own default", which is what `Atomic` wants.
+    pub fn research_max_notes(self) -> Option<u32> {
+        match self {
+            IngestMode::Cited => Some(1),
+            _ => None,
+        }
+    }
+
+    /// Whether this mode runs the research pipeline at all.
+    pub fn is_research(self) -> bool {
+        matches!(self, IngestMode::Cited | IngestMode::Atomic)
+    }
+}
+
 pub const INGEST_EXTENSIONS: &[&str] = &[
     "md", "markdown", "txt", "rst", "log", "json", "html", "htm", "csv", "yaml", "yml", "toml",
 ];
@@ -540,6 +931,16 @@ const INGEST_IMAGE_MAX_BYTES: u64 = 25 * 1024 * 1024;
 /// to ingest into them, otherwise a `/kms ingest notes README.md as index`
 /// would clobber the index with no way back except `--force`.
 const RESERVED_PAGE_STEMS: &[&str] = &["index", "log", "SCHEMA"];
+
+/// True for a page name the KMS keeps for itself. For callers that mint
+/// page names — the research planner titled a note "Index", and the write
+/// that followed took the whole run down with it.
+pub fn is_reserved_page_stem(stem: &str) -> bool {
+    let stem = stem.trim_end_matches(".md");
+    RESERVED_PAGE_STEMS
+        .iter()
+        .any(|r| r.eq_ignore_ascii_case(stem))
+}
 
 // ────────────────────────────────────────────────────────────────────────
 // sources/ as a first-class layer.
@@ -620,6 +1021,27 @@ pub fn list_sources(kref: &KmsRef) -> Vec<SourceFile> {
     out
 }
 
+/// An archive name is cut at a fixed length, and a model rebuilding one
+/// from its URL does not know where: it asks for the whole slug and is told
+/// there is no such source. When exactly one archived file's stem is the
+/// start of what was asked for — and long enough that this is a cut and not
+/// a coincidence — that is the file.
+fn truncated_source(sources_dir: &Path, asked: &str) -> Option<PathBuf> {
+    const MIN_STEM: usize = 40;
+    let mut hits: Vec<PathBuf> = std::fs::read_dir(sources_dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && p.file_stem()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|stem| stem.len() >= MIN_STEM && asked.starts_with(stem))
+        })
+        .collect();
+    (hits.len() == 1).then(|| hits.remove(0))
+}
+
 /// Resolve a source by stem (or full `stem.ext`) to a path inside
 /// `sources/`. Applies the same name validation + canonical-containment
 /// check `page_path` uses, then picks the on-disk extension: an exact
@@ -669,6 +1091,7 @@ pub fn source_path(kref: &KmsRef, name: &str) -> Result<PathBuf> {
         .iter()
         .map(|c| sources_dir.join(c))
         .find(|p| p.is_file())
+        .or_else(|| truncated_source(&sources_dir, name))
         .ok_or_else(|| {
             Error::Tool(format!(
                 "no source '{name}' in kms '{}' (tried: {})",
@@ -711,6 +1134,8 @@ pub struct DropReport {
     pub pages_removed: u32,
     pub sources_removed: u32,
     pub root: PathBuf,
+    /// Where the dropped KMS sits until it is pruned or restored.
+    pub trashed: PathBuf,
 }
 
 /// Delete a KMS from disk. Removes the entire scope-rooted directory
@@ -735,13 +1160,16 @@ pub fn remove(name: &str) -> Result<DropReport> {
     // under-reported any KMS holding txt/json/log/html archives.
     let sources_removed = list_sources(&kref).len() as u32;
 
-    std::fs::remove_dir_all(&kref.root)
-        .map_err(|e| Error::Tool(format!("remove {}: {e}", kref.root.display())))?;
+    // Moved, not removed: `/kms restore <name>` brings it back.
+    drop_search_handle(&kref);
+    drop_search_index(&kref);
+    let trashed = crate::kms_trash::drop_kms(&kref)?;
 
     Ok(DropReport {
         pages_removed,
         sources_removed,
         root: kref.root,
+        trashed,
     })
 }
 
@@ -886,6 +1314,11 @@ pub fn ingest_with_origin(
     let source_target = kms.sources_dir().join(format!("{alias}.{ext}"));
     let page_target = kms.pages_dir().join(format!("{alias}.md"));
     let page_existed = page_target.exists();
+    // Same rule as `write_page`: what a vault starts with is what it is
+    // about. Ingest writes its page directly, so it never reached that
+    // hook — a vault seeded by an ingest had no entry page, and every
+    // system-prompt build paid for inferring one from a full scan.
+    let is_first_page = !page_existed && page_count(kms) == 0;
     // Collision is checked across EVERY source extension, not just the
     // one being written: `notes.txt` and `notes.md` would both claim
     // the alias `notes`, mapping two different documents onto one page
@@ -910,8 +1343,7 @@ pub fn ingest_with_origin(
     // A --force re-ingest under a different extension must not leave
     // the old archive behind as a second document.
     if let Some(old) = existing_source.filter(|f| *f != format!("{alias}.{ext}")) {
-        let old_path = kms.sources_dir().join(&old);
-        let _ = std::fs::remove_file(&old_path);
+        let _ = crate::kms_trash::move_to_trash(kms, &format!("sources/{old}"));
         let _ = crate::kms_sources::forget(kms, &old);
         fire_source_index_delete(kms, &old);
     }
@@ -931,10 +1363,23 @@ pub fn ingest_with_origin(
             fm.insert("title".to_string(), title);
         }
         let target = kms.sources_dir().join(format!("{alias}.md"));
-        std::fs::write(&target, write_frontmatter(&fm, &md).as_bytes())
+        let converted = write_frontmatter(&fm, &md);
+        crate::kms_trash::keep_before_overwrite(
+            kms,
+            &format!("sources/{alias}.md"),
+            converted.as_bytes(),
+        );
+        write_file(&target, converted.as_bytes())
             .map_err(|e| Error::Tool(format!("write {}: {e}", target.display())))?;
         ("md".to_string(), target, Some("text/html"))
     } else {
+        // `--force` replaces the archive; the one it replaces is kept.
+        if let (Ok(next), Some(file)) = (
+            std::fs::read(source),
+            source_target.file_name().and_then(|n| n.to_str()),
+        ) {
+            crate::kms_trash::keep_before_overwrite(kms, &format!("sources/{file}"), &next);
+        }
         std::fs::copy(source, &source_target).map_err(|e| {
             Error::Tool(format!(
                 "copy {} → {} failed: {e}",
@@ -977,11 +1422,35 @@ pub fn ingest_with_origin(
         .filter(|r| r.file != file_name)
         .map(|r| r.file);
 
+    // What is already at `pages/<alias>.md`, if anything. A stub this
+    // function wrote earlier still says `status: derived` and is ours to
+    // regenerate. Anything else has been written over — by a research run
+    // that turned it into the topic page, or by a person — and a re-ingest
+    // used to replace it with a fresh outline stub: a 17,000-character
+    // topic page with its `kind: moc`, its `related:` list and its claim
+    // count, gone behind a generic "Replace?" prompt, while the notes that
+    // link to it stayed.
+    let existing_fm = if page_existed {
+        std::fs::read_to_string(&page_target)
+            .ok()
+            .map(|raw| parse_frontmatter(&raw).0)
+    } else {
+        None
+    };
+    let page_is_ours = existing_fm
+        .as_ref()
+        .map(|fm| fm.get("status").map(|s| s.trim()) == Some("derived"))
+        .unwrap_or(true);
+
     let mut fm = std::collections::BTreeMap::new();
     let today = crate::usage::today_str();
-    if !page_existed {
-        fm.insert("created".into(), today.clone());
-    }
+    // `created` is when the page first appeared, not when it was last
+    // regenerated; it used to be dropped on every re-ingest.
+    let created = existing_fm
+        .as_ref()
+        .and_then(|fm| fm.get("created").cloned())
+        .unwrap_or_else(|| today.clone());
+    fm.insert("created".into(), created);
     fm.insert("updated".into(), today.clone());
     fm.insert("category".into(), "uncategorized".into());
     fm.insert("sources".into(), alias.clone());
@@ -1003,9 +1472,26 @@ pub fn ingest_with_origin(
         &sha256,
         &today,
     );
-    let serialized = write_frontmatter(&fm, &body);
-    std::fs::write(&page_target, serialized.as_bytes())
-        .map_err(|e| Error::Tool(format!("write page {}: {e}", page_target.display())))?;
+    if page_is_ours {
+        let serialized = write_frontmatter(&fm, &body);
+        if let Some(file) = page_target.file_name().and_then(|n| n.to_str()) {
+            crate::kms_trash::keep_before_overwrite(
+                kms,
+                &format!("pages/{file}"),
+                serialized.as_bytes(),
+            );
+        }
+        write_file(&page_target, serialized.as_bytes())
+            .map_err(|e| Error::Tool(format!("write page {}: {e}", page_target.display())))?;
+    } else {
+        eprintln!(
+            "[kms] re-ingest of '{alias}': the source was replaced, the page was kept — \
+             it is no longer an ingest stub"
+        );
+    }
+    if is_first_page && kms.read_manifest().and_then(|m| m.entry).is_none() {
+        let _ = set_entry_page(kms, Some(&alias));
+    }
 
     crate::kms_sources::upsert(
         kms,
@@ -1606,6 +2092,15 @@ fn mark_dependent_pages_stale(kref: &KmsRef, changed_alias: &str) -> Result<usiz
         Err(_) => return Ok(0),
     };
     let today = crate::usage::today_str();
+    // A research note cites by registry index (`sources: [3, 7]`), not by
+    // alias, so the alias has to be looked up there too. Without this no
+    // page written by `/research` was ever marked stale.
+    let indices: Vec<String> = crate::research::registry::SourceRegistry::load(kref)
+        .meta()
+        .into_iter()
+        .filter(|(_, _, url)| crate::research::kms_writer::url_to_filename(url) == changed_alias)
+        .map(|(i, _, _)| i.to_string())
+        .collect();
     let mut count = 0usize;
     for entry in entries.flatten() {
         let Ok(ft) = entry.file_type() else { continue };
@@ -1631,13 +2126,25 @@ fn mark_dependent_pages_stale(kref: &KmsRef, changed_alias: &str) -> Result<usiz
             Some(s) => s.clone(),
             None => continue,
         };
+        // `sources:` is a flow list as often as a bare list, and the old
+        // comparison kept the brackets and quotes on each item — so
+        // `["alias"]` never matched `alias`.
         let mentions = sources_field
-            .split(|c: char| c == ',' || c.is_whitespace())
-            .any(|s| s.trim() == changed_alias);
+            .split(',')
+            .map(|s| {
+                s.trim()
+                    .trim_matches(|c| matches!(c, '[' | ']' | '"' | '\''))
+                    .trim()
+            })
+            .any(|s| s == changed_alias || indices.iter().any(|i| i == s));
         if !mentions {
             continue;
         }
-        fm.insert("updated".into(), today.clone());
+        // Not `updated:` — nothing about the page was updated, and bumping
+        // it made the stalest pages sort as the freshest. `stale_since:`
+        // keeps the first date: that is how long the debt has stood.
+        fm.entry("stale_since".into())
+            .or_insert_with(|| today.clone());
         let mut new_body = body;
         if !new_body.ends_with('\n') {
             new_body.push('\n');
@@ -1646,7 +2153,7 @@ fn mark_dependent_pages_stale(kref: &KmsRef, changed_alias: &str) -> Result<usiz
             "\n> ⚠ STALE: source `{changed_alias}` was re-ingested on {today}. Refresh this page.\n"
         ));
         let serialized = write_frontmatter(&fm, &new_body);
-        if std::fs::write(&path, serialized.as_bytes()).is_ok() {
+        if write_file(&path, serialized.as_bytes()).is_ok() {
             count += 1;
         }
     }
@@ -1720,6 +2227,17 @@ pub fn scan_stale_markers(kref: &KmsRef) -> Result<Vec<StaleEntry>> {
 /// running `ingest()` against it. The HTML→markdown conversion is
 /// out of scope — we save the raw response. Pages can be cleaned up
 /// by the LLM via KmsWrite.
+/// Whether a fetched body is a PDF (dev-plan/64 P4.8).
+///
+/// The header decides where it says anything useful. The magic bytes
+/// are the fallback, because a good share of servers hand a paper over
+/// as `application/octet-stream` or with no type at all — and getting
+/// this wrong is not a cosmetic miss: the body would be decoded as
+/// UTF-8 and archived as mush no reader or search index can use.
+fn looks_like_pdf(content_type: &str, body: &[u8]) -> bool {
+    content_type.contains("pdf") || body.starts_with(b"%PDF-")
+}
+
 pub async fn ingest_url(
     kref: &KmsRef,
     url: &str,
@@ -1746,6 +2264,7 @@ pub async fn ingest_url(
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
+        .user_agent(crate::version::WEB_USER_AGENT)
         .build()
         .map_err(|e| Error::Tool(format!("http client: {e}")))?;
     let resp = client
@@ -1769,10 +2288,28 @@ pub async fn ingest_url(
         .unwrap_or("")
         .trim()
         .to_ascii_lowercase();
-    let body = resp
-        .text()
+    // Bytes, not text: a PDF decoded as UTF-8 is unrecoverable, and the
+    // decision about what this *is* has to come before the decoding.
+    let raw = resp
+        .bytes()
         .await
         .map_err(|e| Error::Tool(format!("read body: {e}")))?;
+
+    // dev-plan/64 P4.8: a URL that serves a PDF is a PDF. This branch
+    // did not exist, so `resp.text()` ran over the binary and archived
+    // lossy mush as `sources/<alias>.md` — reachable from the GUI's URL
+    // field since P5.3, and the commonest shape of a link to a paper.
+    // The header decides, with the magic bytes as the fallback for a
+    // server that says `application/octet-stream`.
+    if looks_like_pdf(&content_type, &raw) {
+        let tmp = std::env::temp_dir().join(format!("kms-url-{alias_clean}.pdf"));
+        std::fs::write(&tmp, &raw)
+            .map_err(|e| Error::Tool(format!("stage {}: {e}", tmp.display())))?;
+        let out = ingest_pdf(kref, &tmp, Some(&alias_clean), force, Some(url)).await;
+        let _ = std::fs::remove_file(&tmp);
+        return out;
+    }
+    let body = String::from_utf8_lossy(&raw).into_owned();
 
     // Archive readable Markdown, not tag soup. Pre-fix this wrote the
     // response bytes verbatim into `sources/<alias>.md`, so every web
@@ -1973,6 +2510,11 @@ pub async fn ingest_pdf(
     pdf_path: &Path,
     alias: Option<&str>,
     force: bool,
+    // `origin_url`: where the PDF really came from, when that is not the
+    // path being read. A URL ingest stages the download in a temp file,
+    // and the temp path is of no use to anyone who later asks where a
+    // claim came from (dev-plan/64 P4.8).
+    origin_url: Option<&str>,
 ) -> Result<IngestResult> {
     let resolved_alias = alias.map(String::from).unwrap_or_else(|| {
         pdf_path
@@ -2016,11 +2558,14 @@ pub async fn ingest_pdf(
 
     let tmp_dir = std::env::temp_dir();
     let tmp_path = tmp_dir.join(format!("kms-pdf-{alias_clean}.md"));
-    let origin_ref = pdf_path
-        .canonicalize()
-        .unwrap_or_else(|_| pdf_path.to_path_buf())
-        .display()
-        .to_string();
+    let origin_ref = match origin_url {
+        Some(u) => u.to_string(),
+        None => pdf_path
+            .canonicalize()
+            .unwrap_or_else(|_| pdf_path.to_path_buf())
+            .display()
+            .to_string(),
+    };
     let mut fm = std::collections::BTreeMap::new();
     fm.insert("type".to_string(), "source".to_string());
     fm.insert("source_pdf".to_string(), origin_ref.clone());
@@ -2094,107 +2639,89 @@ pub fn sanitize_alias(raw: &str) -> String {
 /// nothing.
 pub fn system_prompt_section(active: &[String]) -> String {
     let mut parts = Vec::new();
+    let mut traits = VaultTraits::default();
     for name in active {
         let Some(kref) = resolve(name) else { continue };
 
-        // M6.25 BUG #5: pull SCHEMA.md into the prompt. Pre-fix the
-        // schema sat on disk but the LLM never saw it, so the "wiki
-        // maintainer" affordance had no instructions to follow. Cap
-        // by line count to keep prompt bounded.
+        // A schema the owner wrote is an instruction; the one every KMS
+        // is created with is not — what it says about page shape is in
+        // `KmsWrite`'s own description, and it cost 1.3 KB per attached
+        // base on every request. `KmsRead(kind: "schema")` still reads it.
         let schema = read_text_capped(&kref.schema_path(), 100, 5000);
-        // Categorized index — supersedes the raw index.md when pages
-        // have frontmatter. Falls back to raw index.md for legacy
-        // KMSes that haven't adopted frontmatter.
-        let index_section = render_index_section(&kref);
-
         let mut block = format!("## KMS: {name} ({scope})\n", scope = kref.scope.as_str());
-        if !schema.trim().is_empty() {
+        if !schema.trim().is_empty() && schema.trim() != SCHEMA_TEMPLATE.trim() {
             block.push_str(&format!("\n### Schema\n{}\n", schema.trim()));
         }
-        block.push_str(&format!("\n### Index\n{index_section}\n"));
-        // Per-KMS `### Tools` subsection removed (audit finding B): the
-        // tool signatures don't vary by KMS, only the `kms: "<name>"`
-        // argument does — duplicating ~250 bytes per attached KMS was
-        // pure waste. Tool reference is now globalised once near the
-        // top of the section below.
+        let (header, t) = index_header_with(&kref);
+        traits.provenance_pages |= t.provenance_pages;
+        traits.raw_layer |= t.raw_layer;
+        block.push_str(&format!("\n{header}\n"));
         parts.push(block);
     }
     if parts.is_empty() {
-        String::new()
-    } else {
-        // M6.39.5: strong-imperative wording. Pre-fix the prelude said
-        // "consult them before answering when the user's question
-        // overlaps" — soft enough that models routinely answered from
-        // training data even when the index's per-page summaries
-        // clearly matched the user's question. This rewrite uses
-        // numbered MUST procedure + explicit "do not skip" + framing
-        // skipped lookups as a correctness bug. Reader/maintainer
-        // framing kept (still useful) but moved below the consultation
-        // procedure so the directive lands first.
-        //
-        // Audit finding B (globalised KMS tool reference): the per-KMS
-        // tools subsection was identical across every attached KMS
-        // bar the `name` argument. Render once here, point each KMS
-        // block at it — saves ~200 bytes per additional KMS attached.
-        format!(
-            "# Active knowledge bases (CONSULT BEFORE ANSWERING)\n\n\
-             The following KMS are attached to this conversation. They contain \
-             research, notes, and entity pages curated specifically for this project.\n\n\
-             **MANDATORY consultation procedure.** For ANY user message whose subject \
-             could plausibly appear in the index below, your FIRST action MUST be \
-             a tool call sequence — BEFORE composing any prose response:\n\n\
-             1. Call `KmsSearch(kms: \"<name>\", pattern: \"<keyword>\")` with 1-3 keyword \
-             stems from the user's message. KMS uses plain grep, so romanizations or \
-             English keywords work for non-English questions (e.g. user asks in Thai \
-             about \"llm-wiki\" → search `pattern: \"llm-wiki\"` or `\"llm wiki\"`).\n\
-             2. For each matching page, call `KmsRead(kms: \"<name>\", page: \"<page-stem>\")` \
-             to read full content.\n\
-             3. ONLY THEN compose your answer, citing KMS pages inline as `(see KMS: <name>/<page>)`.\n\n\
-             Do NOT skip steps 1-2 because the question seems familiar from training data. \
-             KMS content is authoritative for any topic it covers — the user populated the KMS \
-             specifically to override generic answers. Answering without KMS lookup when the \
-             index suggests relevance is a correctness bug, not a shortcut.\n\n\
-             **Prefer canonical topic pages.** When matches include both a topic page (named for \
-             the subject, e.g. `welsh-corgi`) and a session-digest or audit page (named `sess-…` \
-             or `dream-…`), read the **topic page** — it's the curated, merged answer. Digests \
-             and `dream-…` logs are provenance/audit, not the canonical source; consult them only \
-             to trace where a fact came from.\n\n\
-             If `KmsSearch` returns no hits AND the index lists nothing matching the user's \
-             topic, fall back to training-data knowledge — but say so explicitly (\"the KMS \
-             has nothing on this; answering from general knowledge\").\n\n\
-             **KMS before the web; write back after.** When a question would otherwise send you \
-             to `WebSearch` / `WebFetch`, search the KMS FIRST (steps 1-2) — re-searching the web \
-             for something the KMS already covers wastes the user's effort and ignores knowledge \
-             they deliberately saved. If the KMS lacks it and you do gather it from the web, \
-             **write the findings back** with `KmsWrite` (a canonical page named by topic) before \
-             you finish, so the next session answers from the KMS instead of searching again. \
-             That write-back is how the KMS compounds — skipping it means re-doing the same \
-             research forever.\n\n\
-             You are both reader AND maintainer: file new findings via `KmsWrite`, update \
-             entity pages when sources contradict them, and run `/kms lint <name>` \
-             periodically.\n\n\
-             **Two layers per KMS.** `pages/` are curated wiki pages; `sources/` are the \
-             raw documents they were built from (ingested files, fetched URLs, PDF text). \
-             Search covers both by default and labels each hit. A page marked \
-             _(derived — uncurated)_ in the index was generated from a source and nobody \
-             has written it up yet: read its **source** for the real content, and prefer \
-             writing that page up over answering from training data. The `## Sources` \
-             list below shows what is archived and which pages stand on it — an \
-             **uncited** source is unused material you should mine before searching the \
-             web for the same thing.\n\n\
-             ## KMS tools (apply to every KMS below — substitute the `kms:` argument)\n\n\
-             - `KmsRead(kms: \"<name>\", page: \"<page>\")` — read one curated page\n\
-             - `KmsRead(kms: \"<name>\", page: \"<file>\", kind: \"source\")` — read raw archived material\n\
-             - `KmsSearch(kms: \"<name>\", query: \"...\")` — ranked search over pages AND sources\n\
-             - `KmsSearch(kms: \"<name>\", pattern: \"...\", scope: \"sources\")` — regex inside the raw archive\n\
-             - `KmsWrite(kms: \"<name>\", page: \"<page>\", content: \"...\")` — create or replace a page (the tool auto-injects the `# {{title}}` / `Description:` / `---` block when your body doesn't already start with a `# heading`; just write `title:` + `topic:` in YAML frontmatter and the body)\n\
-             - `KmsAppend(kms: \"<name>\", page: \"<page>\", content: \"...\")` — append to a page\n\
-             - `KmsDelete(kms: \"<name>\", page: \"<page>\")` — remove a page (last resort; prefer `KmsWrite` to merge or supersede)\n\
-             - `KmsCreate(kms: \"<name>\", scope: \"project|user\")` — bootstrap a new KMS (idempotent)\n\n\
-             Page frontmatter conventions per KMS appear in its `### Schema` subsection.\n\n{}",
-            parts.join("\n\n")
-        )
+        return String::new();
     }
+    // M6.39.5: the numbered MUST procedure, "do not skip" and the no-hits
+    // sentence are what stopped models answering from training data with
+    // an on-topic base attached; they are pinned by a test. dev-plan/64
+    // P2.2 cut everything around them that a tool description already
+    // says, and explains a kind of page only to a base that has one.
+    let mut out = String::from(
+        "# Active knowledge bases (CONSULT BEFORE ANSWERING)\n\n\
+         The user curated the knowledge bases below for this project. On any topic \
+         they cover they are authoritative over your training data.\n\n\
+         **MANDATORY procedure.** When a message's subject could plausibly fall under \
+         what a base below covers, your FIRST action is tool calls, before any prose:\n\n\
+         1. `KmsSearch(kms: \"<name>\", query: \"<1-3 keywords>\")` — keywords in the \
+         language the pages are written in; a page matches only words it contains, so a \
+         translated or romanized keyword finds nothing. Thai, Chinese and Japanese work \
+         as written, and any part of a word matches. Slugs are searchable; if a slug or \
+         title below already looks right, read that page directly. `pattern:` is for an \
+         exact shape only (a regex, an identifier).\n\
+         2. `KmsRead(kms: \"<name>\", page: \"<slug>\")` for each page that matches.\n\
+         3. Only then answer, citing pages inline as `(see KMS: <name>/<page>)`.\n\n\
+         Do NOT skip steps 1-2 because the question seems familiar — answering without a \
+         lookup when a base looks relevant is a correctness bug, not a shortcut. A long \
+         base lists only some of its pages, so a missing name proves nothing: search. If \
+         the search finds nothing, fall back to training-data knowledge and say so (\"the \
+         KMS has nothing on this; answering from general knowledge\"). Having searched is \
+         what earns that sentence.\n\n\
+         A `<system-reminder>` on the user's message naming KMS pages is the result of \
+         that search already run for you: read those pages before answering.\n\n\
+         **KMS before the web; write back after.** Search the KMS before `WebSearch` / \
+         `WebFetch`. What you do learn from the web, file with `KmsWrite` (a page named \
+         for its topic) before you finish, so the next session answers from the KMS. You \
+         maintain these bases as well as read them: `KmsEdit` changes part of a page \
+         (prefer it to rewriting one), `KmsAppend` adds to it, `KmsCreate` starts a new base, and `KmsDelete` is a last resort — prefer \
+         `KmsWrite` to merge or supersede. **Never change a base silently:** in the \
+         same reply, tell the user which page you wrote and what changed — and never \
+         say you wrote something until the tool call has returned.\n\n",
+    );
+    if traits.provenance_pages {
+        out.push_str(
+            "**Prefer topic pages.** A page named for its subject is the curated answer. \
+             `sess-…` and `dream-…` pages are provenance and audit: read them only to \
+             trace where a fact came from.\n\n",
+        );
+    }
+    if traits.raw_layer {
+        out.push_str(
+            "**Two layers.** `pages/` are curated; `sources/` are the raw documents they \
+             were built from, and search covers both, labelling each hit. A page marked \
+             _(derived — uncurated)_ has not been written up: read its **source** \
+             (`KmsRead(kind: \"source\")`) and prefer writing the page up over answering \
+             from training data. An **uncited** source in `KmsRead(kind: \"index\")` is \
+             material to mine before searching the web for the same thing.\n\n",
+        );
+    }
+    out.push_str(&parts.join("\n\n"));
+    out
+}
+
+/// A base's `SCHEMA.md`, for `KmsRead(kind: "schema")`. Never follows a
+/// symlink, and is bounded like everything else a tool returns.
+pub fn read_schema(kref: &KmsRef) -> String {
+    read_text_capped(&kref.schema_path(), 200, 8_000)
 }
 
 /// Read a text file, cap by lines and bytes for prompt safety.
@@ -2217,30 +2744,104 @@ fn read_text_capped(path: &Path, max_lines: usize, max_bytes: usize) -> String {
     )
 }
 
-/// M6.25 BUG #6: render index as categorized markdown when pages have
-/// frontmatter `category:`. Falls back to the raw index.md (capped)
-/// when no frontmatter has been adopted yet — preserves backwards
-/// compat with pre-M6.25 KMSes.
-fn render_index_section(kref: &KmsRef) -> String {
-    let entries = scan_index_entries(kref);
-    if entries.is_empty() {
-        return raw_index_capped(kref);
-    }
-    let mut out = render_page_index(&entries, crate::memory::MEMORY_INDEX_MAX_LINES);
-    // The source layer belongs in the index the model reads: an
-    // ingested document nobody has curated a page from is invisible
-    // otherwise, which is exactly how ingested material ended up
-    // unused.
-    out.push_str(&crate::kms_sources::render_index_block(kref, 40));
-    out
-}
+// `render_index_section` lived here: the categorised page list, rendered
+// straight into the system prompt. `full_index` is the same rendering,
+// reached through `KmsRead(kind: "index")` instead of paid for on every
+// turn. The legacy `raw_index_capped` fallback for KMSes with no
+// frontmatter moved in there too.
 
 /// One row of the index, gathered from a page's own frontmatter+body.
+#[derive(Clone)]
 struct IndexEntry {
     stem: String,
+    /// Frontmatter `title:`, empty when absent. A research-built vault
+    /// has English slugs and Thai titles, so the title is often the only
+    /// part of a row a reader — or the model — recognises.
+    title: String,
     category: String,
     summary: String,
     derived: bool,
+}
+
+/// What the scanners need from one page, parsed once per version of it.
+struct ParsedPage {
+    entry: IndexEntry,
+    updated: String,
+    /// `status:` when it marks the page as unfinished; empty otherwise.
+    status: String,
+    /// Outbound `[[links]]` and `pages/x.md` links, as `outbound_page_links`
+    /// reports them.
+    links: Vec<String>,
+}
+
+/// dev-plan/64 P3.3: read and parse a page only when it has changed.
+///
+/// Every `KmsRead` builds the backlink map, which read and parsed every
+/// page in the vault to find the few that link here; every system-prompt
+/// build walked them three times for the index header. On a 47-page vault
+/// that is 47 file reads and frontmatter parses per tool call, and it grows
+/// with the vault. A file's (mtime, length) says whether it changed, so a
+/// scan is now one `stat` per page. External edits — Obsidian, git, another
+/// agent — change one of the two and are picked up the same way.
+///
+/// In memory only, shared by every KMS in the process, and emptied when it
+/// outgrows [`PAGE_CACHE_MAX`] rather than tracking what is least used.
+fn parsed_page(path: &Path, stem: &str) -> Option<std::sync::Arc<ParsedPage>> {
+    type Key = (std::time::SystemTime, u64, u64);
+    type CachedPage = (Key, std::sync::Arc<ParsedPage>);
+    type PageCache = Option<std::collections::HashMap<PathBuf, CachedPage>>;
+    const PAGE_CACHE_MAX: usize = 20_000;
+    static CACHE: std::sync::Mutex<PageCache> = std::sync::Mutex::new(None);
+
+    let meta = std::fs::metadata(path).ok()?;
+    // Every write here replaces the file (`write_file`), so on unix the
+    // inode changes even when a same-length edit lands inside one tick of a
+    // coarse mtime.
+    #[cfg(unix)]
+    let ino = std::os::unix::fs::MetadataExt::ino(&meta);
+    #[cfg(not(unix))]
+    let ino = 0u64;
+    let key: Key = (meta.modified().ok()?, meta.len(), ino);
+    {
+        let guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((k, page)) = guard.as_ref().and_then(|m| m.get(path)) {
+            if *k == key {
+                return Some(page.clone());
+            }
+        }
+    }
+    let raw = std::fs::read_to_string(path).ok()?;
+    let (fm, body) = parse_frontmatter(&raw);
+    let page = std::sync::Arc::new(ParsedPage {
+        entry: IndexEntry {
+            stem: stem.to_string(),
+            title: fm
+                .get("title")
+                .map(|t| t.trim().trim_matches('"').to_string())
+                .unwrap_or_default(),
+            category: fm
+                .get("category")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "uncategorized".into()),
+            summary: page_summary(&fm, &body, stem),
+            derived: fm.get("status").map(|s| s.trim()) == Some("derived"),
+        },
+        updated: fm.get("updated").cloned().unwrap_or_default(),
+        status: fm
+            .get("status")
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| matches!(s.as_str(), "researching" | "derived" | "failed"))
+            .unwrap_or_default(),
+        links: outbound_page_links(&raw),
+    });
+    let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(Default::default);
+    if map.len() >= PAGE_CACHE_MAX {
+        map.clear();
+    }
+    map.insert(path.to_path_buf(), (key, page.clone()));
+    Some(page)
 }
 
 /// Walk `pages/` and describe every page. This is the single reader
@@ -2269,20 +2870,198 @@ fn scan_index_entries(kref: &KmsRef) -> Vec<IndexEntry> {
         if stem.is_empty() {
             continue;
         }
-        let raw = std::fs::read_to_string(&path).unwrap_or_default();
-        let (fm, body) = parse_frontmatter(&raw);
-        out.push(IndexEntry {
-            stem: stem.to_string(),
-            category: fm
-                .get("category")
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "uncategorized".into()),
-            summary: page_summary(&fm, &body, stem),
-            derived: fm.get("status").map(|s| s.trim()) == Some("derived"),
-        });
+        if let Some(page) = parsed_page(&path, stem) {
+            out.push(page.entry.clone());
+        }
     }
     out.sort_by(|a, b| a.category.cmp(&b.category).then(a.stem.cmp(&b.stem)));
+    out
+}
+
+/// The whole page list, for `KmsRead(kind: "index")`.
+///
+/// This is what [`index_header`] stopped injecting. Bounded the same way
+/// the injected copy was, so asking for it cannot blow the context
+/// either — a base past the cap says so rather than trailing off.
+pub fn full_index(kref: &KmsRef) -> String {
+    let entries = scan_index_entries(kref);
+    if entries.is_empty() {
+        // A KMS whose pages carry no frontmatter scans to nothing here;
+        // its hand-written `index.md` is all it has.
+        let raw = raw_index_capped(kref);
+        if raw.trim() == "(empty index)" {
+            return format!("KMS '{}' has no pages yet.\n", kref.name);
+        }
+        return raw;
+    }
+    let mut out = format!("# {} — {} page(s)\n", kref.name, entries.len());
+    out.push_str(&render_page_index(
+        &entries,
+        crate::memory::MEMORY_INDEX_MAX_LINES,
+    ));
+    out.push_str(&crate::kms_sources::render_index_block(kref, 40));
+    // The entry cap above bounds rows, and a row of Thai is three bytes a
+    // character: 200 pages came to ~80 KB. Bytes are what context costs.
+    if out.len() > FULL_INDEX_MAX_BYTES {
+        let mut cut = FULL_INDEX_MAX_BYTES;
+        while cut > 0 && !out.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        if let Some(nl) = out[..cut].rfind('\n') {
+            cut = nl;
+        }
+        out.truncate(cut);
+        out.push_str(&format!(
+            "\n… index cut at {} KB — the rest is reachable with KmsSearch.\n",
+            FULL_INDEX_MAX_BYTES / 1024
+        ));
+    }
+    out
+}
+
+const FULL_INDEX_MAX_BYTES: usize = 16 * 1024;
+
+/// What a KMS announces about itself in the system prompt.
+///
+/// The whole page list used to go in — 15.5 KB for a 39-page base, on
+/// every turn, capped by entry count rather than bytes so a 200-page
+/// base would have injected around 80 KB per attached KMS. It bought
+/// nothing the procedure needs: that procedure is already search-first
+/// (`KmsSearch`, then `KmsRead`), and the list served only to tell the
+/// model whether this base is worth searching at all. A few lines say
+/// that as well as a few hundred, and `KmsRead(kind: "index")` hands
+/// over the full list to a model that decides it wants one.
+///
+/// What must survive the cut is the relevance trigger: how big the base
+/// is, what it is about, and what its categories are. The failure this
+/// guards against is a model answering from training data because it
+/// never realised the base was on topic — which is the failure M6.39.5
+/// was written for, and why the imperative prelude around this stays.
+#[cfg(test)]
+fn index_header(kref: &KmsRef) -> String {
+    index_header_with(kref).0
+}
+
+/// What a base contains that the prelude only needs to explain when it is
+/// there.
+#[derive(Default, Clone, Copy)]
+struct VaultTraits {
+    /// `sess-…` / `dream-…` pages: provenance and audit, not answers.
+    provenance_pages: bool,
+    /// Archived sources, or pages nobody has written up yet.
+    raw_layer: bool,
+}
+
+fn index_header_with(kref: &KmsRef) -> (String, VaultTraits) {
+    let entries = scan_index_entries(kref);
+    let sources = list_sources(kref).len();
+    let derived = entries.iter().filter(|e| e.derived).count();
+    let traits = VaultTraits {
+        provenance_pages: entries
+            .iter()
+            .any(|e| e.stem.starts_with("sess-") || e.stem.starts_with("dream-")),
+        raw_layer: sources > 0 || derived > 0,
+    };
+    let mut out = format!(
+        "{} page(s){}, {sources} archived source(s).\n",
+        entries.len(),
+        if derived > 0 {
+            format!(" ({derived} uncurated)")
+        } else {
+            String::new()
+        }
+    );
+    // The entry page is the one a reader lands on, so its summary is
+    // the closest thing a KMS has to a statement of what it covers.
+    if let Some(entry) = entry_page(kref) {
+        if let Some(e) = entries.iter().find(|e| e.stem == entry) {
+            let about = strip_wikilink_syntax(e.summary.trim());
+            if !about.is_empty() {
+                out.push_str(&format!("About: {about}\n"));
+            }
+        }
+    }
+    let mut cats: Vec<&str> = entries
+        .iter()
+        .map(|e| e.category.as_str())
+        .filter(|c| *c != "uncategorized")
+        .collect();
+    cats.sort_unstable();
+    cats.dedup();
+    if !cats.is_empty() {
+        out.push_str(&format!("Categories: {}\n", cats.join(", ")));
+    }
+
+    // Every page by name, no summaries. Search cannot yet be trusted to
+    // find a Thai page (dev-plan/64 §1: ~35% of pages containing the
+    // query are missed), so until it can, the prompt has to be able to
+    // name each one. Names are roughly a tenth of the bytes the
+    // summaries were, and the list stops at a byte budget — never at a
+    // count, which for Thai titles at three bytes a character is no
+    // bound at all — saying how many it left out.
+    if !entries.is_empty() {
+        out.push_str("Pages (`slug — title`):\n");
+        let mut used = 0usize;
+        let mut shown = 0usize;
+        for e in &entries {
+            let row = if e.title.is_empty() || e.title == e.stem {
+                format!("- {}\n", e.stem)
+            } else {
+                format!("- {} — {}\n", e.stem, e.title)
+            };
+            if used + row.len() > HEADER_PAGE_LIST_BYTES {
+                break;
+            }
+            used += row.len();
+            shown += 1;
+            out.push_str(&row);
+        }
+        if shown < entries.len() {
+            out.push_str(&format!(
+                "… and {} more — not listed is not the same as not there.\n",
+                entries.len() - shown
+            ));
+        }
+    }
+    out.push_str("One-line summaries for all of them: `KmsRead(kms: \"…\", kind: \"index\")`.\n");
+    (out, traits)
+}
+
+/// Byte budget for the page-name list in [`index_header`].
+const HEADER_PAGE_LIST_BYTES: usize = 3_000;
+
+/// `[[slug|shown]]` → `shown`, `[[slug]]` → `slug`. For text that is
+/// about to be read as prose rather than rendered.
+fn strip_wikilink_syntax(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(open) = rest.find("[[") {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 2..];
+        match after.find("]]") {
+            Some(close) => {
+                let inner = &after[..close];
+                out.push_str(
+                    inner
+                        .rsplit_once('|')
+                        .map(|(_, shown)| shown)
+                        .unwrap_or(inner),
+                );
+                rest = &after[close + 2..];
+            }
+            // A clipped summary can end mid-link; keep what is there.
+            None => {
+                out.push_str(
+                    after
+                        .rsplit_once('|')
+                        .map(|(_, shown)| shown)
+                        .unwrap_or(after),
+                );
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
     out
 }
 
@@ -2382,7 +3161,7 @@ pub fn rebuild_index(kref: &KmsRef) -> Result<usize> {
     }
     out.push_str(&crate::kms_sources::render_index_block(kref, usize::MAX));
     let path = kref.index_path();
-    std::fs::write(&path, out.as_bytes())
+    write_file(&path, out.as_bytes())
         .map_err(|e| Error::Tool(format!("write {}: {e}", path.display())))?;
     Ok(count)
 }
@@ -2501,18 +3280,83 @@ fn page_summary(fm: &std::collections::BTreeMap<String, String>, body: &str, ste
 }
 
 fn normalize_for_compare(s: &str) -> String {
+    fold_for_compare(s)
+}
+
+/// Scripts written without spaces between words — Thai, Lao, Khmer,
+/// Myanmar, Chinese, Japanese kana. Anything that needs a "word" from
+/// running text has to treat these differently: there is no delimiter to
+/// split on, so the search index matches them by overlapping character
+/// pairs and the autolinker only links them where something else sets
+/// them apart.
+pub fn is_spaceless_script(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x0E00..=0x0E7F      // Thai
+            | 0x0E80..=0x0EFF  // Lao
+            | 0x1000..=0x109F  // Myanmar
+            | 0x1780..=0x17FF  // Khmer
+            | 0x3040..=0x30FF  // Hiragana, Katakana
+            | 0x3400..=0x4DBF  // CJK extension A
+            | 0x4E00..=0x9FFF // CJK
+    )
+}
+
+/// Case-, space- and punctuation-insensitive key for deciding whether two
+/// names are the same name.
+///
+/// This was `filter(is_alphanumeric)`, which reads as harmless and is not:
+/// Rust counts Thai vowel signs as alphabetic but not the tone marks
+/// (U+0E48–0E4B) or thanthakhat, so the filter did not skip Thai, it
+/// respelled it. `ก้าว` ("step") and `กาว` ("glue") got one key, as did
+/// `หน้า`/`หนา` and `เสื้อ`/`เสือ` — and the research planner merges notes
+/// on this key. So: ASCII is filtered by class, everything else is kept
+/// unless it is spacing, an invisible format character, or general
+/// punctuation.
+pub fn fold_for_compare(s: &str) -> String {
     s.chars()
-        .filter(|c| c.is_alphanumeric())
+        .filter(|c| {
+            if c.is_ascii() {
+                c.is_ascii_alphanumeric()
+            } else {
+                !c.is_whitespace()
+                    && !matches!(*c, '\u{2000}'..='\u{206F}' | '\u{00AD}' | '\u{FEFF}')
+            }
+        })
         .flat_map(|c| c.to_lowercase())
         .collect()
 }
 
+/// Shorten an index summary to `max` characters, ending somewhere a
+/// reader would.
+///
+/// `index.md` is injected into the system prompt whenever a KMS is
+/// attached, and `raw_index_capped` truncates it by bytes — so a longer
+/// bullet does not merely cost tokens, it pushes later pages out of the
+/// model's view entirely. The cap stays. What changes is where it lands:
+/// a sentence end inside the budget if there is one, otherwise the last
+/// space. Thai puts spaces between phrases rather than words and often
+/// carries no sentence-ending punctuation at all, so that fallback is the
+/// one that usually does the work, and it beats stopping mid-syllable.
+/// A boundary in the first 60% is ignored — a stray abbreviation should
+/// not cost most of the summary.
 fn clip(s: &str, max: usize) -> String {
-    let mut out: String = s.chars().take(max).collect();
-    if s.chars().count() > max {
-        out.push('…');
+    if s.chars().count() <= max {
+        return s.to_string();
     }
-    out
+    let head: String = s.chars().take(max).collect();
+    let floor = head.len() * 3 / 5;
+    let cut = head
+        .char_indices()
+        .filter(|(_, c)| matches!(c, '.' | '!' | '?' | '。' | '！' | '？'))
+        // Past the terminator, not onto it — and by the character's own
+        // width, because the CJK ones are three bytes wide and `+ 1`
+        // would land inside them.
+        .map(|(i, c)| i + c.len_utf8())
+        .rfind(|i| *i >= floor)
+        .or_else(|| head.rfind(' ').filter(|i| *i >= floor))
+        .unwrap_or(head.len());
+    format!("{}…", head[..cut].trim_end())
 }
 
 fn raw_index_capped(kref: &KmsRef) -> String {
@@ -2557,6 +3401,63 @@ fn first_meaningful_line(body: &str) -> String {
 // (`category:`, `tags:`, `sources:`, `created:`, `updated:`) — anything
 // fancier should live in the page body, not the metadata.
 
+/// A line that belongs to the key above it: indented, or a list item.
+fn is_fm_continuation(line: &str) -> bool {
+    line.starts_with(' ') || line.starts_with('\t') || line == "-" || line.starts_with("- ")
+}
+
+/// `- item` with nothing nested under it and no inline map.
+fn is_plain_list_item(line: &str) -> bool {
+    let t = line.trim();
+    let Some(item) = t.strip_prefix('-') else {
+        return false;
+    };
+    let item = item.trim();
+    let quoted = item.starts_with('"') || item.starts_with('\'');
+    !item.is_empty() && !item.starts_with('-') && (quoted || !item.contains(": "))
+}
+
+/// What the quotes around a scalar mean, undone. The writer escapes `\"`;
+/// the parser used to strip the outer quotes and leave the escapes, so each
+/// round trip added a backslash.
+fn unquote_fm_scalar(v: &str) -> String {
+    let v = v.trim();
+    if v.len() >= 2 && v.starts_with('"') && v.ends_with('"') {
+        let inner = &v[1..v.len() - 1];
+        let mut out = String::with_capacity(inner.len());
+        let mut chars = inner.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => match chars.next() {
+                    Some(n @ ('"' | '\\')) => out.push(n),
+                    Some(n) => {
+                        out.push('\\');
+                        out.push(n);
+                    }
+                    None => out.push('\\'),
+                },
+                c => out.push(c),
+            }
+        }
+        return out;
+    }
+    if v.len() >= 2 && v.starts_with('\'') && v.ends_with('\'') {
+        return v[1..v.len() - 1].replace("\'\'", "\'");
+    }
+    v.to_string()
+}
+
+fn quote_fm_item(item: &str) -> String {
+    let plain = !item.is_empty()
+        && !item.contains([',', '[', ']', '{', '}', '"', '#', ':', '\''])
+        && item == item.trim();
+    if plain {
+        item.to_string()
+    } else {
+        format!("\"{}\"", item.replace('\\', "\\\\").replace('"', "\\\""))
+    }
+}
+
 /// Parse `(frontmatter, body)` from a page. Frontmatter map preserves
 /// insertion order via Vec under the hood (BTreeMap is fine — keys
 /// are conventional and small). Returns `(empty, original)` when no
@@ -2585,18 +3486,59 @@ pub fn parse_frontmatter(s: &str) -> (std::collections::BTreeMap<String, String>
     } else {
         ""
     };
-    for line in yaml.lines() {
-        let line = line.trim_end();
-        if line.is_empty() || line.starts_with('#') {
+    let lines: Vec<&str> = yaml.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i].trim_end();
+        i += 1;
+        if line.is_empty() || line.starts_with('#') || is_fm_continuation(line) {
             continue;
         }
-        if let Some((k, v)) = line.split_once(':') {
-            let key = k.trim().to_string();
-            let val = v.trim().trim_matches('"').trim_matches('\'').to_string();
-            if !key.is_empty() {
-                map.insert(key, val);
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
+        let key = k.trim().to_string();
+        if key.is_empty() {
+            continue;
+        }
+        let first = v.trim();
+        // dev-plan/64 P3.4: a value can run on. A block list, a folded or
+        // literal scalar and a nested map all put their content on the
+        // lines below the key, and this parser read one line: `tags:` came
+        // back empty and the next `write_frontmatter` — any append, edit or
+        // stale mark — wrote it back empty. Obsidian writes lists this way.
+        let opens_block =
+            first.is_empty() || matches!(first, ">" | "|" | ">-" | "|-" | ">+" | "|+");
+        let mut block: Vec<&str> = Vec::new();
+        if opens_block {
+            while i < lines.len() && (lines[i].trim().is_empty() || is_fm_continuation(lines[i])) {
+                block.push(lines[i].trim_end());
+                i += 1;
+            }
+            while block.last().is_some_and(|l| l.trim().is_empty()) {
+                block.pop();
             }
         }
+        let val = if block.is_empty() {
+            unquote_fm_scalar(first)
+        } else if first.is_empty()
+            && block
+                .iter()
+                .all(|l| l.trim().is_empty() || is_plain_list_item(l))
+        {
+            // A plain block list becomes the flow list every reader of
+            // `tags:` / `sources:` / `related:` already understands.
+            let items: Vec<String> = block
+                .iter()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| quote_fm_item(&unquote_fm_scalar(l.trim()[1..].trim())))
+                .collect();
+            format!("[{}]", items.join(", "))
+        } else {
+            // Anything else is kept exactly as written and written back so.
+            format!("{first}\n{}", block.join("\n"))
+        };
+        map.insert(key, val);
     }
     (map, body.to_string())
 }
@@ -2616,6 +3558,19 @@ pub fn write_frontmatter(map: &std::collections::BTreeMap<String, String>, body:
         // consumer that expects `sources:` to be a sequence. Single-line
         // only — a flow value with a newline can't be emitted inline, so
         // fall through to quoting.
+        // A block kept verbatim by the parser (folded/literal scalar,
+        // nested map, list of maps) goes back exactly as it came.
+        let first = v.lines().next().unwrap_or("");
+        if v.contains('\n')
+            && (first.is_empty() || matches!(first, ">" | "|" | ">-" | "|-" | ">+" | "|+"))
+        {
+            if first.is_empty() {
+                out.push_str(&format!("{k}:{v}\n"));
+            } else {
+                out.push_str(&format!("{k}: {v}\n"));
+            }
+            continue;
+        }
         let is_flow_collection = !v.contains('\n')
             && ((v.starts_with('[') && v.ends_with(']'))
                 || (v.starts_with('{') && v.ends_with('}')));
@@ -2629,7 +3584,7 @@ pub fn write_frontmatter(map: &std::collections::BTreeMap<String, String>, body:
                 || v.contains('"')
                 || v.contains('\n'));
         if needs_quote {
-            let escaped = v.replace('"', "\\\"");
+            let escaped = v.replace('\\', "\\\\").replace('"', "\\\"");
             out.push_str(&format!("{k}: \"{escaped}\"\n"));
         } else {
             out.push_str(&format!("{k}: {v}\n"));
@@ -2737,6 +3692,27 @@ fn fire_index_upsert(kref: &KmsRef, page_stem: &str) {
     let _ = (kref, page_stem);
 }
 
+/// A dropped or renamed KMS must not leave its index handle — and the
+/// directory lock with it — cached under a path that no longer exists.
+fn drop_search_handle(kref: &KmsRef) {
+    #[cfg(feature = "kms_search_index")]
+    crate::kms_search_index::drop_cached(&kref.root);
+    #[cfg(not(feature = "kms_search_index"))]
+    let _ = kref;
+}
+
+/// The index lives beside the vault (dev-plan/64 D7), so a vault that is
+/// dropped or renamed leaves it behind under the old name. It is a cache:
+/// remove it, and the next search rebuilds one where it belongs.
+fn drop_search_index(kref: &KmsRef) {
+    #[cfg(feature = "kms_search_index")]
+    {
+        let _ = std::fs::remove_dir_all(crate::kms_search_index::index_dir(&kref.root));
+    }
+    #[cfg(not(feature = "kms_search_index"))]
+    let _ = kref;
+}
+
 fn fire_index_delete(kref: &KmsRef, page_stem: &str) {
     #[cfg(feature = "kms_search_index")]
     crate::kms_search_index::on_page_mutated(
@@ -2782,6 +3758,11 @@ pub fn write_page(kref: &KmsRef, page_name: &str, content: &str) -> Result<PathB
     let (mut fm, body) = parse_frontmatter(content);
     let today = crate::usage::today_str();
     fm.entry("updated".into()).or_insert_with(|| today.clone());
+    // A page written without its stale marker has been refreshed; the
+    // debt date goes with the marker, however the caller got its frontmatter.
+    if !body.contains("⚠ STALE:") {
+        fm.remove("stale_since");
+    }
     if existed {
         // A rewrite carries no `created:` unless the caller re-supplied
         // one, and the creation date is not the caller's to forget —
@@ -2798,18 +3779,23 @@ pub fn write_page(kref: &KmsRef, page_name: &str, content: &str) -> Result<PathB
     } else {
         fm.entry("created".into()).or_insert(today.clone());
     }
-    // Canonical page header: `# {title}\nDescription: {topic}\n---\n\n`
-    // injected between the frontmatter and the body. Skipped when the
-    // body already starts with its own `# heading` — model gets to
-    // keep an intentional title (e.g. dream's "Dream consolidation —
-    // YYYY-MM-DD"). title falls back to the page stem when frontmatter
-    // `title:` is absent; the Description line is omitted entirely
-    // when `topic:` is missing/blank (instead of rendering an empty
-    // value). Re-writes are idempotent because `body_has_leading_heading`
+    // Canonical page header: `# {title}\n\n` injected between the
+    // frontmatter and the body. Skipped when the body already starts
+    // with its own `# heading` — model gets to keep an intentional
+    // title (e.g. dream's "Dream consolidation — YYYY-MM-DD"). title
+    // falls back to the page stem when frontmatter `title:` is absent.
+    // Re-writes are idempotent because `body_has_leading_heading`
     // detects the previously-injected `# title` and skips re-injection.
     let canonical_body = maybe_inject_canonical_header(&body, &stem, &fm);
     let serialized = write_frontmatter(&fm, &canonical_body);
-    std::fs::write(&path, serialized.as_bytes())
+    if existed {
+        crate::kms_trash::keep_before_overwrite(
+            kref,
+            &format!("pages/{stem}.md"),
+            serialized.as_bytes(),
+        );
+    }
+    write_file(&path, serialized.as_bytes())
         .map_err(|e| Error::Tool(format!("write {}: {e}", path.display())))?;
 
     // Index summary: prefer the `topic:` frontmatter — it's a purpose-
@@ -2842,30 +3828,34 @@ pub fn write_page(kref: &KmsRef, page_name: &str, content: &str) -> Result<PathB
     Ok(path)
 }
 
-/// Inject the canonical KMS-page header — `# {title}\nDescription: {topic}\n---\n\n`
-/// — between the frontmatter close and the body, when the body
-/// doesn't already start with its own `# heading`. Lenient by design:
-/// a model that intentionally wrote its own title (e.g. dream's
-/// "Dream consolidation — YYYY-MM-DD" or a research-pipeline page with
-/// a specifically-formatted title line) gets left alone. Pages that
+/// Inject the canonical KMS-page header — `# {title}\n\n` — between
+/// the frontmatter close and the body, when the body doesn't already
+/// start with its own `# heading`. Lenient by design: a model that
+/// intentionally wrote its own title (e.g. dream's "Dream
+/// consolidation — YYYY-MM-DD" or a research-pipeline page with a
+/// specifically-formatted title line) gets left alone. Pages that
 /// arrived as pure body — common when the model treats KmsWrite as a
 /// dump-content sink — get the canonical shape stamped on so the
 /// vault stays readable.
 ///
-/// Fallbacks (matching the user-confirmed lenient policy):
-/// - `title:` missing or empty → use the page stem verbatim (e.g.
-///   `dream-2026-05-11`). Ugly but always present — the alternative
-///   is failing the write, which corrodes UX more than a stem-titled
-///   page corrodes the index.
-/// - `topic:` missing or blank → emit `# {title}\n---\n\n` (omit the
-///   Description line entirely). An empty `Description:` is noise.
+/// `title:` missing or empty → the page stem verbatim (e.g.
+/// `dream-2026-05-11`). Ugly but always present — the alternative is
+/// failing the write, which corrodes UX more than a stem-titled page
+/// corrodes the index.
+///
+/// dev-plan/64 P3.9: the header used to carry a `Description: {topic}`
+/// line and a `---` rule as well. Both were noise — `topic:` is in the
+/// frontmatter, which the index and the trust strip already read, and
+/// the rule rendered as a second horizontal line directly under the
+/// title's own underline. A page written before this still has them;
+/// `strip_legacy_header` takes them off the next time it is written.
 fn maybe_inject_canonical_header(
     body: &str,
     stem: &str,
     fm: &std::collections::BTreeMap<String, String>,
 ) -> String {
     if body_has_leading_heading(body) {
-        return body.to_string();
+        return strip_legacy_header(body);
     }
     let title = fm
         .get("title")
@@ -2873,24 +3863,47 @@ fn maybe_inject_canonical_header(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or(stem);
-    let topic = fm
-        .get("topic")
-        .map(String::as_str)
-        .map(str::trim)
-        .unwrap_or("");
 
     let mut out = String::from("\n");
     out.push_str("# ");
     out.push_str(title);
-    out.push('\n');
-    if !topic.is_empty() {
-        out.push_str("Description: ");
-        out.push_str(topic);
-        out.push('\n');
-    }
-    out.push_str("---\n\n");
+    out.push_str("\n\n");
     out.push_str(body.trim_start());
     out
+}
+
+/// Take the pre-P3.9 header remnant off a body that opens with a
+/// heading: the `Description: …` line and the `---` rule that used to
+/// follow it. Blank lines between them are crossed — on a refreshed
+/// page the rule sits a line below the title — but the scan stops at
+/// the first real content, so a rule anywhere else in the page
+/// survives untouched.
+fn strip_legacy_header(body: &str) -> String {
+    let mut lines: Vec<&str> = body.split('\n').collect();
+    let Some(i) = lines.iter().position(|l| !l.trim().is_empty()) else {
+        return body.to_string();
+    };
+    if !lines[i].trim_start().starts_with("# ") {
+        return body.to_string();
+    }
+    let mut j = i + 1;
+    let mut saw_legacy = false;
+    while j < lines.len() {
+        let t = lines[j].trim();
+        if t.is_empty() {
+            j += 1;
+        } else if t == "---" || t.starts_with("Description:") {
+            saw_legacy = true;
+            j += 1;
+        } else {
+            break;
+        }
+    }
+    if !saw_legacy {
+        return body.to_string();
+    }
+    lines.splice(i + 1..j, std::iter::once(""));
+    lines.join("\n")
 }
 
 /// Detect whether the body opens with a `# ` ATX heading — the signal
@@ -2929,7 +3942,7 @@ pub fn append_to_page(kref: &KmsRef, page_name: &str, chunk: &str) -> Result<Pat
             }
             new_body.push_str(chunk);
             let serialized = write_frontmatter(&fm, &new_body);
-            std::fs::write(&path, serialized.as_bytes())
+            write_file(&path, serialized.as_bytes())
                 .map_err(|e| Error::Tool(format!("write {}: {e}", path.display())))?;
         } else {
             // No frontmatter — straight append.
@@ -2956,6 +3969,71 @@ pub fn append_to_page(kref: &KmsRef, page_name: &str, chunk: &str) -> Result<Pat
     Ok(path)
 }
 
+/// Replace one exact span of a page's text — frontmatter included — and
+/// leave every other byte as it was.
+///
+/// Until this existed the only way to change a word was `write_page` with
+/// the whole page. A session spent 16.7k output tokens writing one 19 KB
+/// page twice to fix a detail; `/dream` reported a typo and left it because
+/// "it would mean rewriting the whole page"; and every such rewrite is a
+/// chance to write back less than was read. An edit cannot lose what it
+/// does not mention.
+///
+/// `old` must occur exactly once unless `replace_all`: an edit that lands
+/// somewhere other than where the caller was looking is worse than one that
+/// is refused. Returns the path and how many spans were replaced.
+pub fn edit_page(
+    kref: &KmsRef,
+    page_name: &str,
+    old: &str,
+    new: &str,
+    replace_all: bool,
+) -> Result<(PathBuf, usize)> {
+    ensure_writable(kref)?;
+    if old.is_empty() {
+        return Err(Error::Tool("`old` is empty — nothing to find".into()));
+    }
+    if old == new {
+        return Err(Error::Tool("`old` and `new` are the same".into()));
+    }
+    let path = kref.page_path(page_name)?;
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| Error::Tool(format!("read {}: {e}", path.display())))?;
+    let hits = raw.matches(old).count();
+    match hits {
+        0 => {
+            return Err(Error::Tool(format!(
+                "`old` does not occur in '{page_name}'. It must match the page text exactly, \
+                 including spaces and line breaks — KmsRead the page (or the section) and copy it."
+            )))
+        }
+        n if n > 1 && !replace_all => {
+            return Err(Error::Tool(format!(
+                "`old` occurs {n} times in '{page_name}'. Include more of the surrounding text \
+                 so it is unique, or pass `replace_all: true`."
+            )))
+        }
+        _ => {}
+    }
+    let edited = if replace_all {
+        raw.replace(old, new)
+    } else {
+        raw.replacen(old, new, 1)
+    };
+    // Through `write_page` for everything a write owes the vault — index
+    // row, log line, search index — with `updated:` moved to today, which
+    // `write_page` on its own leaves alone when the page already has one.
+    let (mut fm, body) = parse_frontmatter(&edited);
+    let content = if fm.is_empty() {
+        edited
+    } else {
+        fm.insert("updated".into(), crate::usage::today_str());
+        write_frontmatter(&fm, &body)
+    };
+    let path = write_page(kref, page_name, &content)?;
+    Ok((path, if replace_all { hits } else { 1 }))
+}
+
 /// Delete a KMS page. Validates the name via `writable_page_path`
 /// (same path-safety carve-out as write/append), removes the file,
 /// strips the matching bullet from `index.md`, and appends a
@@ -2971,8 +4049,7 @@ pub fn delete_page(kref: &KmsRef, page_name: &str) -> Result<PathBuf> {
         .and_then(|s| s.to_str())
         .unwrap_or("page")
         .to_string();
-    std::fs::remove_file(&path)
-        .map_err(|e| Error::Tool(format!("remove {}: {e}", path.display())))?;
+    crate::kms_trash::move_to_trash(kref, &format!("pages/{stem}.md"))?;
     remove_index_bullet(kref, &stem)?;
     append_log_header(kref, "deleted", &stem)?;
     fire_index_delete(kref, &stem);
@@ -3052,7 +4129,7 @@ pub fn rename_page(kref: &KmsRef, old_name: &str, new_name: &str) -> Result<Path
             };
             let rewritten = rewrite_merge_links(&body, &page_renames, &source_renames);
             if rewritten != body {
-                std::fs::write(&path, rewritten.as_bytes())
+                write_file(&path, rewritten.as_bytes())
                     .map_err(|e| Error::Tool(format!("write {}: {e}", path.display())))?;
             }
         }
@@ -3064,7 +4141,7 @@ pub fn rename_page(kref: &KmsRef, old_name: &str, new_name: &str) -> Result<Path
     if !index.is_empty() {
         let rewritten = rewrite_merge_links(&index, &page_renames, &source_renames);
         if rewritten != index {
-            std::fs::write(kref.index_path(), rewritten.as_bytes())
+            write_file(kref.index_path(), rewritten.as_bytes())
                 .map_err(|e| Error::Tool(format!("write {}: {e}", kref.index_path().display())))?;
         }
     }
@@ -3096,6 +4173,50 @@ pub struct BrowseFile {
     /// as a badge and passes `name` back unchanged — the backend
     /// re-resolves the extension via [`source_path`].
     pub ext: String,
+    /// What a person calls it (dev-plan/64 P5.7): a page's `title:`, a
+    /// source's catalogued title. A research-built vault has English slugs
+    /// over Thai titles, and the sidebar listed the slugs — a Thai reader
+    /// looked down a column of names that were not the names of anything.
+    /// Empty when there is none, and the GUI falls back to `name`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    /// `status:` when it says the page is not a finished note —
+    /// `researching`, `derived`, `failed` — so the list can say so.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub status: String,
+}
+
+/// One entry in `runs/` — a research run or a verify run. dev-plan/64
+/// P5.6: the provenance ledger. Everything here is read from the run
+/// log's own frontmatter, which both writers already stamp, so listing
+/// the folder costs one small read per file and never parses a body.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct RunEntry {
+    /// File stem, which is also what `read_browse_file` takes back.
+    pub name: String,
+    /// `research` or `verify`, from `type:`. Empty for a log this
+    /// build does not recognise — shown, not hidden.
+    pub kind: String,
+    /// What kind of run: `research`, `refresh`, `ingest`, `selection`
+    /// or `verify`. From the log's `mode:` where it has one; a log
+    /// written before P5.4 stamped it falls back to the `refresh-`
+    /// prefix its name carries, which is all those logs ever recorded.
+    pub mode: String,
+    pub date: String,
+    /// The research query. Verify runs have none.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    pub bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claims: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub findings: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elapsed_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llm_calls: Option<u64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -3118,12 +4239,23 @@ pub fn browse(name: &str) -> Option<BrowseListing> {
     // json and URL ingest can archive html. Listing them through
     // `scan_dir_md` hid every non-markdown source from the browser
     // (and `read_browse_file` then couldn't open one either).
+    let catalogue = crate::kms_sources::load(&kref);
     let sources = list_sources(&kref)
         .into_iter()
-        .map(|s| BrowseFile {
-            name: s.stem,
-            bytes: s.bytes,
-            ext: s.ext,
+        .map(|s| {
+            let title = catalogue
+                .entries
+                .get(&format!("{}.{}", s.stem, s.ext))
+                .map(|r| r.title.trim().to_string())
+                .filter(|t| !t.is_empty() && *t != s.stem)
+                .unwrap_or_default();
+            BrowseFile {
+                name: s.stem,
+                bytes: s.bytes,
+                ext: s.ext,
+                title,
+                status: String::new(),
+            }
         })
         .collect();
     let entry = entry_page(&kref);
@@ -3135,11 +4267,150 @@ pub fn browse(name: &str) -> Option<BrowseListing> {
     })
 }
 
+/// Every run log in `runs/`, newest first. dev-plan/64 P5.6.
+///
+/// A run log is the only record of what a research or audit pass read,
+/// wrote and cost, and until the GUI listed them the folder was
+/// reachable only from a filesystem browser. Sorted by date then name
+/// descending, so same-day runs come back in the order they were
+/// numbered (`-3`, `-2`, then the first).
+pub fn list_runs(kref: &KmsRef) -> Vec<RunEntry> {
+    let dir = kref.root.join("runs");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<RunEntry> = entries
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "md"))
+        .filter_map(|e| {
+            let path = e.path();
+            let stem = path.file_stem()?.to_string_lossy().to_string();
+            let bytes = e.metadata().map(|m| m.len()).unwrap_or(0);
+            // Only the frontmatter is wanted; a verify log's body is
+            // the whole report and can run to hundreds of KB.
+            let head = read_head(&path, 4096);
+            let (fm, _) = parse_frontmatter(&head);
+            let num = |k: &str| fm.get(k).and_then(|v| v.trim().parse::<u64>().ok());
+            let kind: String = match fm.get("type").map(|s| s.trim()) {
+                Some("research-run") => "research".into(),
+                Some("verify-run") => "verify".into(),
+                _ => String::new(),
+            };
+            Some(RunEntry {
+                name: stem.clone(),
+                kind: kind.clone(),
+                mode: fm
+                    .get("mode")
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| match kind.as_str() {
+                        "research" if stem.splitn(2, "-refresh-").count() > 1 => "refresh".into(),
+                        other => other.into(),
+                    }),
+                date: fm
+                    .get("date")
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default(),
+                title: fm
+                    .get("query")
+                    .map(|s| s.trim().trim_matches('"').to_string())
+                    .unwrap_or_default(),
+                bytes,
+                cost_usd: fm
+                    .get("cost_usd")
+                    .and_then(|v| v.trim().parse::<f64>().ok()),
+                claims: num("claims"),
+                findings: num("findings"),
+                elapsed_secs: num("elapsed_secs"),
+                llm_calls: num("llm_calls"),
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| b.date.cmp(&a.date).then_with(|| b.name.cmp(&a.name)));
+    out
+}
+
+/// What a run of one kind has cost in this vault before (dev-plan/64
+/// P5.4). The median, not the mean: one 40-minute run should not make
+/// every later click look expensive.
+///
+/// Deliberately not a token model. A theoretical estimate is a guess
+/// about a model's behaviour; this is what this vault actually paid,
+/// and `runs` says how much history it rests on — `0` means the honest
+/// answer is "not known yet", which the GUI has to be able to say.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ModeCost {
+    /// How many past runs of this kind the numbers come from.
+    pub runs: usize,
+    /// Median USD across those runs, absent when none recorded a cost.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elapsed_secs: Option<u64>,
+    /// Median pages written. Absent for kinds that write none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claims: Option<u64>,
+}
+
+fn median<T: Copy + PartialOrd>(mut v: Vec<T>) -> Option<T> {
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    Some(v[v.len() / 2])
+}
+
+/// [`ModeCost`] per run mode, for pricing a click before it is made.
+pub fn cost_by_mode(kref: &KmsRef) -> std::collections::BTreeMap<String, ModeCost> {
+    let mut out: std::collections::BTreeMap<String, Vec<RunEntry>> = Default::default();
+    for r in list_runs(kref) {
+        if r.mode.is_empty() {
+            continue;
+        }
+        out.entry(r.mode.clone()).or_default().push(r);
+    }
+    out.into_iter()
+        .map(|(mode, rs)| {
+            let stats = ModeCost {
+                runs: rs.len(),
+                cost_usd: median(rs.iter().filter_map(|r| r.cost_usd).collect()),
+                elapsed_secs: median(rs.iter().filter_map(|r| r.elapsed_secs).collect()),
+                claims: median(rs.iter().filter_map(|r| r.claims).collect()),
+            };
+            (mode, stats)
+        })
+        .collect()
+}
+
+/// Read at most `cap` bytes of a file, trimmed to a char boundary so
+/// the result is always valid UTF-8 (a run log's `query:` is often
+/// Thai, and a naive cut lands mid-codepoint).
+pub(crate) fn read_head(path: &Path, cap: usize) -> String {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let mut buf = vec![0u8; cap];
+    let n = f.read(&mut buf).unwrap_or(0);
+    buf.truncate(n);
+    match String::from_utf8(buf) {
+        Ok(s) => s,
+        Err(e) => {
+            let good = e.utf8_error().valid_up_to();
+            String::from_utf8_lossy(&e.into_bytes()[..good]).into_owned()
+        }
+    }
+}
+
 /// Record `slug` as the KMS's entry page, or clear it with `None`.
 /// Rewrites `manifest.json` through a JSON value so a field this build
 /// does not know about survives.
 pub fn set_entry_page(kref: &KmsRef, slug: Option<&str>) -> Result<()> {
     ensure_writable(kref)?;
+    with_kms_lock(kref, || set_entry_page_locked(kref, slug))
+}
+
+fn set_entry_page_locked(kref: &KmsRef, slug: Option<&str>) -> Result<()> {
     let path = kref.manifest_path();
     let mut doc = std::fs::read_to_string(&path)
         .ok()
@@ -3155,7 +4426,7 @@ pub fn set_entry_page(kref: &KmsRef, slug: Option<&str>) -> Result<()> {
             obj.remove("entry");
         }
     }
-    std::fs::write(
+    write_file(
         &path,
         serde_json::to_string_pretty(&doc).unwrap_or_default(),
     )
@@ -3201,7 +4472,7 @@ pub fn apply_entry(kms_name: &str, set: Option<&str>, clear: bool) -> Result<Str
 }
 
 /// Number of pages currently on disk. Used to spot the first one.
-fn page_count(kref: &KmsRef) -> usize {
+pub(crate) fn page_count(kref: &KmsRef) -> usize {
     std::fs::read_dir(kref.pages_dir())
         .map(|rd| {
             rd.flatten()
@@ -3301,10 +4572,19 @@ fn scan_dir_md(dir: &Path) -> Vec<BrowseFile> {
         }
         let stem = name.trim_end_matches(".md").to_string();
         let bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        // From the parsed-page cache: one stat per page, not one read.
+        let (title, status) = parsed_page(&entry.path(), &stem)
+            .map(|p| {
+                let t = p.entry.title.trim().to_string();
+                (if t == stem { String::new() } else { t }, p.status.clone())
+            })
+            .unwrap_or_default();
         out.push(BrowseFile {
             name: stem,
             bytes,
             ext: "md".into(),
+            title,
+            status,
         });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -3614,18 +4894,17 @@ pub fn backlink_map(kref: &KmsRef) -> std::collections::BTreeMap<String, Vec<(St
         if stem.starts_with('.') || stem == "_summary" {
             continue;
         }
-        let Ok(body) = std::fs::read_to_string(&path) else {
+        let Some(page) = parsed_page(&path, stem) else {
             continue;
         };
-        let (fm, _) = parse_frontmatter(&body);
-        let title = fm
-            .get("title")
-            .map(|t| t.trim().trim_matches('"').to_string())
-            .filter(|t| !t.is_empty())
-            .unwrap_or_else(|| stem.to_string());
-        let updated = fm.get("updated").cloned().unwrap_or_default();
+        let title = if page.entry.title.is_empty() {
+            stem.to_string()
+        } else {
+            page.entry.title.clone()
+        };
+        let updated = page.updated.clone();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for target in outbound_page_links(&body) {
+        for target in page.links.iter().cloned() {
             if target == stem || !seen.insert(target.clone()) {
                 continue;
             }
@@ -3758,8 +5037,14 @@ pub fn read_browse_file(kms_name: &str, kind: &str, name: &str) -> Result<Browse
             std::fs::canonicalize(&path)
                 .map_err(|e| Error::Tool(format!("canonicalize {}: {e}", path.display())))?
         }
-        "page" => {
-            let dir = kref.pages_dir();
+        // dev-plan/64 P5.6: a run log opens in the same viewer as a
+        // page. Same directory containment check, different folder.
+        "page" | "run" => {
+            let dir = if kind == "run" {
+                kref.root.join("runs")
+            } else {
+                kref.pages_dir()
+            };
             let stem = name.trim_end_matches(".md");
             let path = dir.join(format!("{stem}.md"));
             if !path.exists() {
@@ -4079,7 +5364,7 @@ pub fn merge_into(src_name: &str, dst_name: &str) -> Result<MergeReport> {
                     .map_err(|e| Error::Tool(format!("read {}: {e}", path.display())))?;
                 let (_src_fm_map, src_body_only) = parse_frontmatter(&src_body);
                 let combined = combine_aggregator_bodies(&dst_body, &src_body_only, src_name);
-                std::fs::write(&dst_path, combined.as_bytes())
+                write_file(&dst_path, combined.as_bytes())
                     .map_err(|e| Error::Tool(format!("write {}: {e}", dst_path.display())))?;
                 report.pages_combined += 1;
                 report.combined.push(stem.clone());
@@ -4103,7 +5388,7 @@ pub fn merge_into(src_name: &str, dst_name: &str) -> Result<MergeReport> {
             let bytes = std::fs::read(&path)
                 .map_err(|e| Error::Tool(format!("read {}: {e}", path.display())))?;
             let target = dst_pages.join(format!("{target_stem}.md"));
-            std::fs::write(&target, &bytes)
+            write_file(&target, &bytes)
                 .map_err(|e| Error::Tool(format!("write {}: {e}", target.display())))?;
         }
     }
@@ -4141,7 +5426,7 @@ pub fn merge_into(src_name: &str, dst_name: &str) -> Result<MergeReport> {
             let bytes = std::fs::read(&path)
                 .map_err(|e| Error::Tool(format!("read {}: {e}", path.display())))?;
             let target = dst_sources.join(format!("{target_stem}.md"));
-            std::fs::write(&target, &bytes)
+            write_file(&target, &bytes)
                 .map_err(|e| Error::Tool(format!("write {}: {e}", target.display())))?;
         }
     }
@@ -4169,7 +5454,7 @@ pub fn merge_into(src_name: &str, dst_name: &str) -> Result<MergeReport> {
                 };
                 let rewritten = rewrite_merge_links(&body, &page_renames, &source_renames);
                 if rewritten != body {
-                    std::fs::write(&path, rewritten.as_bytes())
+                    write_file(&path, rewritten.as_bytes())
                         .map_err(|e| Error::Tool(format!("write {}: {e}", path.display())))?;
                 }
             }
@@ -4198,13 +5483,97 @@ pub fn merge_into(src_name: &str, dst_name: &str) -> Result<MergeReport> {
     if !new_index.ends_with('\n') && !new_index.is_empty() {
         new_index.push('\n');
     }
-    std::fs::write(dst.index_path(), new_index.as_bytes())
+    write_file(dst.index_path(), new_index.as_bytes())
         .map_err(|e| Error::Tool(format!("write {}: {e}", dst.index_path().display())))?;
 
     // ── Log the merge on the destination ─────────────────────────
     append_log_header(&dst, "merge", src_name)?;
 
     Ok(report)
+}
+
+/// Frontmatter keys whose values are page slugs.
+const SLUG_KEYS: &[&str] = &[
+    "related",
+    "supersedes",
+    "superseded_by",
+    "parent",
+    "children",
+    "see_also",
+    "links",
+];
+
+/// dev-plan/64 P3.5: follow a rename or a merge into the frontmatter.
+///
+/// Links in the body were rewritten; `related: ["old", …]` was not, and the
+/// graph view, the research planner's neighbour lookup and lint all read
+/// `related:`. After renaming one page, every note that listed it pointed
+/// at nothing — silently, because a dangling `related:` is not a broken
+/// link to anything that checked.
+///
+/// Only a whole value is replaced, in a slug key's flow list, scalar, or
+/// block list — never a substring, so renaming `ai` leaves `ai-slop` alone.
+fn rewrite_slug_keys(text: &str, old: &str, new: &str) -> String {
+    let Some(rest) = text.strip_prefix("---") else {
+        return text.to_string();
+    };
+    let Some(end) = rest.find("\n---") else {
+        return text.to_string();
+    };
+    let (fm, tail) = rest.split_at(end);
+    let swap = |v: &str| -> Option<String> {
+        let t = v.trim();
+        let bare = t.trim_matches(|c| c == '"' || c == '\'');
+        (bare == old).then(|| v.replacen(bare, new, 1))
+    };
+    let mut in_slug_block = false;
+    let mut changed = false;
+    let mut lines: Vec<String> = Vec::new();
+    for line in fm.split('\n') {
+        let indented = line.starts_with(' ') || line.starts_with('\t');
+        if !indented {
+            in_slug_block = false;
+            if let Some((key, val)) = line.split_once(':') {
+                if SLUG_KEYS.contains(&key.trim()) {
+                    let v = val.trim();
+                    if v.is_empty() {
+                        in_slug_block = true;
+                    } else if let Some(inner) =
+                        v.strip_prefix('[').and_then(|x| x.strip_suffix(']'))
+                    {
+                        let items: Vec<String> = inner
+                            .split(',')
+                            .map(|it| swap(it).unwrap_or_else(|| it.to_string()))
+                            .collect();
+                        let joined = items.join(",");
+                        if joined != inner {
+                            changed = true;
+                            lines.push(format!("{key}: [{joined}]"));
+                            continue;
+                        }
+                    } else if let Some(sw) = swap(v) {
+                        changed = true;
+                        lines.push(format!("{key}: {}", sw.trim()));
+                        continue;
+                    }
+                }
+            }
+        } else if in_slug_block {
+            if let Some(item) = line.trim_start().strip_prefix("- ") {
+                if let Some(sw) = swap(item) {
+                    let pad = &line[..line.len() - line.trim_start().len()];
+                    changed = true;
+                    lines.push(format!("{pad}- {}", sw.trim()));
+                    continue;
+                }
+            }
+        }
+        lines.push(line.to_string());
+    }
+    if !changed {
+        return text.to_string();
+    }
+    format!("---{}{tail}", lines.join("\n"))
 }
 
 /// Rewrite the renamed-on-collision link forms inside a body of
@@ -4222,6 +5591,8 @@ fn rewrite_merge_links(
         out = out.replace(&format!("pages/{old}.md"), &format!("pages/{new}.md"));
         out = out.replace(&format!("[[{old}]]"), &format!("[[{new}]]"));
         out = out.replace(&format!("[[{old}|"), &format!("[[{new}|"));
+        out = out.replace(&format!("[[{old}#"), &format!("[[{new}#"));
+        out = rewrite_slug_keys(&out, old, new);
     }
     for (old, new) in source_renames {
         out = out.replace(&format!("sources/{old}.md"), &format!("sources/{new}.md"));
@@ -4809,7 +6180,7 @@ pub fn import_okf(bundle: &Path, name: &str, scope: KmsScope) -> Result<OkfImpor
         let (fm, body) = parse_frontmatter(&raw);
         let body = rewrite_okf_concept_links(&body, &rel_to_stem);
         let page = write_frontmatter(&okf_fm_to_kms(&fm), &okf_links_to_kms(&body));
-        std::fs::write(kref.pages_dir().join(format!("{stem}.md")), page.as_bytes())
+        write_file(kref.pages_dir().join(format!("{stem}.md")), page.as_bytes())
             .map_err(|e| Error::Tool(format!("write page {stem}: {e}")))?;
         report.pages += 1;
     }
@@ -4844,7 +6215,7 @@ pub fn import_okf(bundle: &Path, name: &str, scope: KmsScope) -> Result<OkfImpor
                     } else {
                         content
                     };
-                    std::fs::write(&dst, restored.as_bytes())
+                    write_file(&dst, restored.as_bytes())
                         .map_err(|e| Error::Tool(format!("write source {fname}: {e}")))?;
                 } else {
                     std::fs::copy(&path, &dst)
@@ -4857,7 +6228,7 @@ pub fn import_okf(bundle: &Path, name: &str, scope: KmsScope) -> Result<OkfImpor
 
     // ── log.md (OKF → KMS form), if present ───────────────────────
     if let Ok(log_raw) = std::fs::read_to_string(bundle.join("log.md")) {
-        std::fs::write(kref.log_path(), okf_log_to_kms(&log_raw).as_bytes())
+        write_file(kref.log_path(), okf_log_to_kms(&log_raw).as_bytes())
             .map_err(|e| Error::Tool(format!("write log.md: {e}")))?;
     }
 
@@ -4869,7 +6240,7 @@ pub fn import_okf(bundle: &Path, name: &str, scope: KmsScope) -> Result<OkfImpor
         } else {
             schema
         };
-        std::fs::write(kref.schema_path(), restored.as_bytes())
+        write_file(kref.schema_path(), restored.as_bytes())
             .map_err(|e| Error::Tool(format!("write SCHEMA.md: {e}")))?;
     }
 
@@ -5064,7 +6435,7 @@ pub fn auto_link(kref: &KmsRef, opts: AutoLinkOptions) -> Result<AutoLinkReport>
     // `https://…deepseek-v4-adapted-[[huawei]]-chips…`, which resolves
     // nowhere. Found by `/kms verify` on an 18-page vault.
     let protect_re = Regex::new(
-        r"(?:\[\[[^\]\n]+\]\]|\[[^\]\n]+\]\([^)\n]+\)|`[^`\n]+`|<?https?://[^\s)>\]]+>?)",
+        r"(?:\[\[[^\]\n]+\]\]|\[[^\]\n]+\]\([^)\n]+\)|`[^`\n]+`|<?(?:kms://[^\n]*|[a-zA-Z][a-zA-Z0-9+.\-]*://[^\s)>\]]+)>?)",
     )
     .expect("static regex");
 
@@ -5184,7 +6555,7 @@ pub fn auto_link(kref: &KmsRef, opts: AutoLinkOptions) -> Result<AutoLinkReport>
                 String::with_capacity(frontmatter_block.len() + rewritten_body.len());
             new_full.push_str(frontmatter_block);
             new_full.push_str(&rewritten_body);
-            std::fs::write(path, new_full.as_bytes())
+            write_file(path, new_full.as_bytes())
                 .map_err(|e| Error::Tool(format!("write {}: {e}", path.display())))?;
         }
     }
@@ -5361,7 +6732,7 @@ pub async fn auto_link_llm(
             let mut full = String::with_capacity(page.frontmatter_block.len() + new_body.len());
             full.push_str(&page.frontmatter_block);
             full.push_str(&new_body);
-            std::fs::write(&page.path, full.as_bytes())
+            write_file(&page.path, full.as_bytes())
                 .map_err(|e| Error::Tool(format!("write {}: {e}", page.path.display())))?;
         }
     }
@@ -5684,6 +7055,13 @@ pub struct LintReport {
     /// Pages still carrying `status: derived` — an ingest whose page
     /// nobody has curated yet. Not an error; a work queue.
     pub derived_pages: Vec<String>,
+    /// `(page, updated)` still carrying `status: researching` — the
+    /// placeholder `/research` writes before it starts and replaces when
+    /// it finishes. One that is still here is a run that died: nothing
+    /// else flagged it, it sat in the index advertising its placeholder
+    /// text, and every later planner read it as a note that already
+    /// covers the subject.
+    pub abandoned_research: Vec<(String, String)>,
     /// (page_stem, source_key, missing_field) — `source_key` is `"global"`
     /// or the page's `category:` value, indicating which manifest rule the
     /// field came from. Empty when no manifest exists or the manifest's
@@ -5701,7 +7079,121 @@ impl LintReport {
             + self.missing_required_fields.len()
             + self.orphan_sources.len()
             + self.dangling_source_refs.len()
+            + self.abandoned_research.len()
     }
+}
+
+/// One lint issue, flattened so the GUI can render a list and open
+/// what each row is about (dev-plan/64 P5.6). `/kms lint` prints the
+/// same report grouped by category; a person reading it in a sidebar
+/// wants to click the page, not retype its name.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LintFinding {
+    /// Category slug, for grouping and for a stable key.
+    pub kind: String,
+    /// What is wrong, as a sentence about `target`.
+    pub detail: String,
+    /// `page` | `source` | empty when there is nothing to open.
+    pub target_kind: String,
+    /// The file stem the viewer should open.
+    pub target: String,
+}
+
+/// [`LintReport`] as a flat list, worst first: things that are broken,
+/// then things that are unfinished, then things that are merely
+/// unreferenced.
+pub fn lint_findings(report: &LintReport) -> Vec<LintFinding> {
+    let mut out = Vec::new();
+    let mut push = |kind: &str, detail: String, target_kind: &str, target: &str| {
+        out.push(LintFinding {
+            kind: kind.into(),
+            detail,
+            target_kind: target_kind.into(),
+            target: target.into(),
+        });
+    };
+    for (page, target) in &report.broken_links {
+        push(
+            "broken_link",
+            format!("links to `{target}`, which is not a page"),
+            "page",
+            page,
+        );
+    }
+    for (page, source) in &report.dangling_source_refs {
+        push(
+            "dangling_source",
+            format!("cites `{source}`, which is not archived"),
+            "page",
+            page,
+        );
+    }
+    for page in &report.missing_frontmatter {
+        push(
+            "missing_frontmatter",
+            "has no frontmatter".into(),
+            "page",
+            page,
+        );
+    }
+    for (page, key, field) in &report.missing_required_fields {
+        push(
+            "missing_field",
+            format!("has no `{field}:` (required by {key})"),
+            "page",
+            page,
+        );
+    }
+    for stem in &report.index_orphans {
+        push(
+            "index_orphan",
+            format!("`{stem}` is in the index, but the file is gone"),
+            "",
+            "",
+        );
+    }
+    for (page, updated) in &report.abandoned_research {
+        push(
+            "abandoned_research",
+            format!("still `status: researching` since {updated} — the run died"),
+            "page",
+            page,
+        );
+    }
+    for page in &report.derived_pages {
+        push(
+            "derived",
+            "came from an ingest and has not been written up".into(),
+            "page",
+            page,
+        );
+    }
+    for page in &report.missing_in_index {
+        push(
+            "missing_in_index",
+            "is not in the index".into(),
+            "page",
+            page,
+        );
+    }
+    for page in &report.orphan_pages {
+        push("orphan_page", "nothing links to it".into(), "page", page);
+    }
+    for src in &report.orphan_sources {
+        // The report names the file; the viewer takes the stem, and
+        // re-resolves the extension itself (a source is not always .md).
+        let stem = Path::new(src)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| src.clone());
+        push(
+            "orphan_source",
+            "is archived and nothing cites it".into(),
+            "source",
+            &stem,
+        );
+    }
+    out
 }
 
 /// Walk a KMS and report common health issues. Pure-read; doesn't
@@ -5754,6 +7246,18 @@ pub fn lint(kref: &KmsRef) -> Result<LintReport> {
         .flat_map(|s| [s.stem.clone(), s.file_name()])
         .collect();
     let mut cited_sources: HashSet<String> = HashSet::new();
+    // `/research` writes `sources: [3, 4, 5]` — indices into the KMS's
+    // citation registry, not filenames. Lint read them as filenames, so a
+    // freshly researched vault reported every page as citing missing
+    // archives (99 findings on a 39-page base, all false), which is the
+    // quickest way to teach someone never to run it again.
+    let registry: std::collections::HashMap<u32, String> =
+        crate::research::registry::SourceRegistry::load(kref)
+            .meta()
+            .into_iter()
+            // `meta()` is `(index, title, url)` — the URL is last.
+            .map(|(index, _title, url)| (index, url))
+            .collect();
     for (stem, body) in &page_bodies {
         let (fm, _rest) = parse_frontmatter(body);
         // Source provenance: `sources:` naming a file that isn't there
@@ -5763,12 +7267,29 @@ pub fn lint(kref: &KmsRef) -> Result<LintReport> {
         if let Some(raw) = fm.get("sources") {
             for token in raw
                 .split(|c: char| c == ',' || c.is_whitespace())
-                .map(|s| s.trim().trim_matches('"'))
-                .filter(|s| !s.is_empty() && *s != "[]")
+                .map(|s| s.trim().trim_matches(|c| c == '[' || c == ']' || c == '"'))
+                .filter(|s| !s.is_empty())
             {
                 // `session-…` / `memory` / bare URLs are legitimate
                 // non-file provenance values, not missing archives.
                 if token.starts_with("http") || token.starts_with("session-") || token == "memory" {
+                    continue;
+                }
+                // A citation index: good if the registry knows it, and its
+                // archive (when one was written) counts as cited.
+                if let Ok(index) = token.parse::<u32>() {
+                    match registry.get(&index) {
+                        Some(url) => {
+                            let archive = crate::research::kms_writer::url_to_filename(url);
+                            if source_stems.contains(&archive) {
+                                cited_sources.insert(archive);
+                            }
+                        }
+                        None => report.dangling_source_refs.push((
+                            stem.clone(),
+                            format!("[{index}] (not in the citation registry)"),
+                        )),
+                    }
                     continue;
                 }
                 if source_stems.contains(token) {
@@ -5788,6 +7309,14 @@ pub fn lint(kref: &KmsRef) -> Result<LintReport> {
         }
         if fm.get("status").map(|s| s.trim()) == Some("derived") {
             report.derived_pages.push(stem.clone());
+        }
+        if fm.get("status").map(|s| s.trim()) == Some("researching") {
+            report.abandoned_research.push((
+                stem.clone(),
+                fm.get("updated")
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default(),
+            ));
         }
         for target in extract_source_link_targets(body) {
             cited_sources.insert(
@@ -5877,6 +7406,7 @@ pub fn lint(kref: &KmsRef) -> Result<LintReport> {
     report.orphan_sources.sort();
     report.dangling_source_refs.sort();
     report.derived_pages.sort();
+    report.abandoned_research.sort();
     report.broken_links.dedup();
     Ok(report)
 }
@@ -5927,7 +7457,7 @@ fn migrate_0_to_1(kref: &KmsRef, dry_run: bool) -> Result<Vec<String>> {
             frontmatter_required: std::collections::BTreeMap::new(),
             entry: entry_page(kref),
         };
-        std::fs::write(
+        write_file(
             &manifest_path,
             serde_json::to_string_pretty(&manifest).unwrap_or_else(|_| "{}".into()),
         )
@@ -6097,6 +7627,20 @@ pub fn format_lint_report(name: &str, report: &LintReport) -> String {
         ));
         for file in &report.orphan_sources {
             out.push_str(&format!("  - sources/{file}\n"));
+        }
+    }
+    if !report.abandoned_research.is_empty() {
+        out.push_str(&format!(
+            "\n{} page(s) still `status: researching` — a research run that never finished. \
+             Re-run `/research` on the topic, or delete the placeholder:\n",
+            report.abandoned_research.len()
+        ));
+        for (stem, updated) in &report.abandoned_research {
+            if updated.is_empty() {
+                out.push_str(&format!("  - {stem}\n"));
+            } else {
+                out.push_str(&format!("  - {stem} (since {updated})\n"));
+            }
         }
     }
     // Not counted in total_issues — a backlog, not a defect.
@@ -6421,12 +7965,158 @@ mod tests {
 
     // ─── index ────────────────────────────────────────────────────────
 
+    /// The page-name list is bounded by bytes and says what it left out.
+    /// A count cap is no bound for Thai titles at three bytes a character,
+    /// and a silent cut reads to the model as "those pages do not exist".
+    #[test]
+    fn the_prompt_page_list_is_byte_bounded_and_admits_what_it_omits() {
+        let _home = scoped_home();
+        let k = create("big", KmsScope::User).unwrap();
+        let _batch = IndexBatch::new(&k);
+        for i in 0..200 {
+            write_page(
+                &k,
+                &format!("page-{i:03}"),
+                &format!(
+                    "---\ntitle: {}\n---\n\nbody\n",
+                    "มาตรฐานการครองชีพ".repeat(3)
+                ),
+            )
+            .unwrap();
+        }
+        let header = index_header(&k);
+        assert!(
+            header.len() < HEADER_PAGE_LIST_BYTES + 1_000,
+            "header is {} bytes",
+            header.len()
+        );
+        assert!(header.contains("200 page(s)"), "{header}");
+        assert!(header.contains("more — not listed"), "{header}");
+    }
+
+    /// A KMS is found by slug as well as by its exact name — and always
+    /// answers with its real name, so nothing records a second spelling.
+    #[test]
+    fn a_kms_is_found_by_slug_and_answers_with_its_real_name() {
+        let _home = scoped_home();
+        create("Age of Abundance", KmsScope::Project).unwrap();
+        create("คลังความรู้ ไทย", KmsScope::Project).unwrap();
+        for typed in [
+            "Age of Abundance",
+            "age-of-abundance",
+            "age_of_abundance",
+            "AgeOfAbundance",
+            "AGE OF ABUNDANCE",
+        ] {
+            let k = resolve(typed).unwrap_or_else(|| panic!("`{typed}` found nothing"));
+            assert_eq!(k.name, "Age of Abundance", "from `{typed}`");
+            assert!(k.root.ends_with("Age of Abundance"), "{:?}", k.root);
+        }
+        assert_eq!(resolve("คลังความรู้-ไทย").unwrap().name, "คลังความรู้ ไทย");
+        // Tone marks still matter: a different word is a different base.
+        assert!(resolve("คลังความรู-ไทย").is_none());
+
+        assert!(resolve("age-of").is_none(), "a prefix is not a match");
+        assert!(resolve("---").is_none());
+        // The exact lookup stays exact.
+        assert!(resolve_exact("age-of-abundance").is_none());
+    }
+
+    /// Two bases that read the same once folded: the exact name still
+    /// finds each, and the slug finds neither rather than picking one to
+    /// write into.
+    #[test]
+    fn an_ambiguous_slug_finds_nothing() {
+        let _home = scoped_home();
+        create("My Notes", KmsScope::Project).unwrap();
+        create("my-notes", KmsScope::Project).unwrap();
+        assert_eq!(resolve("My Notes").unwrap().name, "My Notes");
+        assert_eq!(resolve("my-notes").unwrap().name, "my-notes");
+        assert!(resolve("my_notes").is_none(), "ambiguous must not guess");
+    }
+
+    /// Two different names must never fold to one key. The old filter
+    /// kept Thai vowels and dropped Thai tone marks, so it turned words
+    /// into other words — and the research planner merges notes on this.
+    #[test]
+    fn folding_a_name_never_makes_two_thai_words_equal() {
+        for (a, b) in [("ก้าว", "กาว"), ("หน้า", "หนา"), ("เสื้อ", "เสือ")]
+        {
+            assert_ne!(fold_for_compare(a), fold_for_compare(b), "{a} vs {b}");
+        }
+        // What it is for still works.
+        assert_eq!(
+            fold_for_compare("Deep-Seek  V4!"),
+            fold_for_compare("deepseek v4")
+        );
+        assert_eq!(
+            fold_for_compare("มาตรฐาน การครองชีพ"),
+            fold_for_compare("มาตรฐาน\u{200B}การครองชีพ")
+        );
+    }
+
+    #[test]
+    fn wikilink_syntax_is_stripped_for_prose() {
+        assert_eq!(
+            strip_wikilink_syntax("ตอบโดย [[herbert-simon|Herbert Simon]] ในปี 1971"),
+            "ตอบโดย Herbert Simon ในปี 1971"
+        );
+        assert_eq!(
+            strip_wikilink_syntax("see [[jevons-paradox]]."),
+            "see jevons-paradox."
+        );
+        // A clipped summary can end inside a link.
+        assert_eq!(
+            strip_wikilink_syntax("see [[herbert-simon|Herbert Si…"),
+            "see Herbert Si…"
+        );
+        assert_eq!(strip_wikilink_syntax("plain"), "plain");
+    }
+
+    /// An index bullet has to stop somewhere a reader would. It used to
+    /// stop at exactly 120 characters, which in Thai lands mid-syllable.
+    #[test]
+    fn an_index_summary_stops_at_a_boundary() {
+        let short = "A small herding breed.";
+        assert_eq!(clip(short, 120), short, "under the cap, untouched");
+
+        // English: the sentence end inside the budget wins.
+        let two = "First sentence here. And then a second one that runs past the budget entirely.";
+        let cut = clip(two, 40);
+        assert!(cut.ends_with('…'), "{cut}");
+        assert!(cut.starts_with("First sentence here."), "{cut}");
+
+        // Thai: no sentence-ending punctuation at all, so it falls back
+        // to a space — which in Thai separates phrases, not words.
+        let thai = "มาตรฐานการครองชีพ คือระดับความเป็นอยู่ที่วัดจากสินค้าและบริการ ที่ครัวเรือนเข้าถึงได้จริง";
+        let cut = clip(thai, 40);
+        assert!(cut.ends_with('…'), "{cut}");
+        assert!(
+            !cut.trim_end_matches('…').ends_with(' '),
+            "trailing space should be trimmed: {cut}"
+        );
+        assert!(
+            thai.starts_with(cut.trim_end_matches('…')),
+            "the kept part must be a real prefix, not a broken one: {cut}"
+        );
+
+        // A boundary in the first 60% is ignored rather than costing
+        // most of the summary.
+        let early =
+            "Dr. Somchai went on to describe the entire programme in considerable detail here";
+        let cut = clip(early, 60);
+        assert!(
+            cut.chars().count() > 40,
+            "early period cost too much: {cut}"
+        );
+    }
+
     #[test]
     fn index_summary_is_not_the_page_title_restated() {
         let _home = scoped_home();
         let k = create("nb", KmsScope::Project).unwrap();
-        // Exactly what KmsWrite produces: injected `# title` header,
-        // `Description:` line, `---` rule, then the body.
+        // Exactly what KmsWrite produces: injected `# title` heading,
+        // then the body.
         write_page(
             &k,
             "welsh-corgi",
@@ -6462,11 +8152,11 @@ mod tests {
                 "index.md missing {needle}:\n{on_disk}"
             );
         }
-        let prompt = render_index_section(&k);
+        let on_demand = full_index(&k);
         for needle in ["**one**", "**two**", "Alpha body.", "Beta body."] {
             assert!(
-                prompt.contains(needle),
-                "prompt missing {needle}:\n{prompt}"
+                on_demand.contains(needle),
+                "KmsRead(kind: \"index\") missing {needle}:\n{on_demand}"
             );
         }
     }
@@ -6534,6 +8224,47 @@ mod tests {
     }
 
     #[test]
+    fn lint_findings_name_what_to_open_worst_first() {
+        let _home = scoped_home();
+        let k = create("nb", KmsScope::Project).unwrap();
+        std::fs::write(
+            k.pages_dir().join("hub.md"),
+            "---\ncategory: c\n---\n\nSee [[nowhere]].\n",
+        )
+        .unwrap();
+        let sources = k.root.join("sources");
+        std::fs::create_dir_all(&sources).unwrap();
+        std::fs::write(sources.join("unused.md"), "nobody cites me").unwrap();
+
+        let out = lint_findings(&lint(&k).unwrap());
+        assert!(!out.is_empty());
+        // A broken link is a thing that is broken; an uncited archive is
+        // only unreferenced. Broken comes first.
+        let pos = |kind: &str| out.iter().position(|f| f.kind == kind);
+        let broken = pos("broken_link").expect("broken link missing");
+        let orphan_src = pos("orphan_source").expect("orphan source missing");
+        assert!(broken < orphan_src, "{out:?}");
+
+        let f = &out[broken];
+        // The row opens the page that has the bad link, not the target,
+        // which by definition is not there to open.
+        assert_eq!(f.target, "hub");
+        assert_eq!(f.target_kind, "page");
+        assert!(f.detail.contains("nowhere"), "{}", f.detail);
+        assert_eq!(out[orphan_src].target_kind, "source");
+        assert_eq!(out[orphan_src].target, "unused");
+        // Every finding either names something to open or names nothing
+        // at all — never a target with no kind to open it as.
+        for f in &out {
+            assert_eq!(
+                f.target.is_empty(),
+                f.target_kind.is_empty(),
+                "half-specified target: {f:?}"
+            );
+        }
+    }
+
+    #[test]
     fn lint_reports_broken_wikilinks() {
         let _home = scoped_home();
         let k = create("nb", KmsScope::Project).unwrap();
@@ -6571,6 +8302,71 @@ mod tests {
             report.dangling_source_refs,
             vec![("p".to_string(), "ghost".to_string())]
         );
+    }
+
+    /// What `/research` actually writes: `sources: [1, 2]`, indices into
+    /// the citation registry. Lint read them as filenames and reported
+    /// every researched page as citing missing archives — 99 findings on
+    /// a clean 39-page vault, all false.
+    #[test]
+    fn lint_reads_research_citation_indices() {
+        let _home = scoped_home();
+        let k = create("nb", KmsScope::Project).unwrap();
+        let mut reg = crate::research::registry::SourceRegistry::load(&k);
+        let one = reg.index_for("https://example.com/a", "A");
+        let two = reg.index_for("https://example.com/b", "B");
+        reg.save(&k).unwrap();
+        std::fs::create_dir_all(k.sources_dir()).unwrap();
+        // Only the first was archived; the second is cited but was never
+        // written to disk, which is not a lint matter.
+        std::fs::write(k.sources_dir().join("example-com-a.md"), "# A").unwrap();
+        std::fs::write(
+            k.pages_dir().join("p.md"),
+            format!("---\ntype: note\nsources: [{one}, {two}]\n---\n\nBody.\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            k.pages_dir().join("q.md"),
+            "---\ntype: note\nsources: [99]\n---\n\nBody.\n",
+        )
+        .unwrap();
+
+        let report = lint(&k).unwrap();
+        assert_eq!(
+            report.dangling_source_refs,
+            vec![(
+                "q".to_string(),
+                "[99] (not in the citation registry)".to_string()
+            )],
+            "known indices are fine; only an unknown one is a finding"
+        );
+        assert!(
+            report.orphan_sources.is_empty(),
+            "an archive cited by index is not an orphan: {:?}",
+            report.orphan_sources
+        );
+    }
+
+    /// A placeholder left by a research run that died is a finding. It
+    /// used to pass every check: valid frontmatter, an inbound link, a
+    /// fresh date, no numbers to be uncited.
+    #[test]
+    fn lint_flags_a_research_placeholder_nobody_finished() {
+        let _home = scoped_home();
+        let k = create("nb", KmsScope::Project).unwrap();
+        std::fs::write(
+            k.pages_dir().join("herbert-simon.md"),
+            "---\ntitle: Herbert Simon\ntype: note\nstatus: researching\nupdated: 2026-09-18\n---\n\n\
+             Researching \"Herbert Simon\" — this page is being written by `/research`.\n",
+        )
+        .unwrap();
+        let report = lint(&k).unwrap();
+        assert_eq!(
+            report.abandoned_research,
+            vec![("herbert-simon".to_string(), "2026-09-18".to_string())]
+        );
+        assert!(report.total_issues() >= 1);
+        assert!(format_lint_report("nb", &report).contains("never finished"));
     }
 
     #[test]
@@ -6764,6 +8560,555 @@ mod tests {
         }
     }
 
+    /// A workspace with agents, as the host lays it out. Returns the
+    /// workspace root; cwd and `THCLAWS_WORKSPACE_ROOT` are what an agent
+    /// process spawned by the host would see.
+    struct HostGuard {
+        prev_ws: Option<String>,
+        _env: EnvGuard,
+    }
+
+    impl Drop for HostGuard {
+        fn drop(&mut self) {
+            match &self.prev_ws {
+                Some(v) => std::env::set_var("THCLAWS_WORKSPACE_ROOT", v),
+                None => std::env::remove_var("THCLAWS_WORKSPACE_ROOT"),
+            }
+        }
+    }
+
+    fn legacy_vault(ws: &Path, bot: &str, name: &str, page: &str) {
+        let pages = ws
+            .join(".thclaws/bots")
+            .join(bot)
+            .join(PROJECT_KMS_DIR)
+            .join(name)
+            .join("pages");
+        std::fs::create_dir_all(&pages).unwrap();
+        std::fs::write(
+            pages.join(format!("{page}.md")),
+            format!("# {page} of {bot}\n"),
+        )
+        .unwrap();
+    }
+
+    fn as_agent(bot: &str) -> (HostGuard, PathBuf) {
+        let env = scoped_home();
+        let ws = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let bot_dir = ws.join(".thclaws/bots").join(bot);
+        std::fs::create_dir_all(&bot_dir).unwrap();
+        let prev_ws = std::env::var("THCLAWS_WORKSPACE_ROOT").ok();
+        std::env::set_var("THCLAWS_WORKSPACE_ROOT", &ws);
+        std::env::set_current_dir(&bot_dir).unwrap();
+        (HostGuard { prev_ws, _env: env }, ws)
+    }
+
+    /// dev-plan/64 P3.10. Six bugs in 48 hours were one bug: a function that
+    /// takes a name assumed the name was ASCII. Every such function goes
+    /// through one fixture here and must keep three promises — it returns
+    /// something, it does not change its own output, and it does not make
+    /// two different names the same.
+    #[test]
+    fn every_name_function_keeps_its_promises_on_every_script() {
+        const NAMES: &[&str] = &[
+            "ยุคที่ความฉลาดล้นเหลือ",
+            "ก้าว",
+            "กาว",
+            "ก้าวหน้า",
+            "กาวหนา",
+            "มาตรฐานการครองชีพ",
+            "知識管理",
+            "知识管理",
+            "ナレッジ",
+            "إدارة المعرفة",
+            "Ζήνων",
+            "naïve café",
+            "naive cafe",
+            "Age of Abundance",
+            "claude-code",
+            "claude code hooks",
+            "🧠 second brain",
+            "v2.0 — final (draft)",
+            "a/b\\c:d*e?f",
+        ];
+        type NameFn = (&'static str, fn(&str) -> String);
+        let fns: &[NameFn] = &[
+            ("kms::sanitize_alias", sanitize_alias),
+            (
+                "research::sanitize_slug",
+                crate::research::digest::sanitize_slug,
+            ),
+        ];
+        for (label, f) in fns {
+            let mut seen: std::collections::HashMap<String, &str> = Default::default();
+            for name in NAMES {
+                let out = f(name);
+                assert!(!out.is_empty(), "{label}({name:?}) is empty");
+                assert_eq!(f(&out), out, "{label} is not idempotent on {name:?}");
+                assert!(
+                    !out.contains(['/', '\\', '\0']) && !out.contains(".."),
+                    "{label}({name:?}) = {out:?} is not a safe file name"
+                );
+                assert!(
+                    !out.chars().any(|c| c.is_control()) && !Path::new(&out).is_absolute(),
+                    "{label}({name:?}) = {out:?} would be refused as a page name"
+                );
+                if let Some(other) = seen.insert(out.clone(), name) {
+                    panic!("{label} makes {other:?} and {name:?} the same: {out:?}");
+                }
+            }
+        }
+        // Loose matching may merge spellings of ONE name; never two names.
+        let mut folded: std::collections::HashMap<String, &str> = Default::default();
+        for name in NAMES {
+            let out = fold_for_compare(name);
+            assert!(!out.is_empty(), "fold_for_compare({name:?}) is empty");
+            assert_eq!(
+                fold_for_compare(&out),
+                out,
+                "fold is not idempotent on {name:?}"
+            );
+            if let Some(other) = folded.insert(out.clone(), name) {
+                let same_name = matches!(
+                    (other, *name),
+                    ("naïve café", "naive cafe") | ("naive cafe", "naïve café")
+                );
+                assert!(
+                    same_name,
+                    "fold makes {other:?} and {name:?} the same: {out:?}"
+                );
+            }
+        }
+        // Archive names: a Thai URL and its neighbour stay apart.
+        let urls = [
+            "https://th.wikipedia.org/wiki/ก้าว",
+            "https://th.wikipedia.org/wiki/กาว",
+            "https://example.com/a?x=1",
+            "https://example.com/a?x=2",
+            "https://example.com/a#frag",
+        ];
+        let names: Vec<String> = urls
+            .iter()
+            .map(|u| crate::research::kms_writer::url_to_filename(u))
+            .collect();
+        for (u, n) in urls.iter().zip(&names) {
+            assert!(!n.is_empty() && !n.contains('/'), "{u} → {n:?}");
+        }
+        assert_ne!(names[0], names[1]);
+        assert_ne!(names[2], names[3]);
+    }
+
+    /// dev-plan/64 P3.4. Every append, edit and stale mark parses a page's
+    /// frontmatter and writes it back. What the parser does not understand
+    /// it must carry, not drop: a block list (how Obsidian writes `tags:`)
+    /// came back empty and was written back empty.
+    #[test]
+    fn frontmatter_survives_a_round_trip() {
+        let src = "---\n# a comment\ntitle: \"He said \\\"hi\\\": ok\"\ntags:\n  - alpha\n  - \"b, c\"\naliases: [\"x\", y]\nsummary: >\n  folded line one\n  folded line two\nnested:\n  key: value\n  other: 2\nempty:\nurl: https://example.com/a#b\n---\nbody\n";
+        let (fm, body) = parse_frontmatter(src);
+        assert_eq!(fm.get("title").unwrap(), "He said \"hi\": ok");
+        assert_eq!(fm.get("tags").unwrap(), "[alpha, \"b, c\"]");
+        assert_eq!(fm.get("aliases").unwrap(), "[\"x\", y]");
+        assert_eq!(
+            fm.get("summary").unwrap(),
+            ">\n  folded line one\n  folded line two"
+        );
+        assert_eq!(fm.get("nested").unwrap(), "\n  key: value\n  other: 2");
+        assert!(
+            !fm.contains_key("key"),
+            "a nested key is not a top-level key"
+        );
+        assert_eq!(fm.get("empty").unwrap(), "");
+        assert_eq!(fm.get("url").unwrap(), "https://example.com/a#b");
+        assert_eq!(body, "body\n");
+
+        let once = write_frontmatter(&fm, &body);
+        assert!(
+            once.contains("summary: >\n  folded line one\n  folded line two\n"),
+            "{once}"
+        );
+        assert!(
+            once.contains("nested:\n  key: value\n  other: 2\n"),
+            "{once}"
+        );
+        assert!(once.contains("tags: [alpha, \"b, c\"]\n"), "{once}");
+        let (fm2, body2) = parse_frontmatter(&once);
+        assert_eq!(fm, fm2, "parse ∘ write is the identity");
+        assert_eq!(write_frontmatter(&fm2, &body2), once, "and stays so");
+
+        // The path that lost data: an append to a page Obsidian wrote.
+        let _g = scoped_home();
+        let k = create("nb", KmsScope::Project).unwrap();
+        std::fs::write(k.pages_dir().join("p.md"), src).unwrap();
+        append_to_page(&k, "p", "more\n").unwrap();
+        let after = std::fs::read_to_string(k.pages_dir().join("p.md")).unwrap();
+        assert!(after.contains("alpha") && after.contains("b, c"), "{after}");
+        assert!(
+            after.contains("folded line two") && after.contains("other: 2"),
+            "{after}"
+        );
+    }
+
+    /// Not a test: a sweep. Every page of a real vault must parse to the
+    /// same map after a write, and keep every top-level key it has.
+    /// `KMS_BENCH_VAULT=<kms folder> cargo test --lib sweep_frontmatter -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn sweep_frontmatter_on_a_real_vault() {
+        let Ok(root) = std::env::var("KMS_BENCH_VAULT") else {
+            return;
+        };
+        let (mut pages, mut bad) = (0, 0);
+        for dir in ["pages", "sources"] {
+            let Ok(rd) = std::fs::read_dir(PathBuf::from(&root).join(dir)) else {
+                continue;
+            };
+            for e in rd.flatten() {
+                let Ok(raw) = std::fs::read_to_string(e.path()) else {
+                    continue;
+                };
+                let (fm, body) = parse_frontmatter(&raw);
+                if fm.is_empty() {
+                    continue;
+                }
+                pages += 1;
+                let out = write_frontmatter(&fm, &body);
+                let (fm2, body2) = parse_frontmatter(&out);
+                let head = raw.split("\n---\n").next().unwrap_or("");
+                let keys = head
+                    .lines()
+                    .skip(1)
+                    .filter(|l| !l.starts_with([' ', '\t', '-', '#']) && l.contains(':'))
+                    .count();
+                if fm != fm2 || body != body2 || keys != fm.len() {
+                    bad += 1;
+                    eprintln!("UNSTABLE {:?}: keys {keys} vs {}", e.file_name(), fm.len());
+                }
+            }
+        }
+        eprintln!("swept {pages} files with frontmatter, {bad} unstable");
+        assert_eq!(bad, 0);
+    }
+
+    /// Not a test: a stopwatch. `KMS_BENCH_VAULT=<path to a KMS folder>
+    /// cargo test --lib bench_page_scans -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_page_scans_on_a_real_vault() {
+        let Ok(root) = std::env::var("KMS_BENCH_VAULT") else {
+            return;
+        };
+        let k = KmsRef {
+            name: "bench".into(),
+            scope: KmsScope::User,
+            root: PathBuf::from(root),
+        };
+        let time = |label: &str| {
+            let t = std::time::Instant::now();
+            let n = backlink_map(&k).len() + scan_index_entries(&k).len();
+            eprintln!("{label}: {:?} ({n} rows)", t.elapsed());
+        };
+        time("cold (read + parse every page)");
+        time("warm (one stat per page)");
+        time("warm again");
+    }
+
+    /// dev-plan/64 P5.7: the sidebar is given what a person calls each file.
+    #[test]
+    fn a_listing_carries_titles_and_unfinished_status() {
+        let _g = scoped_home();
+        let k = create("nb", KmsScope::Project).unwrap();
+        write_page(
+            &k,
+            "hidden-poverty-households",
+            "---\ntitle: ครัวเรือนยากจนแฝง\n---\nbody\n",
+        )
+        .unwrap();
+        write_page(&k, "plain", "---\ntitle: plain\n---\nbody\n").unwrap();
+        std::fs::write(
+            k.pages_dir().join("stub.md"),
+            "---\ntitle: Stub\nstatus: researching\n---\nplaceholder\n",
+        )
+        .unwrap();
+        crate::research::kms_writer::write_source(
+            "nb",
+            "q",
+            "2026-09-20",
+            1,
+            "OECD — Foundations for Growth",
+            "https://www.oecd.org/x",
+            "body",
+        )
+        .unwrap();
+
+        let listing = browse("nb").unwrap();
+        let page = |n: &str| listing.pages.iter().find(|p| p.name == n).unwrap().clone();
+        assert_eq!(page("hidden-poverty-households").title, "ครัวเรือนยากจนแฝง");
+        assert_eq!(
+            page("plain").title,
+            "",
+            "a title equal to the slug adds nothing"
+        );
+        assert_eq!(page("stub").status, "researching");
+        assert_eq!(page("plain").status, "");
+        assert_eq!(listing.sources[0].title, "OECD — Foundations for Growth");
+
+        let json = serde_json::to_value(&page("plain")).unwrap();
+        assert!(
+            json.get("title").is_none() && json.get("status").is_none(),
+            "{json}"
+        );
+    }
+
+    /// dev-plan/64 P3.3: the cache never serves a page that has changed —
+    /// by our own writer, or by something else editing the file in place.
+    #[test]
+    fn the_page_cache_follows_every_kind_of_edit() {
+        let _g = scoped_home();
+        let k = create("nb", KmsScope::Project).unwrap();
+        write_page(&k, "a", "---\ntitle: One\n---\n\nlinks [[b]]\n").unwrap();
+        write_page(&k, "b", "---\ntitle: B\n---\n\nbody\n").unwrap();
+        let title = |k: &KmsRef| {
+            scan_index_entries(k)
+                .into_iter()
+                .find(|e| e.stem == "a")
+                .unwrap()
+                .title
+        };
+        assert_eq!(title(&k), "One");
+        assert_eq!(backlink_map(&k).get("b").unwrap()[0].0, "a");
+
+        // Same length, straight after: a coarse mtime alone would miss it.
+        write_page(&k, "a", "---\ntitle: Two\n---\n\nlinks [[b]]\n").unwrap();
+        assert_eq!(title(&k), "Two");
+
+        // An outside editor writing in place, as Obsidian does.
+        let path = k.pages_dir().join("a.md");
+        let edited = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("title: Two", "title: Three and longer")
+            .replace("[[b]]", "nothing");
+        std::fs::write(&path, edited).unwrap();
+        assert_eq!(title(&k), "Three and longer");
+        assert!(backlink_map(&k).get("b").is_none(), "the link is gone");
+
+        delete_page(&k, "a").unwrap();
+        assert!(scan_index_entries(&k).iter().all(|e| e.stem != "a"));
+    }
+
+    /// dev-plan/64 P3.8. A re-ingested source marks the pages built on it,
+    /// however they name it — bare, in a flow list, or by research index —
+    /// and records when the debt began without pretending the page changed.
+    #[test]
+    fn a_reingested_source_marks_every_page_that_cites_it() {
+        let _g = scoped_home();
+        let k = create("nb", KmsScope::Project).unwrap();
+        let mut reg = crate::research::registry::SourceRegistry::load(&k);
+        let idx = reg.index_for("kms://nb/sources/report", "Report");
+        reg.index_for("https://example.com/other", "Other");
+        reg.save(&k).unwrap();
+        let page = |sources: &str| {
+            format!("---\ntitle: T\nsources: {sources}\nupdated: 2026-01-01\n---\n\nbody\n")
+        };
+        std::fs::write(k.pages_dir().join("bare.md"), page("report")).unwrap();
+        std::fs::write(k.pages_dir().join("flow.md"), page("[\"report\", \"x\"]")).unwrap();
+        std::fs::write(
+            k.pages_dir().join("research.md"),
+            page(&format!("[{idx}, 99]")),
+        )
+        .unwrap();
+        std::fs::write(k.pages_dir().join("other.md"), page("[\"reporting\", 2]")).unwrap();
+
+        assert_eq!(mark_dependent_pages_stale(&k, "report").unwrap(), 3);
+        for stem in ["bare", "flow", "research"] {
+            let raw = std::fs::read_to_string(k.pages_dir().join(format!("{stem}.md"))).unwrap();
+            assert!(raw.contains("⚠ STALE: source `report`"), "{stem}: {raw}");
+            assert!(raw.contains("stale_since:"), "{stem}: {raw}");
+            assert!(
+                raw.contains("updated: 2026-01-01"),
+                "{stem} was not updated: {raw}"
+            );
+        }
+        let other = std::fs::read_to_string(k.pages_dir().join("other.md")).unwrap();
+        assert!(!other.contains("STALE"), "{other}");
+
+        // A second re-ingest keeps the first date; a refresh clears it.
+        let first = std::fs::read_to_string(k.pages_dir().join("bare.md")).unwrap();
+        mark_dependent_pages_stale(&k, "report").unwrap();
+        let (fm1, _) = parse_frontmatter(&first);
+        let (fm2, _) =
+            parse_frontmatter(&std::fs::read_to_string(k.pages_dir().join("bare.md")).unwrap());
+        assert_eq!(fm1.get("stale_since"), fm2.get("stale_since"));
+        write_page(
+            &k,
+            "bare",
+            "---\ntitle: T\nsources: report\nstale_since: 2026-09-01\n---\n\nrefreshed\n",
+        )
+        .unwrap();
+        let fresh = std::fs::read_to_string(k.pages_dir().join("bare.md")).unwrap();
+        assert!(!fresh.contains("stale_since"), "{fresh}");
+    }
+
+    /// dev-plan/64 P3.5: a rename reaches `related:` in every form it is
+    /// written in, and never a slug that merely starts the same.
+    #[test]
+    fn a_rename_follows_the_page_into_frontmatter() {
+        let _g = scoped_home();
+        let k = create("nb", KmsScope::Project).unwrap();
+        write_page(&k, "claude-code", "---\ntitle: Claude Code\n---\nbody\n").unwrap();
+        write_page(&k, "claude-code-hooks", "---\ntitle: Hooks\n---\nbody\n").unwrap();
+        let flow = "---\ntitle: A\nrelated: [\"claude-code\", \"claude-code-hooks\", jevons]\nsupersedes: claude-code\n---\n\nSee [[claude-code#Spawning|spawn]] and [[claude-code-hooks]].\n";
+        let block = "---\ntitle: B\nrelated:\n  - claude-code\n  - \"claude-code-hooks\"\ntags: [claude-code]\n---\n\nbody mentions claude-code in prose\n";
+        std::fs::write(k.pages_dir().join("a.md"), flow).unwrap();
+        std::fs::write(k.pages_dir().join("b.md"), block).unwrap();
+
+        rename_page(&k, "claude-code", "claude-code-subagent-spawning").unwrap();
+
+        let a = std::fs::read_to_string(k.pages_dir().join("a.md")).unwrap();
+        assert!(
+            a.contains(
+                "related: [\"claude-code-subagent-spawning\", \"claude-code-hooks\", jevons]"
+            ),
+            "{a}"
+        );
+        assert!(
+            a.contains("supersedes: claude-code-subagent-spawning"),
+            "{a}"
+        );
+        assert!(
+            a.contains("[[claude-code-subagent-spawning#Spawning|spawn]]"),
+            "{a}"
+        );
+        assert!(a.contains("[[claude-code-hooks]]"), "{a}");
+        let b = std::fs::read_to_string(k.pages_dir().join("b.md")).unwrap();
+        assert!(
+            b.contains("  - claude-code-subagent-spawning\n  - \"claude-code-hooks\""),
+            "{b}"
+        );
+        assert!(
+            b.contains("tags: [claude-code]"),
+            "a tag is not a slug: {b}"
+        );
+        assert!(b.contains("mentions claude-code in prose"), "{b}");
+    }
+
+    /// dev-plan/64 P3.2. A write replaces the file whole or not at all, and
+    /// leaves nothing behind that a page lister would count.
+    #[test]
+    fn a_write_replaces_the_file_in_one_step() {
+        let td = tempfile::tempdir().unwrap();
+        let page = td.path().join("ยุค.md");
+        write_file(&page, "v1").unwrap();
+        write_file(&page, "ฉบับที่สอง").unwrap();
+        assert_eq!(std::fs::read_to_string(&page).unwrap(), "ฉบับที่สอง");
+        let names: Vec<String> = std::fs::read_dir(td.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["ยุค.md"], "no temp file left");
+
+        // A write that cannot complete leaves the old bytes and no temp.
+        let gone = td.path().join("no-such-dir").join("x.md");
+        assert!(write_file(&gone, "x").is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&page, std::fs::Permissions::from_mode(0o600)).unwrap();
+            write_file(&page, "v3").unwrap();
+            let mode = std::fs::metadata(&page).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "permissions survive the replace");
+        }
+    }
+
+    /// dev-plan/64 D1. The vault one agent built is the workspace's: a
+    /// second agent in the same workspace resolves it, and it sits at the
+    /// workspace root with every file it had.
+    #[test]
+    fn a_project_kms_is_shared_by_every_agent_in_the_workspace() {
+        let (_g, ws) = as_agent("writer");
+        legacy_vault(&ws, "main", "Age of Abundance", "ยุคที่ความฉลาดล้นเหลือ");
+
+        let kref = resolve("age-of-abundance").expect("the writer sees main's vault");
+        assert_eq!(kref.name, "Age of Abundance");
+        assert_eq!(kref.root, ws.join(PROJECT_KMS_DIR).join("Age of Abundance"));
+        assert!(kref.page_path("ยุคที่ความฉลาดล้นเหลือ").is_ok());
+        assert!(!ws
+            .join(".thclaws/bots/main")
+            .join(PROJECT_KMS_DIR)
+            .join("Age of Abundance")
+            .exists());
+        let log = std::fs::read_to_string(kref.root.join("log.md")).unwrap_or_default();
+        assert!(
+            log.contains("moved"),
+            "the move is on the vault's own log: {log}"
+        );
+
+        let made = create("notes", KmsScope::Project).unwrap();
+        assert_eq!(made.root, ws.join(PROJECT_KMS_DIR).join("notes"));
+    }
+
+    /// Two agents each hold a vault called `notes`. One moves; the other
+    /// must not be overwritten, merged, or lost — it stays where it is
+    /// and its own agent still reads ITS pages, not the workspace's.
+    #[test]
+    fn a_name_two_agents_both_use_moves_once_and_loses_nothing() {
+        let (_g, ws) = as_agent("writer");
+        legacy_vault(&ws, "main", "notes", "from-main");
+        legacy_vault(&ws, "writer", "notes", "from-writer");
+        legacy_vault(&ws, "writer", "drafts", "ch1");
+
+        let report = migrate_project_kms_in(&ws);
+        assert_eq!(report.len(), 3, "{report:?}");
+        assert!(report
+            .iter()
+            .any(|l| l.contains("stays with agent 'writer'")));
+
+        let shared = ws.join(PROJECT_KMS_DIR);
+        assert!(shared.join("notes/pages/from-main.md").is_file());
+        assert!(!shared.join("notes/pages/from-writer.md").exists());
+        assert!(shared.join("drafts/pages/ch1.md").is_file());
+        let kept = ws
+            .join(".thclaws/bots/writer")
+            .join(PROJECT_KMS_DIR)
+            .join("notes");
+        assert!(kept.join("pages/from-writer.md").is_file());
+
+        let mine = resolve("notes").unwrap();
+        assert_eq!(
+            mine.root.canonicalize().unwrap(),
+            kept.canonicalize().unwrap()
+        );
+        assert!(mine.page_path("from-writer").is_ok());
+        let names: Vec<String> = list_all().into_iter().map(|k| k.name).collect();
+        assert_eq!(names, vec!["drafts", "notes"], "one row per name");
+
+        assert!(migrate_project_kms_in(&ws)
+            .iter()
+            .all(|l| l.contains("stays")));
+        assert!(
+            kept.join("pages/from-writer.md").is_file(),
+            "a second run moves nothing"
+        );
+    }
+
+    /// No host, no variable: the workspace root is the cwd and a project
+    /// vault is exactly where it has always been.
+    #[test]
+    fn outside_a_host_a_project_kms_stays_under_the_cwd() {
+        let _g = scoped_home();
+        let prev = std::env::var("THCLAWS_WORKSPACE_ROOT").ok();
+        std::env::remove_var("THCLAWS_WORKSPACE_ROOT");
+        let made = create("solo", KmsScope::Project).unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(made.root, cwd.join(PROJECT_KMS_DIR).join("solo"));
+        assert!(legacy_project_root().is_none());
+        assert!(resolve("solo").is_some());
+        if let Some(v) = prev {
+            std::env::set_var("THCLAWS_WORKSPACE_ROOT", v);
+        }
+    }
+
     #[test]
     fn create_seeds_starter_files() {
         let _home = scoped_home();
@@ -6844,15 +9189,49 @@ mod tests {
         assert_eq!(system_prompt_section(&[]), "");
     }
 
+    /// The prompt announces a base; it does not list it.
+    ///
+    /// The whole page list used to be injected on every turn — 15.5 KB
+    /// for 39 pages, and capped by entry count rather than bytes, so a
+    /// large base could have taken ~80 KB per turn. The procedure was
+    /// already search-first, so the list only ever answered "is this
+    /// base worth searching", which the header answers far cheaper.
     #[test]
-    fn system_prompt_section_includes_index_text() {
+    fn the_prompt_announces_a_base_rather_than_listing_it() {
         let _home = scoped_home();
         let k = create("nb", KmsScope::User).unwrap();
-        std::fs::write(k.index_path(), "# nb\n- [foo](pages/foo.md) — foo page\n").unwrap();
+        // `foo` is written first, so it is the entry page.
+        write_page(&k, "foo", "---\ntitle: Foo\n---\n\nA page about foo.\n").unwrap();
+        write_page(&k, "bar", "---\ntitle: Bar\n---\n\nA page about bar.\n").unwrap();
         let out = system_prompt_section(&["nb".into()]);
-        assert!(out.contains("## KMS: nb"));
-        assert!(out.contains("foo page"));
-        assert!(out.contains("KmsRead"));
+
+        assert!(out.contains("## KMS: nb"), "{out}");
+        assert!(
+            out.contains("2 page(s)"),
+            "size is the relevance cue: {out}"
+        );
+        assert!(
+            out.contains("KmsRead") && out.contains("\"index\""),
+            "must point at the on-demand list: {out}"
+        );
+        // Names, yes — search cannot yet be relied on to find a Thai page,
+        // so every page has to be nameable from the prompt. Summaries, no:
+        // they were nine tenths of the bytes.
+        assert!(out.contains("- foo — Foo"), "page names are listed: {out}");
+        assert!(out.contains("- bar — Bar"), "page names are listed: {out}");
+        // The entry page's summary IS the base's `About:` line, so that one
+        // belongs here. No other page's summary does.
+        assert!(out.contains("About: A page about foo."), "{out}");
+        assert!(
+            !out.contains("A page about bar."),
+            "summaries must NOT be injected:\n{out}"
+        );
+        assert!(!out.contains("pages/foo.md"), "{out}");
+
+        // And the list is still reachable, with the summary in it.
+        let full = full_index(&k);
+        assert!(full.contains("pages/foo.md"), "{full}");
+        assert!(full.contains("A page about foo."), "{full}");
     }
 
     /// M6.39.5: pin the strong-imperative wording of the prelude.
@@ -6894,6 +9273,29 @@ mod tests {
         );
     }
 
+    /// dev-plan/64 P2.2. The section is paid for on every request, so it
+    /// has a budget, and it explains a kind of page only to a base that
+    /// has one: the two-layer and provenance paragraphs were 1.3 KB sent
+    /// to every conversation whether or not they described anything.
+    #[test]
+    fn the_prelude_fits_its_budget_and_explains_only_what_is_there() {
+        let _home = scoped_home();
+        let k = create("nb", KmsScope::User).unwrap();
+        std::fs::write(k.pages_dir().join("foo.md"), "---\ntitle: Foo\n---\nbody\n").unwrap();
+        let out = system_prompt_section(&["nb".into()]);
+        assert!(out.len() <= 2_500, "{} bytes:\n{out}", out.len());
+        assert!(!out.contains("Two layers"), "{out}");
+        assert!(!out.contains("Prefer topic pages"), "{out}");
+        assert!(out.contains("<system-reminder>"), "{out}");
+
+        std::fs::write(k.pages_dir().join("sess-1.md"), "---\ntitle: S\n---\nx\n").unwrap();
+        std::fs::create_dir_all(k.root.join("sources")).unwrap();
+        std::fs::write(k.root.join("sources/raw.txt"), "raw").unwrap();
+        let out = system_prompt_section(&["nb".into()]);
+        assert!(out.contains("Two layers"), "{out}");
+        assert!(out.contains("Prefer topic pages"), "{out}");
+    }
+
     #[test]
     fn system_prompt_section_skips_missing() {
         let _home = scoped_home();
@@ -6917,12 +9319,12 @@ mod tests {
 
         let out = system_prompt_section(&["alpha".into(), "beta".into()]);
 
-        // The globalised header should appear exactly once.
-        let header_count = out.matches("## KMS tools").count();
-        assert_eq!(
-            header_count, 1,
-            "tools reference must appear exactly once for any number of KMSes, got {header_count}:\n{out}"
-        );
+        // dev-plan/64 P2.2: the tools block is gone altogether — it
+        // repeated the tool definitions the request already carries. The
+        // write tools are still named, once, where the prelude says when
+        // to use them.
+        assert!(!out.contains("## KMS tools"), "{out}");
+        assert_eq!(out.matches("`KmsDelete`").count(), 1, "{out}");
         // Each KMS still has its own block (Schema + Index).
         assert!(out.contains("## KMS: alpha"));
         assert!(out.contains("## KMS: beta"));
@@ -7184,6 +9586,58 @@ mod tests {
         std::fs::write(&src, "data").unwrap();
         let err = ingest(&k, &src, None, false).unwrap_err();
         assert!(format!("{err}").contains("not supported"));
+    }
+
+    /// Re-ingesting a document refreshes its source and regenerates its
+    /// stub — but only while the page still IS a stub. Once a research
+    /// run or a person has written it, `--force` must not put the outline
+    /// back over their work.
+    #[test]
+    fn a_forced_reingest_keeps_a_page_that_is_no_longer_a_stub() {
+        let _home = scoped_home();
+        let k = create("notes", KmsScope::Project).unwrap();
+        let src_dir = tempfile::tempdir().unwrap();
+        let src = src_dir.path().join("ยุคใหม่.md");
+        std::fs::write(&src, "# ยุคใหม่\n\nversion one\n").unwrap();
+        let first = ingest(&k, &src, None, false).unwrap();
+        let page = k.pages_dir().join(format!("{}.md", first.alias));
+        assert!(std::fs::read_to_string(&page)
+            .unwrap()
+            .contains("status: derived"));
+
+        // A stub is ours to regenerate, and keeps its birthday.
+        let stamped = std::fs::read_to_string(&page).unwrap().replace(
+            &format!("created: {}", crate::usage::today_str()),
+            "created: 2020-01-01",
+        );
+        std::fs::write(&page, stamped).unwrap();
+        ingest(&k, &src, None, true).unwrap();
+        assert!(
+            std::fs::read_to_string(&page)
+                .unwrap()
+                .contains("created: 2020-01-01"),
+            "`created:` was dropped on re-ingest"
+        );
+
+        // The research run turns the stub into the topic page…
+        std::fs::write(
+            &page,
+            "---\ncreated: 2020-01-01\nkind: moc\nrelated: [\"a\", \"b\"]\ntitle: ยุคใหม่\ntype: note\n---\n\nthe written topic page\n",
+        )
+        .unwrap();
+        // …and a later re-ingest of an edited document must leave it alone
+        // while still replacing the archived source.
+        std::fs::write(&src, "# ยุคใหม่\n\nversion two\n").unwrap();
+        ingest(&k, &src, None, true).unwrap();
+        let after = std::fs::read_to_string(&page).unwrap();
+        assert!(
+            after.contains("the written topic page"),
+            "page overwritten:\n{after}"
+        );
+        assert!(after.contains("kind: moc"), "{after}");
+        let archived =
+            std::fs::read_to_string(k.sources_dir().join(format!("{}.md", first.alias))).unwrap();
+        assert!(archived.contains("version two"), "source not refreshed");
     }
 
     #[test]
@@ -7674,11 +10128,45 @@ mod tests {
             body.contains("# Auth tokens"),
             "title heading missing: {body}"
         );
+        // dev-plan/64 P3.9: the title stands alone. `topic:` is in the
+        // frontmatter, and a bare `---` under the title rendered as a
+        // second rule right below the heading's own underline.
         assert!(
-            body.contains("Description: how the API stores session tokens"),
-            "Description line missing: {body}"
+            !body.contains("Description:"),
+            "Description line should no longer be injected: {body}"
+        );
+        assert!(
+            !body.contains("\n---"),
+            "the rule under the title should be gone: {body}"
         );
         assert!(body.contains("We rotate JWTs nightly."));
+    }
+
+    #[test]
+    fn write_page_strips_the_pre_p39_header_from_an_older_page() {
+        let _home = scoped_home();
+        let k = create("nb", KmsScope::User).unwrap();
+        // Exactly what a page written before P3.9 looks like when it is
+        // read back and re-written (an edit, a refresh, Mark reviewed).
+        let path = write_page(
+            &k,
+            "legacy",
+            "---\ntitle: Legacy\n---\n\n# Legacy\n\nDescription: the old topic line\n---\n\nFirst paragraph.\n\n---\n\nA rule the writer meant to keep.\n",
+        )
+        .unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let (_, body) = parse_frontmatter(&raw);
+        assert!(
+            !body.contains("Description:"),
+            "legacy Description line survived: {body}"
+        );
+        assert_eq!(
+            body.matches("\n---\n").count(),
+            1,
+            "only the rule further down should remain: {body}"
+        );
+        assert!(body.contains("A rule the writer meant to keep."));
+        assert!(body.contains("# Legacy"));
     }
 
     #[test]
@@ -7698,7 +10186,7 @@ mod tests {
             body.contains("# dream-2026-05-11"),
             "stem fallback missing: {body}"
         );
-        assert!(body.contains("Description: KMS audit log"));
+        assert!(body.contains("Some dream content."));
     }
 
     #[test]
@@ -7742,11 +10230,11 @@ mod tests {
 
     #[test]
     fn write_page_re_write_is_idempotent_on_canonical_pages() {
-        // A page that's been through write_page once will have the
-        // canonical `# title\nDescription:\n---` block at the top of
-        // its body. Reading it back and re-writing should not pile on
-        // a second copy of the header — `body_has_leading_heading`
-        // detects the prior `# heading` and skips re-injection.
+        // A page that's been through write_page once carries a
+        // `# title` heading at the top of its body. Reading it back and
+        // re-writing should not pile on a second copy of the header —
+        // `body_has_leading_heading` detects the prior `# heading` and
+        // skips re-injection.
         let _home = scoped_home();
         let k = create("nb", KmsScope::User).unwrap();
         let path = write_page(
@@ -7763,11 +10251,6 @@ mod tests {
         assert_eq!(
             heading_count, 1,
             "canonical heading should appear exactly once after a round-trip re-write; got {heading_count}:\n{raw2}"
-        );
-        let desc_count = raw2.matches("Description: jwt storage").count();
-        assert_eq!(
-            desc_count, 1,
-            "Description should appear exactly once after a round-trip re-write; got {desc_count}:\n{raw2}"
         );
     }
 
@@ -7866,6 +10349,14 @@ mod tests {
         let out = system_prompt_section(&["nb".into()]);
         assert!(out.contains("### Schema"));
         assert!(out.contains("Pages must have category"));
+
+        // dev-plan/64 P2.3: the schema every KMS is born with is not an
+        // instruction from its owner, and is not worth 1.3 KB a request.
+        let plain = create("plain", KmsScope::User).unwrap();
+        assert_eq!(read_schema(&plain).trim(), SCHEMA_TEMPLATE.trim());
+        let out = system_prompt_section(&["plain".into()]);
+        assert!(!out.contains("### Schema"), "{out}");
+        assert!(!out.contains("Canonical page shape"), "{out}");
         assert!(out.contains("KmsWrite")); // tool affordance listed
         assert!(out.contains("KmsAppend"));
     }
@@ -7885,10 +10376,6 @@ mod tests {
         // top-level `## KMS tools` h2 instead of a per-KMS `### Tools`
         // h3 subsection. The substantive assertions (every tool
         // listed + "last resort" framing) are unchanged.
-        assert!(
-            out.contains("## KMS tools"),
-            "expected globalised KMS-tools header; got:\n{out}"
-        );
         assert!(out.contains("KmsRead"));
         assert!(out.contains("KmsSearch"));
         assert!(out.contains("KmsWrite"));
@@ -7926,15 +10413,27 @@ mod tests {
             "---\ncategory: research\n---\n# Paper B\n",
         )
         .unwrap();
+        // dev-plan/64: the prompt names the categories and the pages; the
+        // categorised list itself moved behind `KmsRead(kind: "index")`.
         let out = system_prompt_section(&["nb".into()]);
         assert!(
-            out.contains("**research**"),
-            "missing research section: {out}"
+            out.contains("Categories: api, research"),
+            "categories must still reach the model: {out}"
         );
-        assert!(out.contains("**api**"), "missing api section: {out}");
         assert!(out.contains("paper-a"));
         assert!(out.contains("paper-b"));
         assert!(out.contains("api-x"));
+        assert!(
+            !out.contains("**research**"),
+            "sections are on demand: {out}"
+        );
+
+        let full = full_index(&k);
+        assert!(
+            full.contains("**research**"),
+            "missing research section: {full}"
+        );
+        assert!(full.contains("**api**"), "missing api section: {full}");
     }
 
     // ─── M6.25: re-ingest cascade (BUG #10) ───────────────────────────────
@@ -8352,6 +10851,169 @@ mod tests {
     }
 
     #[test]
+    fn list_runs_reads_the_ledger_out_of_each_log_newest_first() {
+        let _home = scoped_home();
+        let k = create("nb", KmsScope::Project).unwrap();
+        let runs = k.root.join("runs");
+        std::fs::create_dir_all(&runs).unwrap();
+        std::fs::write(
+            runs.join("2026-09-19-jevons.md"),
+            "---\ntype: research-run\nquery: \"ปฏิทรรศน์เจวอนส์\"\ndate: 2026-09-19\nelapsed_secs: 384\nclaims: 70\nllm_calls: 2\ncost_usd: 0.0114\n---\n\n# Research run\n",
+        )
+        .unwrap();
+        std::fs::write(
+            runs.join("2026-09-20-verify.md"),
+            "---\ntype: verify-run\ndate: 2026-09-20\nfindings: 41\nllm_calls: 39\ncost_usd: 0.2100\n---\n\n```\nreport\n```\n",
+        )
+        .unwrap();
+        std::fs::write(
+            runs.join("2026-09-20-verify-2.md"),
+            "---\ntype: verify-run\ndate: 2026-09-20\nfindings: 3\n---\n\n```\nreport\n```\n",
+        )
+        .unwrap();
+        // Not a run log; must not appear.
+        std::fs::write(runs.join("notes.txt"), "scratch").unwrap();
+
+        let out = list_runs(&k);
+        let names: Vec<&str> = out.iter().map(|r| r.name.as_str()).collect();
+        // Newest date first; same-day runs in the order they were numbered.
+        assert_eq!(
+            names,
+            vec![
+                "2026-09-20-verify-2",
+                "2026-09-20-verify",
+                "2026-09-19-jevons"
+            ]
+        );
+        assert_eq!(out[0].kind, "verify");
+        assert_eq!(out[0].findings, Some(3));
+        assert_eq!(out[0].cost_usd, None, "a log with no cost says so");
+        assert_eq!(out[1].cost_usd, Some(0.21));
+        let research = &out[2];
+        assert_eq!(research.kind, "research");
+        assert_eq!(research.title, "ปฏิทรรศน์เจวอนส์", "query, unquoted");
+        assert_eq!(research.claims, Some(70));
+        assert_eq!(research.elapsed_secs, Some(384));
+        assert_eq!(research.cost_usd, Some(0.0114));
+        assert!(research.bytes > 0);
+    }
+
+    #[test]
+    fn cost_by_mode_prices_a_click_from_runs_of_the_same_kind() {
+        let _home = scoped_home();
+        let k = create("nb", KmsScope::Project).unwrap();
+        let runs = k.root.join("runs");
+        std::fs::create_dir_all(&runs).unwrap();
+        let log = |name: &str, body: &str| {
+            std::fs::write(runs.join(format!("{name}.md")), body).unwrap();
+        };
+        // Three refreshes: 1¢, 2¢ and one wild 90¢ outlier.
+        log(
+            "2026-09-18-refresh-a",
+            "---\ntype: research-run\nmode: refresh\ndate: 2026-09-18\nelapsed_secs: 60\ncost_usd: 0.0100\n---\n",
+        );
+        log(
+            "2026-09-19-refresh-b",
+            "---\ntype: research-run\nmode: refresh\ndate: 2026-09-19\nelapsed_secs: 120\ncost_usd: 0.0200\n---\n",
+        );
+        log(
+            "2026-09-20-refresh-c",
+            "---\ntype: research-run\nmode: refresh\ndate: 2026-09-20\nelapsed_secs: 2400\ncost_usd: 0.9000\n---\n",
+        );
+        log(
+            "2026-09-20-topic",
+            "---\ntype: research-run\nmode: research\ndate: 2026-09-20\nelapsed_secs: 400\ncost_usd: 0.0500\n---\n",
+        );
+        // Written before P5.4 stamped `mode:` — the name is all it has.
+        log(
+            "2026-09-17-refresh-old",
+            "---\ntype: research-run\ndate: 2026-09-17\ncost_usd: 0.0300\n---\n",
+        );
+
+        let by = cost_by_mode(&k);
+        let refresh = by.get("refresh").expect("refresh mode");
+        assert_eq!(refresh.runs, 4, "the unstamped log is a refresh too");
+        // The median, not the mean: one 90¢ run must not make every
+        // later click look expensive. Mean here would be 24.75¢.
+        assert_eq!(refresh.cost_usd, Some(0.03));
+        assert_eq!(by.get("research").map(|m| m.runs), Some(1));
+        assert_eq!(by.get("research").and_then(|m| m.cost_usd), Some(0.05));
+        // A kind nobody has run here has no entry, so the GUI says
+        // "not known" instead of borrowing another kind's number.
+        assert!(by.get("selection").is_none());
+    }
+
+    /// A URL that serves a paper is a paper. Before this, `resp.text()`
+    /// ran over the bytes and archived lossy mush — and the GUI's URL
+    /// field made that the commonest thing a researcher would paste.
+    /// dev-plan/64 P4.9. The mode decides whether a page gets claims,
+    /// quotes and citations or none of them, so an unknown value must
+    /// land somewhere safe and predictable rather than on the most
+    /// expensive option — and the cheap paths must not run the
+    /// pipeline by accident.
+    #[test]
+    fn an_ingest_mode_that_is_not_recognised_falls_back_to_the_old_behaviour() {
+        use IngestMode::*;
+        // What every caller written before the choice existed sends.
+        assert_eq!(IngestMode::parse(""), Summary);
+        assert_eq!(IngestMode::parse("nonsense"), Summary);
+        assert_eq!(IngestMode::parse("SUMMARY"), Summary);
+        assert_eq!(IngestMode::parse(" Cited "), Cited);
+        assert_eq!(IngestMode::parse("archive"), Archive);
+        assert_eq!(IngestMode::parse("atomic"), Atomic);
+
+        // Only the two expensive ones reach the research pipeline.
+        assert!(!Archive.is_research());
+        assert!(!Summary.is_research());
+        assert!(Cited.is_research());
+        assert!(Atomic.is_research());
+
+        // `cited` is one page; `atomic` keeps the run's own ceiling.
+        assert_eq!(Cited.research_max_notes(), Some(1));
+        assert_eq!(Atomic.research_max_notes(), None);
+
+        // Round-trips, since the mode rides an IPC envelope as a string.
+        for m in [Archive, Summary, Cited, Atomic] {
+            assert_eq!(IngestMode::parse(m.as_str()), m);
+        }
+    }
+
+    #[test]
+    fn a_pdf_over_http_is_recognised_however_the_server_labels_it() {
+        let pdf = b"%PDF-1.7\n1 0 obj\n";
+        let html = b"<!doctype html><html><body>hi</body></html>";
+        // The header, when it says something.
+        assert!(looks_like_pdf("application/pdf", html));
+        assert!(looks_like_pdf("application/x-pdf", b""));
+        // The bytes, when it does not — the shape that made this a bug.
+        assert!(looks_like_pdf("application/octet-stream", pdf));
+        assert!(looks_like_pdf("", pdf));
+        // And neither for an ordinary page.
+        assert!(!looks_like_pdf("text/html", html));
+        assert!(!looks_like_pdf("", html));
+        // A page that merely mentions the word is not one.
+        assert!(!looks_like_pdf(
+            "text/html",
+            b"<p>download the pdf here</p>"
+        ));
+    }
+
+    #[test]
+    fn read_browse_file_opens_a_run_log_but_not_a_traversal() {
+        let _home = scoped_home();
+        let k = create("nb", KmsScope::Project).unwrap();
+        let runs = k.root.join("runs");
+        std::fs::create_dir_all(&runs).unwrap();
+        std::fs::write(runs.join("2026-09-20-verify.md"), "the report").unwrap();
+        let read = read_browse_file("nb", "run", "2026-09-20-verify").unwrap();
+        assert_eq!(read.content, "the report");
+        // A page of the same stem is a different file: the folder is
+        // chosen by `kind`, not guessed.
+        assert!(read_browse_file("nb", "page", "2026-09-20-verify").is_err());
+        assert!(read_browse_file("nb", "run", "../pages/x").is_err());
+    }
+
+    #[test]
     fn read_browse_file_passes_through_small_files() {
         let _home = scoped_home();
         let k = create("nb", KmsScope::Project).unwrap();
@@ -8625,6 +11287,38 @@ Inline `PostgreSQL` in code span.\n\
         assert_eq!(report.links_added, 0);
         let on_disk = std::fs::read_to_string(k.pages_dir().join("postgresql.md")).unwrap();
         assert!(!on_disk.contains("[[postgresql]]"));
+    }
+
+    /// A locally ingested document's alias is also a page name, and its
+    /// Sources line ends in `kms://<kms>/sources/<alias>`. The URL guard
+    /// knew `https?://` only, so the linker rewrote the tail of that
+    /// address into a wikilink on 25 of 39 pages of a real vault — the
+    /// same defect dev-plan/58 fixed once, reopened by a new scheme.
+    #[test]
+    fn auto_link_leaves_a_kms_url_alone_even_when_the_kms_name_has_spaces() {
+        let _home = scoped_home();
+        let k = create("nb", KmsScope::Project).unwrap();
+        std::fs::write(
+            k.pages_dir().join("my-doc.md"),
+            "---\ntitle: My Doc\n---\nstub\n",
+        )
+        .unwrap();
+        let line = "1. [T](../sources/my-doc.md) — kms://Age of Abundance/sources/my-doc\n";
+        std::fs::write(
+            k.pages_dir().join("note.md"),
+            format!("This note rests on one source.\n\n## Sources\n\n{line}"),
+        )
+        .unwrap();
+        let opts = AutoLinkOptions {
+            apply: true,
+            ..AutoLinkOptions::default()
+        };
+        auto_link(&k, opts).unwrap();
+        let on_disk = std::fs::read_to_string(k.pages_dir().join("note.md")).unwrap();
+        assert!(
+            on_disk.contains(line),
+            "the address was rewritten:\n{on_disk}"
+        );
     }
 
     #[test]

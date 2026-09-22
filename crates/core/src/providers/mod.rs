@@ -1339,6 +1339,26 @@ pub struct Usage {
 }
 
 impl Usage {
+    /// The cache part of a `[tokens: …]` line, or nothing.
+    ///
+    /// It used to be printed only when a provider reported BOTH cache writes
+    /// and cache reads, which is Anthropic alone. OpenAI-compatible
+    /// providers (DeepSeek, OpenAI, Qwen) report reads only — and since
+    /// `input_tokens` is what was NOT served from cache, a long conversation
+    /// on one of them showed a falling `in` count and no sign of why.
+    pub fn cache_note(&self) -> String {
+        let w = self.cache_creation_input_tokens.unwrap_or(0);
+        let r = self.cache_read_input_tokens.unwrap_or(0);
+        match (w, r) {
+            (0, 0) => String::new(),
+            (0, r) => format!(" · cache: {r}r"),
+            (w, 0) => format!(" · cache: +{w}w"),
+            (w, r) => format!(" · cache: +{w}w/{r}r"),
+        }
+    }
+}
+
+impl Usage {
     /// Accumulate another usage into this one (for cumulative tracking).
     pub fn accumulate(&mut self, other: &Usage) {
         self.input_tokens += other.input_tokens;
@@ -1895,6 +1915,65 @@ pub async fn build_all_models_payload() -> String {
     .to_string()
 }
 
+/// How long a built picker payload stays good. Long enough that opening the
+/// dropdown twice in a row cannot disagree with itself; short enough that a
+/// backend started a minute ago shows up without a restart.
+const PICKER_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+static PICKER_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<(std::time::Instant, String)>>> =
+    std::sync::OnceLock::new();
+
+/// The picker payload, rebuilt at most once per [`PICKER_CACHE_TTL`].
+///
+/// Issue #215: every open re-parsed the catalogue, re-read settings **and**
+/// live-probed each endpoint-owned backend with an 800 ms / 1500 ms timeout.
+/// A probe that timed out dropped that provider's whole group, so two opens
+/// a second apart could disagree — which is what "very unreliable" meant.
+/// Caching does not make a slow endpoint fast, but it stops the same question
+/// getting two different answers while nothing has changed.
+pub async fn all_models_payload_cached() -> String {
+    if let Some(hit) = picker_cache_hit(PICKER_CACHE_TTL) {
+        return hit;
+    }
+    let body = build_all_models_payload().await;
+    picker_cache_store(&body);
+    body
+}
+
+/// The cached payload if it is still younger than `ttl`. Takes the TTL as an
+/// argument so a test can ask for the expired answer without sleeping out the
+/// real minute.
+fn picker_cache_hit(ttl: std::time::Duration) -> Option<String> {
+    PICKER_CACHE
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|c| match &*c {
+            Some((at, body)) if at.elapsed() < ttl => Some(body.clone()),
+            _ => None,
+        })
+}
+
+fn picker_cache_store(body: &str) {
+    if let Ok(mut c) = PICKER_CACHE
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+    {
+        *c = Some((std::time::Instant::now(), body.to_string()));
+    }
+}
+
+/// Drop the cached picker payload — for when something that changes the
+/// answer happened, rather than waiting out the TTL.
+pub fn invalidate_picker_cache() {
+    if let Ok(mut c) = PICKER_CACHE
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+    {
+        *c = None;
+    }
+}
+
 /// Pick the default model for the highest-priority provider the user
 /// actually has usable credentials for — their own API key (env or
 /// keychain) **or** a gateway route — scanning in the order
@@ -2032,6 +2111,43 @@ mod tests {
             None => std::env::remove_var(key_var),
         }
     }
+    /// Issue #215, the other half: the payload is cached so two opens a second
+    /// apart cannot disagree. Three things have to hold, and each one of them
+    /// failing looks like the bug the cache was meant to fix — a stale list, a
+    /// list that never refreshes, or a list that ignores a key the user just
+    /// added.
+    #[test]
+    fn the_picker_cache_expires_and_can_be_dropped() {
+        let _g = crate::kms::test_env_lock();
+        super::invalidate_picker_cache();
+
+        assert!(
+            super::picker_cache_hit(super::PICKER_CACHE_TTL).is_none(),
+            "an empty cache must miss, not serve an empty list"
+        );
+
+        super::picker_cache_store("{\"type\":\"all_models_list\"}");
+        assert_eq!(
+            super::picker_cache_hit(super::PICKER_CACHE_TTL).as_deref(),
+            Some("{\"type\":\"all_models_list\"}"),
+            "a fresh entry is served as-is"
+        );
+
+        // The expiry path, without sleeping out the real TTL: nothing is old
+        // enough to survive a zero-length one.
+        assert!(
+            super::picker_cache_hit(std::time::Duration::ZERO).is_none(),
+            "an entry past its TTL must miss so the list can refresh"
+        );
+
+        // What `store_provider_key` relies on — a new key must not wait 60s.
+        super::invalidate_picker_cache();
+        assert!(
+            super::picker_cache_hit(super::PICKER_CACHE_TTL).is_none(),
+            "invalidation must drop the entry immediately"
+        );
+    }
+
     /// `/models` on a user-pointed provider says which endpoint it asked,
     /// because "no models for openai-compat" tells the user nothing about
     /// the box they actually configured.
@@ -3258,6 +3374,25 @@ pub(crate) fn http_client() -> reqwest::Client {
 
 #[cfg(test)]
 mod http_client_tests {
+    #[test]
+    fn the_usage_line_shows_cache_reads_on_their_own() {
+        use super::Usage;
+        let u = |w: Option<u32>, r: Option<u32>| Usage {
+            cache_creation_input_tokens: w,
+            cache_read_input_tokens: r,
+            ..Usage::default()
+        };
+        assert_eq!(u(None, None).cache_note(), "");
+        assert_eq!(u(Some(0), Some(0)).cache_note(), "");
+        // DeepSeek / OpenAI: reads only. This printed nothing.
+        assert_eq!(u(None, Some(48_000)).cache_note(), " · cache: 48000r");
+        assert_eq!(u(Some(900), None).cache_note(), " · cache: +900w");
+        assert_eq!(
+            u(Some(900), Some(48_000)).cache_note(),
+            " · cache: +900w/48000r"
+        );
+    }
+
     /// Pins the settings, not the behaviour — reqwest exposes no getters,
     /// so the guard this test gives is that the builder still accepts the
     /// configuration and produces a client. The regression it exists for

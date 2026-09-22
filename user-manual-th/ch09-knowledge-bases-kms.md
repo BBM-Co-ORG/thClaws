@@ -52,7 +52,7 @@ Use case:
 ```yaml
 ---
 title: ชื่อหน้าที่อ่านออก       # ใส่ไม่ครบ → fallback ใช้ชื่อไฟล์
-topic: บรรยายในบรรทัดเดียว     # render เป็น Description: …; ขาดบรรทัดนี้ก็ถูก omit
+topic: บรรยายในบรรทัดเดียว     # คือสิ่งที่ index แสดงสำหรับหน้านี้ — ควรเขียนไว้
 sources: ["https://…", "memory"]  # **บังคับ** — provenance (URLs, session-XYZ, memory, หรือ [] สำหรับ opinion)
 category: หมวดหมู่ (optional)
 tags: [optional, free-form]
@@ -74,8 +74,6 @@ verified: 2026-05-11                  # stamp เฉพาะตอน /research
 ---
 
 # {title}
-Description: {topic}
----
 
 (body)
 ```
@@ -661,8 +659,10 @@ Alias: `mv`
 
 ### `/kms drop NAME [--force]`
 
-destructive — ลบ directory tree ทั้ง KMS (`<scope>/.thclaws/state/kms/<name>/`
-หรือ `~/.config/thclaws/kms/<name>/`) Aliases: `delete`, `rm`
+ย้าย directory tree ทั้ง KMS ออกไป (`<scope>/.thclaws/state/kms/<name>/`
+หรือ `~/.config/thclaws/kms/<name>/`) — แต่ไม่ได้ทำลาย: สิ่งที่ถูกเอาออกจะ
+**ย้ายไปอยู่ `<scope>/.trash/`** เก็บไว้ 30 วัน และเอากลับมาได้ด้วย
+`/kms restore NAME` Aliases: `delete`, `rm`
 
 **default เป็น dry-run** ถ้าไม่ใส่ `--force` จะ print ว่าจะลบ
 page กี่ตัว source กี่ตัว แต่ไม่ touch ดิสก์:
@@ -886,7 +886,7 @@ Drop `<kms_root>/.index/` แล้ว rebuild จาก `pages/` บน disk Op
 
 Surface สำหรับ mutate KMS ที่ agent (และ `/dream` consolidator ด้านล่าง) ใช้ Always-on — register ใน registry ตลอด ไม่ว่ามี KMS active หรือไม่ ทำให้ `/dream` กับ side-channel agent ตัวอื่น bootstrap audit-log KMS จากศูนย์ได้ ทุกตัวยกเว้น `KmsCreate` ต้อง approval (KmsCreate idempotent + name-validated, risk เท่ากับ `SessionRename`)
 
-- `KmsWrite(kms, page, content)` — สร้างหรือเขียนทับ page รักษา YAML frontmatter ไว้, bump `updated:`, อัปเดต bullet ใน `index.md`, append `wrote | <page>` เข้า `log.md`. Auto-inject `# {title}\nDescription: {topic}\n---` block ถ้า body ไม่ขึ้นด้วย `# heading` Warn เมื่อ frontmatter ขาด `sources:`
+- `KmsWrite(kms, page, content)` — สร้างหรือเขียนทับ page รักษา YAML frontmatter ไว้, bump `updated:`, อัปเดต bullet ใน `index.md`, append `wrote | <page>` เข้า `log.md`. Auto-inject หัวเรื่อง `# {title}` ถ้า body ไม่ขึ้นด้วย `# heading` Warn เมื่อ frontmatter ขาด `sources:`
 - `KmsAppend(kms, page, content)` — ต่อท้าย page ที่มีอยู่ เร็วกว่า `KmsWrite` สำหรับการอัปเดตทีละนิด (log, journal, accumulating notes) bump `updated:` ถ้า page มี frontmatter
 - `KmsDelete(kms, page)` — ลบ page, ตัด bullet ออกจาก `index.md`, append `deleted | <page>` ใน `log.md` ใช้ตอน consolidate เพื่อปลด page ที่ซ้ำหรือล้าสมัย
 - `KmsCreate(name, scope)` — ensure ว่า KMS มีอยู่ Idempotent: return ref เดิมถ้ามีแล้ว ถ้ายังไม่มีก็ seed directory tree (pages/, sources/, index.md, log.md, SCHEMA.md, manifest.json) `/dream` Pass 5 ใช้ตัวนี้ bootstrap `dreams` KMS ก่อนเขียน summary

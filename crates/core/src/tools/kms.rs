@@ -36,6 +36,10 @@ pub struct KmsReadTool;
 
 #[async_trait]
 impl Tool for KmsReadTool {
+    fn requires_gate(&self) -> Option<&'static str> {
+        Some(super::KMS_EXISTS_GATE)
+    }
+
     fn name(&self) -> &'static str {
         "KmsRead"
     }
@@ -48,7 +52,12 @@ impl Tool for KmsReadTool {
          or when KmsSearch returns a `[source]` / `sources/…` hit. Source \
          names may carry an extension (`spec.txt`); the bare stem also \
          resolves. A page read ends with the notes that link TO it, so \
-         you can walk the graph backwards as well as forwards."
+         you can walk the graph backwards as well as forwards. \
+         `kind: \"index\"` needs no `page` and returns the base's whole \
+         page list with one-line summaries — the system prompt carries \
+         only each base's size and subject, so this is how you see \
+         everything it holds. Search first; read the index when you need \
+         the shape of the base rather than an answer from it."
     }
 
     fn input_schema(&self) -> Value {
@@ -56,16 +65,18 @@ impl Tool for KmsReadTool {
             "type": "object",
             "properties": {
                 "kms":  {"type": "string", "description": "KMS name (from the active list)"},
-                "page": {"type": "string", "description": "Page name (with or without .md), or source file name when kind=source"},
-                "kind": {"type": "string", "enum": ["page", "source"], "description": "Which layer to read. Default \"page\"."}
+                "page": {"type": "string", "description": "Page name (with or without .md), or source file name when kind=source. Omit when kind=index or kind=schema."},
+                "kind": {"type": "string", "enum": ["page", "source", "index", "schema"], "description": "Which layer to read. Default \"page\". \"index\" lists every page and \"schema\" returns the base's page conventions; neither needs `page`."},
+                "section": {"type": "string", "description": "Read only the section under this heading (any part of the heading, case-insensitive). Works for pages and for markdown sources. Use after a long read came back cut."},
+                "full": {"type": "boolean", "description": "Return a long page whole instead of its first 16 KB plus an outline. Default false."},
+                "offset": {"type": "integer", "description": "kind=source only: byte offset to continue a long source from, as given in the previous read's trailer."}
             },
-            "required": ["kms", "page"]
+            "required": ["kms"]
         })
     }
 
     async fn call(&self, input: Value) -> Result<String> {
         let kms_name = req_str(&input, "kms")?;
-        let page = req_str(&input, "page")?;
         let kind = input
             .get("kind")
             .and_then(|v| v.as_str())
@@ -76,12 +87,41 @@ impl Tool for KmsReadTool {
                 "no KMS named '{kms_name}' (check /kms list)"
             )));
         };
+        // Prompts older than `kind: "index"` — dream, reconcile, a user's own
+        // copy of either — ask for the index as if it were a page. There is
+        // no such page, and the error sent them looking for one.
+        let asks_for_index = matches!(kind, "page" | "pages")
+            && input
+                .get("page")
+                .and_then(Value::as_str)
+                .map(|p| p.trim().trim_end_matches(".md"))
+                .is_some_and(|p| matches!(p, "index" | "_index"));
+        if matches!(kind, "index") || asks_for_index {
+            return Ok(crate::kms::full_index(&kref));
+        }
+        if matches!(kind, "schema") {
+            let schema = crate::kms::read_schema(&kref);
+            return Ok(if schema.trim().is_empty() {
+                format!("KMS '{}' has no SCHEMA.md.", kref.name)
+            } else {
+                schema
+            });
+        }
+        // `page` is required for everything except the index, and the
+        // schema can no longer say so — it is checked here instead.
+        let page = req_str(&input, "page")?;
         if matches!(kind, "source" | "sources") {
-            return read_source(&kref, page);
+            let offset = input.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let section = input
+                .get("section")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            return read_source(&kref, page, offset, section);
         }
         if !matches!(kind, "page" | "pages") {
             return Err(Error::Tool(format!(
-                "KmsRead: invalid kind '{kind}' — use \"page\" or \"source\""
+                "KmsRead: invalid kind '{kind}' — use \"page\", \"source\", \"index\" or \"schema\""
             )));
         }
         let path = kref.page_path(page)?;
@@ -100,6 +140,13 @@ impl Tool for KmsReadTool {
         // "no verification record" hint rather than a date-based
         // alarm so existing user-curated content isn't shouted at.
         let warning = staleness_warning(&body);
+        let full = input.get("full").and_then(Value::as_bool).unwrap_or(false);
+        let section = input
+            .get("section")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let body = fit_page(&body, section, full)?;
         let body = match warning {
             Some(w) => format!("{w}\n\n{body}"),
             None => body,
@@ -114,6 +161,101 @@ impl Tool for KmsReadTool {
             .to_string();
         Ok(format!("{body}{}", backlink_footer(&kref, &stem)))
     }
+}
+
+/// What one `KmsRead` of a page may put into context. A page has no
+/// size limit on disk — the largest in the vault this was measured on is
+/// 48.7 KB, 1.3 KB under the point where the agent spills a tool result
+/// to a file — and most questions need one section of it.
+const PAGE_READ_MAX_BYTES: usize = 16 * 1024;
+
+/// Opens the trailer of a cut page read. `KmsWrite` refuses content that
+/// carries it: a page written back from a cut read is a page cut in half.
+const CUT_MARK: &str = "[cut:";
+
+/// After a tool changes a knowledge base. The owner's rule (2026-09-19):
+/// writing is fine, writing unannounced is not. A rule in the prompt is
+/// forgotten by the time the answer is composed; this is the last thing
+/// the model reads before composing it, and it reaches `/dream`, workflows
+/// and subagents too, which never see the chat prelude.
+const TELL_USER: &str = "\n[Tell the user in your reply that you changed the knowledge base: which page, and what changed, in a line each.]";
+
+/// Largest index a char boundary at or below `max`.
+fn floor_boundary(s: &str, max: usize) -> usize {
+    let mut end = max.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
+fn heading(line: &str) -> Option<(usize, &str)> {
+    let t = line.trim_start();
+    let level = t.bytes().take_while(|b| *b == b'#').count();
+    ((1..=6).contains(&level) && t[level..].starts_with(' ')).then(|| (level, t[level..].trim()))
+}
+
+/// The whole page when it fits or was asked for whole; one section when
+/// one was named; otherwise the opening, cut at a line, followed by the
+/// page's own outline so the next read can name what it wants.
+fn fit_page(body: &str, section: Option<&str>, full: bool) -> Result<String> {
+    if let Some(want) = section {
+        let want = crate::kms::fold_for_compare(want);
+        let lines: Vec<&str> = body.lines().collect();
+        let start = lines.iter().position(|l| {
+            heading(l).is_some_and(|(_, t)| crate::kms::fold_for_compare(t).contains(&want))
+        });
+        let Some(start) = start else {
+            let have: Vec<&str> = lines
+                .iter()
+                .filter_map(|l| heading(l).map(|h| h.1))
+                .collect();
+            return Err(Error::Tool(format!(
+                "no section matching '{}' — this page has: {}",
+                section.unwrap_or_default(),
+                if have.is_empty() {
+                    "(no headings)".into()
+                } else {
+                    have.join(" · ")
+                }
+            )));
+        };
+        let level = heading(lines[start]).map(|h| h.0).unwrap_or(1);
+        let end = lines[start + 1..]
+            .iter()
+            .position(|l| heading(l).is_some_and(|(lv, _)| lv <= level))
+            .map(|i| start + 1 + i)
+            .unwrap_or(lines.len());
+        let text = lines[start..end].join("\n");
+        let cut = floor_boundary(&text, PAGE_READ_MAX_BYTES * 2);
+        return Ok(text[..cut].to_string());
+    }
+    if full || body.len() <= PAGE_READ_MAX_BYTES {
+        return Ok(body.to_string());
+    }
+    let mut cut = floor_boundary(body, PAGE_READ_MAX_BYTES);
+    if let Some(nl) = body[..cut].rfind('\n') {
+        cut = nl;
+    }
+    let outline: Vec<String> = body[cut..]
+        .lines()
+        .filter_map(heading)
+        .map(|(lv, t)| format!("{}- {t}", "  ".repeat(lv.saturating_sub(1))))
+        .collect();
+    let mut out = format!(
+        "{}\n\n{CUT_MARK} first {} KB of {} KB shown. Read one part with `section: \"<heading>\"`, \
+         or everything with `full: true`. This is NOT the whole page: never KmsWrite a page \
+         back from a cut read — read it with `full: true` first.",
+        &body[..cut],
+        cut / 1024,
+        body.len() / 1024
+    );
+    if outline.is_empty() {
+        out.push(']');
+    } else {
+        out.push_str(&format!(" Sections not shown:\n{}\n]", outline.join("\n")));
+    }
+    Ok(out)
 }
 
 /// Notes linking to `stem`, as a trailing line on a `KmsRead` result.
@@ -154,7 +296,12 @@ fn backlink_footer(kref: &crate::kms::KmsRef, stem: &str) -> String {
 /// and a truncation notice is prepended — the model gets the head of
 /// the document plus an explicit instruction on how to reach the rest,
 /// rather than a silently-clipped body it will treat as complete.
-fn read_source(kref: &crate::kms::KmsRef, name: &str) -> Result<String> {
+fn read_source(
+    kref: &crate::kms::KmsRef,
+    name: &str,
+    offset: usize,
+    section: Option<&str>,
+) -> Result<String> {
     let path = crate::kms::source_path(kref, name)?;
     let raw = std::fs::read_to_string(&path)
         .map_err(|e| Error::Tool(format!("read {}: {e}", path.display())))?;
@@ -163,19 +310,36 @@ fn read_source(kref: &crate::kms::KmsRef, name: &str) -> Result<String> {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| name.to_string());
     let header = format!("[source: sources/{file} — raw archived material, not curated]\n\n");
-    if raw.len() <= SOURCE_READ_MAX_BYTES {
+    // An ingested document is markdown as often as not, and a model that
+    // has just learned `section:` from a cut page uses it here too. It was
+    // ignored, so two reads asking for two sections each came back as the
+    // same first 16 KB. A source with no such heading says so, with the
+    // headings it does have, instead of answering a different question.
+    if let Some(want) = section {
+        return Ok(format!("{header}{}", fit_page(&raw, Some(want), false)?));
+    }
+    if offset == 0 && raw.len() <= SOURCE_READ_MAX_BYTES {
         return Ok(format!("{header}{raw}"));
     }
-    let mut end = SOURCE_READ_MAX_BYTES;
-    while end > 0 && !raw.is_char_boundary(end) {
-        end -= 1;
+    // A model echoes the offset it was given, but nothing makes it land on
+    // a character: round up rather than slice through one.
+    let mut start = offset.min(raw.len());
+    while start < raw.len() && !raw.is_char_boundary(start) {
+        start += 1;
     }
+    let end = start + floor_boundary(&raw[start..], SOURCE_READ_MAX_BYTES);
+    let rest = if end < raw.len() {
+        format!(
+            " Continue with `offset: {end}`, or go straight to the part you need with \
+             KmsSearch(kms, pattern: \"<term>\", scope: \"sources\")."
+        )
+    } else {
+        String::new()
+    };
     Ok(format!(
-        "{header}[truncated: showing first {} KB of {} KB. To reach the rest, \
-         KmsSearch(kms, pattern: \"<term>\", scope: \"sources\") for the section you need.]\n\n{}",
-        SOURCE_READ_MAX_BYTES / 1024,
-        raw.len() / 1024,
-        &raw[..end],
+        "{header}[bytes {start}–{end} of {}.{rest}]\n\n{}",
+        raw.len(),
+        &raw[start..end],
     ))
 }
 
@@ -183,7 +347,7 @@ fn read_source(kref: &crate::kms::KmsRef, name: &str) -> Result<String> {
 /// loop's `TOOL_RESULT_CONTEXT_LIMIT` (50 KB) so a source read lands
 /// in context whole instead of being spilled to disk with only a
 /// preview left behind.
-const SOURCE_READ_MAX_BYTES: usize = 40 * 1024;
+const SOURCE_READ_MAX_BYTES: usize = 16 * 1024;
 
 /// Inspect a page's frontmatter and return a one-line `[note: …]`
 /// banner if it looks stale or unverified. `verified: YYYY-MM-DD`
@@ -198,7 +362,16 @@ fn staleness_warning(body: &str) -> Option<String> {
     if fm.is_empty() {
         return None;
     }
+    // A research note is checked claim by claim as it is written. Ones
+    // from before that was recorded as `verified:` say so with `claims:`,
+    // and telling the model to distrust them contradicts the prompt that
+    // calls the base authoritative — on every read of every such page.
+    let checked_on_write = fm
+        .get("claims")
+        .and_then(|c| c.trim().parse::<u32>().ok())
+        .is_some_and(|n| n > 0);
     match fm.get("verified") {
+        None if checked_on_write => None,
         None => Some(
             "[note: this page has no `verified:` frontmatter — provenance is best-effort, treat factual claims with caution]"
                 .to_string(),
@@ -243,6 +416,10 @@ pub struct KmsSearchTool;
 
 #[async_trait]
 impl Tool for KmsSearchTool {
+    fn requires_gate(&self) -> Option<&'static str> {
+        Some(super::KMS_EXISTS_GATE)
+    }
+
     fn name(&self) -> &'static str {
         "KmsSearch"
     }
@@ -251,15 +428,19 @@ impl Tool for KmsSearchTool {
         "Search one knowledge base across BOTH layers — curated `pages/` \
          and raw archived `sources/`. Two modes, exactly one of which \
          must be provided:\n\
-         - `query`: natural-language BM25 search across title (×4 boost), \
-         topic (×2), and body. Returns ranked hits marked `[page]` or \
+         - `query`: ranked BM25 search across title, slug and aliases (×4 \
+         boost), topic (×2), and body. The default — use it first. Words \
+         match in any script; Thai, Chinese and Japanese match on any part \
+         of a word, as written. Returns ranked hits marked `[page]` or \
          `[source]` with snippet previews. Optional `tags` / `category` \
          filters narrow the candidate set. Requires the `kms_search_index` \
          feature build; falls back to regex with an advisory when \
          unavailable.\n\
-         - `pattern`: regex grep, returns matching lines as \
+         - `pattern`: case-insensitive regex grep, returns matching lines as \
          `pages/<stem>:line:text` or `sources/<file>:line:text`. Use for \
-         exact-shape lookups (a TODO marker, function name, error code).\n\
+         exact-shape lookups (a TODO marker, function name, error code, a \
+         regex). Output is budgeted; files past the budget are listed by name \
+         with their match counts.\n\
          Follow a `[source]` / `sources/…` hit with \
          `KmsRead(kind: \"source\", page: \"<stem>\")`. Use `scope` to \
          restrict a search to one layer; the default searches both."
@@ -351,8 +532,17 @@ const PATTERN_MATCHES_PER_FILE: usize = 12;
 /// unbounded — a `pattern: "."` against a KMS holding an ingested
 /// PDF returned the whole corpus into the model's context.
 const PATTERN_MATCHES_TOTAL: usize = 200;
-/// Matching lines longer than this are trimmed around the match.
+/// Matching lines longer than this many **bytes** are trimmed around the
+/// match. It was a character count, which for Thai is three times the
+/// bytes: 200 hits × 300 Thai characters came to 106 KB on a 39-page
+/// base, past the tool-result spill limit.
 const PATTERN_LINE_MAX: usize = 300;
+/// Byte budget for the matching lines of one search. Past it the search
+/// keeps going but reports only *which files* still match, so a page is
+/// never hidden by the pages that sort before it.
+const PATTERN_BYTES_TOTAL: usize = 8 * 1024;
+/// How many over-budget files are named before the rest are counted.
+const PATTERN_OVERFLOW_NAMES: usize = 60;
 
 /// Regex line-grep across `pages/` and (new) `sources/`. Hits are
 /// prefixed with their layer — `pages/<stem>:<line>:<text>` /
@@ -373,7 +563,19 @@ fn kms_search_pattern_scoped(
     pattern: &str,
     scope: SearchScope,
 ) -> Result<String> {
-    let re = Regex::new(pattern).map_err(|e| Error::Tool(format!("regex: {e}")))?;
+    // Case-insensitive: this is how a knowledge base gets looked up, and
+    // `(?-i)` is there for the rare exact-case search. A pattern that is
+    // not valid regex — a title with a parenthesis, `C++` — is searched
+    // literally rather than refused.
+    let re = regex::RegexBuilder::new(pattern)
+        .case_insensitive(true)
+        .build()
+        .or_else(|_| {
+            regex::RegexBuilder::new(&regex::escape(pattern))
+                .case_insensitive(true)
+                .build()
+        })
+        .map_err(|e| Error::Tool(format!("regex: {e}")))?;
 
     // (sort_key, rendered_line) so output orders by layer → stem →
     // line NUMBER. The old code sorted the rendered strings, which
@@ -382,6 +584,9 @@ fn kms_search_pattern_scoped(
     let mut total = 0usize;
     let mut truncated_files: Vec<String> = Vec::new();
     let mut capped = false;
+    let mut bytes = 0usize;
+    // (file, matching lines not shown) once the budget is spent.
+    let mut overflow: Vec<(String, usize)> = Vec::new();
 
     let mut scan = |label: &str,
                     layer: u8,
@@ -394,6 +599,7 @@ fn kms_search_pattern_scoped(
             return true;
         };
         let mut per_file = 0usize;
+        let mut unshown = 0usize;
         for (i, line) in contents.lines().enumerate() {
             if !re.is_match(line) {
                 continue;
@@ -402,15 +608,22 @@ fn kms_search_pattern_scoped(
                 truncated_files.push(label.to_string());
                 return true;
             }
-            if *total >= PATTERN_MATCHES_TOTAL {
-                return false;
+            // Out of room: keep scanning, but only count. Stopping here
+            // used to hide every file that sorts after the cut-off, and
+            // with the page list gone from the system prompt a hidden
+            // match is a page the model never learns exists.
+            if *total >= PATTERN_MATCHES_TOTAL || bytes >= PATTERN_BYTES_TOTAL {
+                unshown += 1;
+                continue;
             }
-            results.push((
-                (layer, sort_stem.clone(), i + 1),
-                format!("{label}:{}:{}", i + 1, trim_match_line(line, &re)),
-            ));
+            let rendered = format!("{label}:{}:{}", i + 1, trim_match_line(line, &re));
+            bytes += rendered.len() + 1;
+            results.push(((layer, sort_stem.clone(), i + 1), rendered));
             per_file += 1;
             *total += 1;
+        }
+        if unshown > 0 {
+            overflow.push((label.to_string(), unshown));
         }
         true
     };
@@ -504,6 +717,25 @@ fn kms_search_pattern_scoped(
             "[result cap {PATTERN_MATCHES_TOTAL} reached — narrow the pattern or set scope: \"pages\"]"
         ));
     }
+    if !overflow.is_empty() {
+        let more: usize = overflow.iter().map(|(_, n)| n).sum();
+        let mut names: Vec<String> = overflow
+            .iter()
+            .take(PATTERN_OVERFLOW_NAMES)
+            .map(|(label, n)| format!("{label} ({n})"))
+            .collect();
+        if overflow.len() > PATTERN_OVERFLOW_NAMES {
+            names.push(format!(
+                "… and {} more file(s)",
+                overflow.len() - PATTERN_OVERFLOW_NAMES
+            ));
+        }
+        out.push(format!(
+            "\n[output budget reached — {more} more matching line(s) not shown, in: {}. \
+             Read those files, or narrow the pattern / set scope: \"pages\".]",
+            names.join(", ")
+        ));
+    }
     Ok(out.join("\n"))
 }
 
@@ -513,22 +745,177 @@ fn kms_search_pattern_scoped(
 /// bytes of a minified blob.
 fn trim_match_line(line: &str, re: &Regex) -> String {
     let line = line.trim_end();
-    if line.chars().count() <= PATTERN_LINE_MAX {
+    if line.len() <= PATTERN_LINE_MAX {
         return line.to_string();
     }
     let hit = re.find(line).map(|m| m.start()).unwrap_or(0);
-    // Convert the byte offset to a char index, then window around it.
-    let hit_chars = line[..hit].chars().count();
-    let half = PATTERN_LINE_MAX / 2;
-    let start = hit_chars.saturating_sub(half);
-    let taken: String = line.chars().skip(start).take(PATTERN_LINE_MAX).collect();
+    // A byte window around the match, each end walked back to a
+    // character boundary — a Thai character is three bytes and a window
+    // edge lands inside one two times in three.
+    let mut start = hit.saturating_sub(PATTERN_LINE_MAX / 2);
+    while !line.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = (start + PATTERN_LINE_MAX).min(line.len());
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
     let lead = if start > 0 { "…" } else { "" };
-    let tail = if start + PATTERN_LINE_MAX < line.chars().count() {
-        "…"
-    } else {
-        ""
+    let tail = if end < line.len() { "…" } else { "" };
+    format!("{lead}{}{tail}", &line[start..end])
+}
+
+/// One result row for the KMS sidebar's search box.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UiHit {
+    /// `"page"` or `"source"`.
+    pub kind: &'static str,
+    /// What the viewer opens: the page stem, or the source's stem.
+    pub name: String,
+    /// The file as it is on disk, for display (`spec.txt`).
+    pub file: String,
+    pub title: String,
+    /// The line that matched, windowed around the match — not the page's
+    /// opening line, which says nothing about why this page came back.
+    pub snippet: String,
+}
+
+/// Search one KMS for the sidebar. Ranked when this build has the index;
+/// a literal scan otherwise, or when the index cannot be used — the box
+/// must never be the thing that says "search is unavailable". The second
+/// value is a note for the UI when the results are degraded.
+pub fn ui_search(
+    kref: &crate::kms::KmsRef,
+    query: &str,
+    limit: usize,
+) -> (Vec<UiHit>, Option<String>) {
+    let query = query.trim();
+    if query.chars().count() < 2 {
+        return (Vec::new(), None);
+    }
+    let limit = limit.clamp(1, 50);
+    // Any of the query's words, literally, for picking the line to show.
+    let words: Vec<String> = query.split_whitespace().map(regex::escape).collect();
+    let line_re =
+        regex::RegexBuilder::new(&format!("{}|{}", regex::escape(query), words.join("|")))
+            .case_insensitive(true)
+            .build()
+            .ok();
+    let path_of = |kind: &str, file: &str| match kind {
+        "page" => kref.pages_dir().join(format!("{file}.md")),
+        _ => kref.sources_dir().join(file),
     };
-    format!("{lead}{taken}{tail}")
+    let snippet_for = |kind: &str, file: &str, fallback: &str| -> String {
+        let Some(re) = line_re.as_ref() else {
+            return fallback.to_string();
+        };
+        std::fs::read_to_string(path_of(kind, file))
+            .ok()
+            .and_then(|raw| {
+                let (_, body) = crate::kms::parse_frontmatter(&raw);
+                body.lines()
+                    .map(str::trim)
+                    .find(|l| !l.starts_with('#') && re.is_match(l))
+                    .map(|l| trim_match_line(l, re))
+            })
+            .unwrap_or_else(|| fallback.to_string())
+    };
+    let stem_of = |file: &str| {
+        file.rsplit_once('.')
+            .map(|(s, _)| s.to_string())
+            .unwrap_or_else(|| file.to_string())
+    };
+
+    // A block, because `#[cfg]` is only stable on a statement, not on an
+    // `if` expression.
+    #[cfg(feature = "kms_search_index")]
+    {
+        let ranked = if kref.read_only() {
+            // A shared KMS is mounted read-only; its index cannot be built.
+            Err(crate::kms_search_index::IndexError::Busy)
+        } else {
+            crate::kms_search_index::ensure_fresh(&kref.root).and_then(|fresh| {
+                let idx = crate::kms_search_index::get_or_open(&kref.root)?;
+                Ok((fresh, idx.search(query, &[], None, limit)?))
+            })
+        };
+        if let Ok((fresh, found)) = ranked {
+            let hits = found
+                .into_iter()
+                .map(|h| {
+                    let kind = h.kind.as_str();
+                    let name = match h.kind {
+                        crate::kms_search_index::DocKind::Page => h.page.clone(),
+                        crate::kms_search_index::DocKind::Source => stem_of(&h.page),
+                    };
+                    UiHit {
+                        kind,
+                        snippet: snippet_for(kind, &h.page, &h.snippet_preview),
+                        title: h.title.unwrap_or_else(|| name.clone()),
+                        name,
+                        file: h.page,
+                    }
+                })
+                .collect();
+            let note = fresh
+                .busy
+                .then(|| "another thClaws process is updating the index — the newest edits may be missing".to_string());
+            return (hits, note);
+        }
+    }
+
+    // Literal scan: every file containing the whole query, most matches first.
+    let Some(re) = regex::RegexBuilder::new(&regex::escape(query))
+        .case_insensitive(true)
+        .build()
+        .ok()
+    else {
+        return (Vec::new(), None);
+    };
+    let mut scored: Vec<(usize, UiHit)> = Vec::new();
+    let mut scan = |kind: &'static str, file: String, path: std::path::PathBuf| {
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let count = re.find_iter(&raw).count();
+        if count == 0 {
+            return;
+        }
+        let (fm, _) = crate::kms::parse_frontmatter(&raw);
+        let name = if kind == "page" {
+            file.clone()
+        } else {
+            stem_of(&file)
+        };
+        scored.push((
+            count,
+            UiHit {
+                kind,
+                title: fm
+                    .get("title")
+                    .map(|t| t.trim().trim_matches('"').to_string())
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or_else(|| name.clone()),
+                snippet: snippet_for(kind, &file, ""),
+                name,
+                file,
+            },
+        ));
+    };
+    if let Some(listing) = crate::kms::browse(&kref.name) {
+        for p in listing.pages {
+            let path = kref.pages_dir().join(format!("{}.md", p.name));
+            scan("page", p.name, path);
+        }
+    }
+    for src in crate::kms::list_sources(kref) {
+        let file = src.file_name();
+        let path = kref.sources_dir().join(&file);
+        scan("source", file, path);
+    }
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
+    let hits = scored.into_iter().take(limit).map(|(_, h)| h).collect();
+    (hits, Some("unranked — literal matches only".to_string()))
 }
 
 /// BM25 path — only available when the `kms_search_index` Cargo
@@ -574,28 +961,27 @@ fn kms_search_query_path(
         .map(|n| n as usize)
         .unwrap_or(10);
 
-    // Auto-build-on-stale (Tier 3.A): if the manifest is missing or
-    // its index_version doesn't match the current binary, do a full
-    // rebuild from disk before serving. Cheap on first-touch
-    // (single rebuild per KMS per binary version); transparent on
-    // steady state (manifest hit → no rebuild).
-    let index_dir = kref.root.join(".index");
-    let needs_build = match read_manifest(&index_dir) {
-        Some(m) => m.index_version != crate::kms_search_index::INDEX_VERSION,
-        None => !index_dir.join("meta.json").exists(),
-    };
+    // Bring the index up to date with the disk first: a rebuild when it
+    // is from another index version (or has no manifest at all), otherwise
+    // only the files whose mtime or size changed — which is what makes a
+    // page edited in Obsidian findable. If the index cannot be used at all
+    // the search still answers, by literal grep, and says so.
     let mut advisory = String::new();
-    if needs_build {
-        match crate::kms_search_index::full_rebuild(&kref.root) {
-            Ok(n) => {
-                write_manifest(&index_dir);
-                advisory = format!("[index rebuilt — {n} page(s) indexed]\n\n");
+    match crate::kms_search_index::ensure_fresh(&kref.root) {
+        Ok(f) => {
+            if let Some(n) = f.rebuilt {
+                advisory = format!("[index rebuilt — {n} document(s) indexed]\n\n");
+            } else if f.busy {
+                advisory = "[another thClaws process is writing this index — results may miss \
+                            the latest edits]\n\n"
+                    .to_string();
             }
-            Err(e) => {
-                return Err(Error::Tool(format!(
-                    "KmsSearch: index rebuild failed: {e}\nFall back to `pattern:` or run /kms reindex"
-                )));
-            }
+        }
+        Err(e) => {
+            let grep = kms_search_pattern_scoped(kref, _kms_name, &regex::escape(query), scope)?;
+            return Ok(format!(
+                "[ranked search unavailable ({e}) — literal matches instead; /kms reindex to repair]\n\n{grep}"
+            ));
         }
     }
 
@@ -710,6 +1096,9 @@ pub fn run_slash_search(name: &str, query: &str, is_pattern: bool) -> String {
 }
 
 #[cfg(feature = "kms_search_index")]
+const HITS_BYTES_TOTAL: usize = 12 * 1024;
+
+#[cfg(feature = "kms_search_index")]
 fn format_hits(advisory: &str, hits: &[crate::kms_search_index::SearchHit]) -> String {
     if hits.is_empty() {
         return format!(
@@ -719,6 +1108,15 @@ fn format_hits(advisory: &str, hits: &[crate::kms_search_index::SearchHit]) -> S
     let mut out = String::new();
     out.push_str(advisory);
     for (i, h) in hits.iter().enumerate() {
+        // Measured in bytes: a Thai preview is three per character, so a
+        // count of hits says little about what lands in context.
+        if out.len() > HITS_BYTES_TOTAL {
+            out.push_str(&format!(
+                "\n… {} more hit(s) not shown — narrow the query.\n",
+                hits.len() - i
+            ));
+            break;
+        }
         if i > 0 {
             out.push('\n');
         }
@@ -752,36 +1150,6 @@ fn format_hits(advisory: &str, hits: &[crate::kms_search_index::SearchHit]) -> S
 /// index. Lives at `<kms_root>/.index/manifest.json`. Read on every
 /// query to decide whether to auto-rebuild; written after every
 /// full_rebuild.
-#[cfg(feature = "kms_search_index")]
-#[derive(serde::Serialize, serde::Deserialize)]
-struct IndexManifest {
-    index_version: u32,
-    /// Unix seconds (i64 for serde compat; never negative in practice).
-    last_full_rebuild_at: i64,
-}
-
-#[cfg(feature = "kms_search_index")]
-fn read_manifest(index_dir: &std::path::Path) -> Option<IndexManifest> {
-    let path = index_dir.join("manifest.json");
-    let raw = std::fs::read_to_string(&path).ok()?;
-    serde_json::from_str(&raw).ok()
-}
-
-#[cfg(feature = "kms_search_index")]
-fn write_manifest(index_dir: &std::path::Path) {
-    let _ = std::fs::create_dir_all(index_dir);
-    let manifest = IndexManifest {
-        index_version: crate::kms_search_index::INDEX_VERSION,
-        last_full_rebuild_at: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0),
-    };
-    if let Ok(json) = serde_json::to_string_pretty(&manifest) {
-        let _ = std::fs::write(index_dir.join("manifest.json"), json);
-    }
-}
-
 /// M6.25 BUG #1: write a KMS page. Create-or-replace; if the content
 /// includes YAML frontmatter (`---\n...\n---\n`), it's preserved and
 /// `updated:` is bumped to today. New pages get `created:` stamped.
@@ -823,13 +1191,12 @@ impl Tool for KmsWriteTool {
          verification record]` banner.\n\
          \n\
          `created:` / `updated:` are auto-stamped. The tool injects a \
-         canonical `# {title}\\nDescription: {topic}\\n---` block before \
-         the body so every page has a uniform header — DO NOT include \
-         that block yourself (it will be added automatically). If you \
-         intentionally want a different leading heading, write your own \
-         `# heading` as the body's first line and the tool will respect \
-         it. Missing `title:` falls back to the page filename; missing \
-         `topic:` skips the Description line."
+         `# {title}` heading before the body so every page has a \
+         uniform header — DO NOT write that heading yourself (it will \
+         be added automatically). If you intentionally want a different \
+         leading heading, write your own `# heading` as the body's \
+         first line and the tool will respect it. Missing `title:` \
+         falls back to the page filename."
     }
 
     fn input_schema(&self) -> Value {
@@ -838,7 +1205,7 @@ impl Tool for KmsWriteTool {
             "properties": {
                 "kms":     {"type": "string", "description": "KMS name (from the active list)"},
                 "page":    {"type": "string", "description": "Page name (with or without .md). No path separators."},
-                "content": {"type": "string", "description": "Full page content. Include YAML frontmatter with `title:`, `topic:`, AND `sources:` at the top; the body follows below. The tool auto-injects `# {title}\\nDescription: {topic}\\n---` before the body."}
+                "content": {"type": "string", "description": "Full page content. Include YAML frontmatter with `title:`, `topic:`, AND `sources:` at the top; the body follows below. The tool auto-injects a `# {title}` heading before the body."}
             },
             "required": ["kms", "page", "content"]
         })
@@ -870,12 +1237,36 @@ impl Tool for KmsWriteTool {
         // The `KmsRead` staleness banner is the second layer of the
         // same enforcement.
         let provenance_warning = check_provenance(content);
+        if content.contains(CUT_MARK) && content.contains("KB shown.") {
+            return Err(Error::Tool(
+                "this content carries the trailer of a cut KmsRead, so it is not the whole page. \
+                 Read the page with `full: true`, then write."
+                    .into(),
+            ));
+        }
+        let before = kref
+            .page_path(page)
+            .ok()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len() as usize)
+            .unwrap_or(0);
         let path = crate::kms::write_page(&kref, page, content)?;
-        let base = format!("wrote {} ({} bytes)", path.display(), content.len());
-        Ok(match provenance_warning {
-            Some(w) => format!("{base}\nwarning: {w}"),
-            None => base,
-        })
+        let mut base = format!("wrote {} ({} bytes)", path.display(), content.len());
+        // A rewrite from a partial read looks exactly like this. It can
+        // also be a real condensation, so it is said, not refused.
+        if before > PAGE_READ_MAX_BYTES && content.len() < before / 2 {
+            base.push_str(&format!(
+                "\nwarning: this replaced a {} KB page with {} KB. If you did not mean to drop \
+                 most of it, you wrote from a partial read — tell the user.",
+                before / 1024,
+                content.len() / 1024
+            ));
+        }
+        if let Some(w) = provenance_warning {
+            base.push_str(&format!("\nwarning: {w}"));
+        }
+        base.push_str(TELL_USER);
+        Ok(base)
     }
 }
 
@@ -887,6 +1278,10 @@ pub struct KmsWriteSourceTool;
 
 #[async_trait]
 impl Tool for KmsWriteSourceTool {
+    fn requires_gate(&self) -> Option<&'static str> {
+        Some(super::KMS_EXISTS_GATE)
+    }
+
     fn name(&self) -> &'static str {
         "KmsWriteSource"
     }
@@ -985,6 +1380,10 @@ pub struct KmsAppendTool;
 
 #[async_trait]
 impl Tool for KmsAppendTool {
+    fn requires_gate(&self) -> Option<&'static str> {
+        Some(super::KMS_EXISTS_GATE)
+    }
+
     fn name(&self) -> &'static str {
         "KmsAppend"
     }
@@ -1027,9 +1426,80 @@ impl Tool for KmsAppendTool {
         deny_if_read_only(&kref)?;
         let path = crate::kms::append_to_page(&kref, page, content)?;
         Ok(format!(
-            "appended {} bytes to {}",
+            "appended {} bytes to {}{TELL_USER}",
             content.len(),
             path.display()
+        ))
+    }
+}
+
+/// Change part of a page without resending the rest of it.
+pub struct KmsEditTool;
+
+#[async_trait]
+impl Tool for KmsEditTool {
+    fn requires_gate(&self) -> Option<&'static str> {
+        Some(super::KMS_EXISTS_GATE)
+    }
+
+    fn name(&self) -> &'static str {
+        "KmsEdit"
+    }
+
+    fn description(&self) -> &'static str {
+        "Replace one exact span of text in a knowledge-base page, leaving the rest \
+         untouched. Use it for any change smaller than the page: a corrected figure, \
+         a fixed typo, one rewritten paragraph, an entry added to or removed from \
+         `sources:` in the frontmatter. Prefer it to KmsWrite — it costs the span, \
+         not the page, and cannot drop what it does not mention. `old` must match the \
+         page text exactly (copy it from a KmsRead) and occur once; include enough \
+         surrounding text to make it unique."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "kms":  {"type": "string", "description": "KMS name"},
+                "page": {"type": "string", "description": "Page name (with or without .md)"},
+                "old":  {"type": "string", "description": "Exact text to replace, as it appears in the page"},
+                "new":  {"type": "string", "description": "Text to put in its place. Empty string deletes the span."},
+                "replace_all": {"type": "boolean", "description": "Replace every occurrence instead of requiring exactly one. Default false."}
+            },
+            "required": ["kms", "page", "old", "new"]
+        })
+    }
+
+    fn requires_approval(&self, _input: &Value) -> bool {
+        true
+    }
+
+    async fn call(&self, input: Value) -> Result<String> {
+        let kms_name = req_str(&input, "kms")?;
+        let page = req_str(&input, "page")?;
+        let old = req_str(&input, "old")?;
+        // `new` may legitimately be empty, which `req_str` rejects.
+        let new = input
+            .get("new")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Tool("missing `new`".into()))?;
+        let replace_all = input
+            .get("replace_all")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        crate::workflow::check_kms_write_capability(kms_name)?;
+        let Some(kref) = crate::kms::resolve(kms_name) else {
+            return Err(Error::Tool(format!(
+                "no KMS named '{kms_name}' (check /kms list)"
+            )));
+        };
+        deny_if_read_only(&kref)?;
+        let (path, n) = crate::kms::edit_page(&kref, page, old, new, replace_all)?;
+        Ok(format!(
+            "edited {} — {n} replacement(s), {} → {} bytes{TELL_USER}",
+            path.display(),
+            old.len() * n,
+            new.len() * n
         ))
     }
 }
@@ -1042,6 +1512,10 @@ pub struct KmsDeleteTool;
 
 #[async_trait]
 impl Tool for KmsDeleteTool {
+    fn requires_gate(&self) -> Option<&'static str> {
+        Some(super::KMS_EXISTS_GATE)
+    }
+
     fn name(&self) -> &'static str {
         "KmsDelete"
     }
@@ -1081,7 +1555,7 @@ impl Tool for KmsDeleteTool {
         };
         deny_if_read_only(&kref)?;
         let path = crate::kms::delete_page(&kref, page)?;
-        Ok(format!("deleted {}", path.display()))
+        Ok(format!("deleted {}{TELL_USER}", path.display()))
     }
 }
 
@@ -1297,6 +1771,170 @@ mod tests {
         }
     }
 
+    /// dev-plan/64 P2.4: what a page read costs is bounded in bytes, cut
+    /// on a line and never through a character, and the cut says how to
+    /// reach the rest.
+    #[test]
+    fn a_long_page_comes_back_cut_with_its_outline() {
+        let para = "ความฉลาดล้นเหลือ ".repeat(40);
+        let mut page = String::from("# หัวเรื่อง\n\n");
+        for i in 0..20 {
+            page.push_str(&format!("## ส่วนที่ {i}\n\n{para}\n\n"));
+        }
+        assert!(page.len() > PAGE_READ_MAX_BYTES * 2);
+
+        let cut = fit_page(&page, None, false).unwrap();
+        assert!(cut.len() < PAGE_READ_MAX_BYTES + 2_000, "{}", cut.len());
+        assert!(
+            cut.contains("section:") && cut.contains("full: true"),
+            "{cut}"
+        );
+        assert!(cut.contains("- ส่วนที่ 19"), "outline names what was cut");
+        assert!(!cut.contains("- ส่วนที่ 0\n"), "and not what was shown");
+
+        assert_eq!(fit_page(&page, None, true).unwrap(), page);
+
+        let one = fit_page(&page, Some("ส่วนที่ 7"), false).unwrap();
+        assert!(one.starts_with("## ส่วนที่ 7\n"), "{one}");
+        assert!(!one.contains("ส่วนที่ 8"), "stops at the next heading");
+
+        let err = fit_page(&page, Some("ไม่มี"), false).unwrap_err().to_string();
+        assert!(err.contains("ส่วนที่ 3"), "a miss lists the headings: {err}");
+
+        let short = "# T\n\nbody\n";
+        assert_eq!(fit_page(short, None, false).unwrap(), short);
+    }
+
+    /// dev-plan/64 P2.5: no knowledge base, no knowledge-base tools in the
+    /// request — except the two that make the first one. Making it brings
+    /// the rest in without rebuilding the registry.
+    #[test]
+    fn kms_tools_appear_once_a_kms_exists() {
+        let _home = scoped_home();
+        let mut reg = crate::tools::ToolRegistry::new();
+        reg.register(std::sync::Arc::new(KmsReadTool));
+        reg.register(std::sync::Arc::new(KmsSearchTool));
+        reg.register(std::sync::Arc::new(KmsAppendTool));
+        reg.register(std::sync::Arc::new(KmsEditTool));
+        reg.register(std::sync::Arc::new(KmsDeleteTool));
+        reg.register(std::sync::Arc::new(KmsWriteSourceTool));
+        reg.register(std::sync::Arc::new(KmsWriteTool));
+        reg.register(std::sync::Arc::new(KmsCreateTool));
+        let names = |r: &crate::tools::ToolRegistry| -> Vec<String> {
+            r.tool_defs().into_iter().map(|d| d.name).collect()
+        };
+        assert_eq!(names(&reg), vec!["KmsCreate", "KmsWrite"]);
+        create("nb", KmsScope::Project).unwrap();
+        assert_eq!(names(&reg).len(), 8);
+    }
+
+    /// A page read back cut must not be written back cut. `/dream` and
+    /// `/kms maintain` read a page, change one frontmatter line and write
+    /// the whole page: with a 16 KB read cap that halves a 35 KB page.
+    #[tokio::test]
+    async fn a_cut_read_cannot_be_written_back() {
+        let _home = scoped_home();
+        let k = create("nb", KmsScope::Project).unwrap();
+        let long = format!(
+            "---\ntitle: L\nsources: []\n---\n\n## a\n\n{}\n\n## b\n\ntail\n",
+            "ก".repeat(12_000)
+        );
+        std::fs::write(k.pages_dir().join("long.md"), &long).unwrap();
+
+        let cut = KmsReadTool
+            .call(json!({"kms": "nb", "page": "long"}))
+            .await
+            .unwrap();
+        assert!(
+            cut.contains("never KmsWrite a page back from a cut read"),
+            "{}",
+            &cut[cut.len() - 400..]
+        );
+        let err = KmsWriteTool
+            .call(json!({"kms": "nb", "page": "long", "content": cut}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("full: true"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(k.pages_dir().join("long.md")).unwrap(),
+            long
+        );
+
+        // Dropping the trailer gets past the guard; the result still says
+        // what happened, and says to tell the user.
+        let out = KmsWriteTool
+            .call(json!({"kms": "nb", "page": "long", "content": "---\ntitle: L\nsources: []\n---\n\nshort\n"}))
+            .await
+            .unwrap();
+        assert!(out.contains("replaced a 35 KB page with 0 KB"), "{out}");
+        assert!(out.contains("Tell the user"), "{out}");
+
+        // Prompts older than `kind: "index"` ask for it as a page.
+        let idx = KmsReadTool
+            .call(json!({"kms": "nb", "page": "index"}))
+            .await
+            .unwrap();
+        assert!(idx.contains("nb") && idx.contains("page(s)"), "{idx}");
+    }
+
+    #[tokio::test]
+    async fn kms_edit_changes_one_span_and_nothing_else() {
+        let _home = scoped_home();
+        let k = create("nb", KmsScope::Project).unwrap();
+        let tail = "ท้ายหน้า ".repeat(3_000);
+        let page = format!(
+            "---\ntitle: Baumol\nsources: [\"sess-dead\", \"sess-live\"]\nupdated: 2026-01-01\n---\n\n# Baumol\n\nตอนนั้น waktu ผ่านไป และ 50.9% ยังไต่ขึ้น\n\n{tail}\n"
+        );
+        std::fs::write(k.pages_dir().join("baumol.md"), &page).unwrap();
+        let edit = |old: &str, new: &str| {
+            KmsEditTool.call(json!({"kms": "nb", "page": "baumol", "old": old, "new": new}))
+        };
+
+        let out = edit("waktu", "เวลา").await.unwrap();
+        assert!(
+            out.contains("1 replacement") && out.contains("Tell the user"),
+            "{out}"
+        );
+        // The job `/dream` does by rewriting the page: drop one dead source.
+        edit("\"sess-dead\", ", "").await.unwrap();
+
+        let now = std::fs::read_to_string(k.pages_dir().join("baumol.md")).unwrap();
+        assert!(now.contains("ตอนนั้น เวลา ผ่านไป") && !now.contains("waktu"));
+        assert!(
+            now.contains("sess-live") && !now.contains("sess-dead"),
+            "{now}"
+        );
+        assert!(
+            now.contains(tail.trim_end()),
+            "a 27 KB tail it never saw is intact"
+        );
+        assert!(
+            !now.contains("updated: 2026-01-01"),
+            "updated: moves to today"
+        );
+
+        let twice = edit("ท้ายหน้า", "x").await.unwrap_err().to_string();
+        assert!(twice.contains("3000 times"), "{twice}");
+        let none = edit("ไม่มีข้อความนี้", "x").await.unwrap_err().to_string();
+        assert!(none.contains("does not occur"), "{none}");
+        assert!(edit("x", "y").await.is_err());
+        assert_eq!(
+            std::fs::read_to_string(k.pages_dir().join("baumol.md")).unwrap(),
+            now
+        );
+    }
+
+    #[test]
+    fn a_note_checked_on_write_is_not_called_unverified() {
+        let research = "---\ntitle: T\nclaims: 4\nsources: [1, 2]\n---\nbody\n";
+        assert_eq!(staleness_warning(research), None);
+        let hand = "---\ntitle: T\n---\nbody\n";
+        assert!(staleness_warning(hand).unwrap().contains("no `verified:`"));
+        let old = "---\ntitle: T\nclaims: 4\nverified: 2020-01-01\n---\nbody\n";
+        assert!(staleness_warning(old).unwrap().contains("days ago"));
+    }
+
     #[tokio::test]
     async fn read_rejects_unknown_kind() {
         let _home = scoped_home();
@@ -1320,13 +1958,75 @@ mod tests {
             .call(json!({"kms": "nb", "page": "big", "kind": "source"}))
             .await
             .unwrap();
-        assert!(out.contains("truncated"), "{out}");
-        assert!(out.contains("scope: "), "no recovery hint: {out}");
+        assert!(out.contains("bytes 0–16384 of 200000"), "{}", &out[..300]);
+        assert!(out.contains("scope: "), "no recovery hint: {}", &out[..300]);
         assert!(
-            out.len() < 60_000,
+            out.len() < 17_000,
             "exceeded the read cap: {} bytes",
             out.len()
         );
+
+        // dev-plan/64 P2.4: the rest of a long source is reachable. It used
+        // to be the first 40 KB or nothing — for an HTML dump, the site's
+        // navigation. An offset that lands inside a character rounds up.
+        // A name cut at the archive's length limit, asked for uncut.
+        let cut_name =
+            "gdcatalog-go-th-dataset-tags-e0-b8-84-e0-b8-a7-e0-b8-b2-e0-b8-a1-e0-b8-a2-e0-b8-";
+        std::fs::write(
+            k.sources_dir().join(format!("{cut_name}.md")),
+            "ครัวเรือนยากจนแฝง",
+        )
+        .unwrap();
+        let got = KmsReadTool
+            .call(json!({"kms": "nb", "page": format!("{cut_name}a1-e0-b8-88-e0-b8-99"), "kind": "source"}))
+            .await
+            .unwrap();
+        assert!(got.contains("ครัวเรือนยากจนแฝง"), "{got}");
+        assert!(
+            KmsReadTool
+                .call(json!({"kms": "nb", "page": "bigger-than-big", "kind": "source"}))
+                .await
+                .is_err(),
+            "a short stem is a coincidence, not a cut"
+        );
+
+        // A section of a markdown source, not its first 16 KB again.
+        let md = format!(
+            "# Doc\n\n## 9.0 ก่อน\n\n{}\n\n## 9.1 Baumol กลับหัว\n\nเนื้อหา 9.1\n\n## 9.2 หลัง\n\nx\n",
+            "ก".repeat(10_000)
+        );
+        std::fs::write(k.sources_dir().join("doc.md"), md).unwrap();
+        let sec = KmsReadTool
+            .call(json!({"kms": "nb", "page": "doc.md", "kind": "source", "section": "9.1"}))
+            .await
+            .unwrap();
+        assert!(
+            sec.contains("เนื้อหา 9.1") && !sec.contains("9.2 หลัง"),
+            "{sec}"
+        );
+        assert!(sec.len() < 500, "{}", sec.len());
+        let miss = KmsReadTool
+            .call(json!({"kms": "nb", "page": "doc.md", "kind": "source", "section": "ไม่มีหัวข้อนี้"}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(miss.contains("9.1 Baumol"), "{miss}");
+
+        std::fs::write(k.sources_dir().join("th.txt"), "ก".repeat(20_000)).unwrap();
+        let next = KmsReadTool
+            .call(json!({"kms": "nb", "page": "th", "kind": "source", "offset": 16_384}))
+            .await
+            .unwrap();
+        assert!(
+            next.contains("bytes 16386–32769 of 60000"),
+            "{}",
+            &next[..300]
+        );
+        let last = KmsReadTool
+            .call(json!({"kms": "nb", "page": "th", "kind": "source", "offset": 59_000}))
+            .await
+            .unwrap();
+        assert!(!last.contains("Continue with"), "{}", &last[..300]);
     }
 
     #[tokio::test]
@@ -1573,6 +2273,116 @@ mod tests {
             "single-KMS search should not print the multi-KMS header: {out}",
         );
         assert!(out.contains("p:1:find-me here"), "missing hit: {out}");
+    }
+
+    /// A Thai search must fit in the context window AND name every page
+    /// that matched. The caps used to be in characters, so a common Thai
+    /// word returned 106 KB on a 39-page base; and the search simply
+    /// stopped at its cap, so pages that sort late were never mentioned.
+    #[tokio::test]
+    async fn a_thai_pattern_search_is_bounded_and_names_every_matching_page() {
+        let _home = scoped_home();
+        let k = create("th", KmsScope::User).unwrap();
+        // Forty pages, each with several long Thai lines that match.
+        let line = format!("{} ความฉลาด {}", "ก".repeat(200), "ข".repeat(200));
+        for i in 0..40 {
+            let body = std::iter::repeat(line.as_str())
+                .take(6)
+                .collect::<Vec<_>>()
+                .join("\n");
+            std::fs::write(k.pages_dir().join(format!("page-{i:02}.md")), body).unwrap();
+        }
+        let out = kms_search_pattern_scoped(&k, "th", "ความฉลาด", SearchScope::Pages).unwrap();
+
+        assert!(
+            out.len() < 2 * PATTERN_BYTES_TOTAL,
+            "unbounded result: {} bytes",
+            out.len()
+        );
+        for i in 0..40 {
+            assert!(
+                out.contains(&format!("pages/page-{i:02}")),
+                "page-{i:02} matched and was never mentioned:\n{out}"
+            );
+        }
+        assert!(out.contains("output budget reached"), "{out}");
+        // Every shown line is windowed around the match, on a char boundary.
+        assert!(out.contains("ความฉลาด"), "{out}");
+    }
+
+    /// The sidebar's search box: finds text *inside* pages and sources,
+    /// in Thai written without spaces, and shows the line that matched.
+    /// It has to work in every build — ranked when the index feature is
+    /// compiled in, a literal scan when it is not.
+    #[tokio::test]
+    async fn the_sidebar_search_finds_thai_inside_pages_and_sources() {
+        let _home = scoped_home();
+        let k = create("th", KmsScope::User).unwrap();
+        std::fs::write(
+            k.pages_dir().join("labour-law.md"),
+            "---\ntitle: กฎหมายแรงงานไทย\n---\n\n# กฎหมายแรงงานไทย\n\nบทนำทั่วไปของหน้า\n\nนายจ้างต้องจ่ายค่าล่วงเวลาแก่ลูกจ้างตามกฎหมาย\n",
+        )
+        .unwrap();
+        std::fs::write(k.pages_dir().join("weather.md"), "ฝนตกหนักในภาคใต้\n").unwrap();
+        std::fs::create_dir_all(k.sources_dir()).unwrap();
+        std::fs::write(
+            k.sources_dir().join("ministry-report.txt"),
+            "รายงานกระทรวง: อัตราค่าล่วงเวลาปี 2569\n",
+        )
+        .unwrap();
+
+        let (hits, note) = ui_search(&k, "ค่าล่วงเวลา", 30);
+        let mut found: Vec<(&str, &str)> = hits.iter().map(|h| (h.kind, h.name.as_str())).collect();
+        found.sort();
+        assert_eq!(
+            found,
+            vec![("page", "labour-law"), ("source", "ministry-report")]
+        );
+
+        let page = hits.iter().find(|h| h.kind == "page").unwrap();
+        assert_eq!(page.title, "กฎหมายแรงงานไทย");
+        assert!(
+            page.snippet.contains("ค่าล่วงเวลา"),
+            "snippet must be the matching line, not the page's first: {:?}",
+            page.snippet
+        );
+        // A source opens by its stem; the extension is for display.
+        let src = hits.iter().find(|h| h.kind == "source").unwrap();
+        assert_eq!(
+            (src.name.as_str(), src.file.as_str()),
+            ("ministry-report", "ministry-report.txt")
+        );
+
+        if cfg!(feature = "kms_search_index") {
+            assert!(note.is_none(), "{note:?}");
+        } else {
+            assert!(note.is_some_and(|n| n.contains("unranked")));
+        }
+        // One character is not a search; neither is nothing.
+        assert!(ui_search(&k, "ค", 30).0.is_empty());
+        assert!(ui_search(&k, "  ", 30).0.is_empty());
+        assert!(ui_search(&k, "ไม่มีคำนี้ในคลัง", 30).0.is_empty());
+        #[cfg(feature = "kms_search_index")]
+        crate::kms_search_index::drop_cached(&k.root);
+    }
+
+    /// Case should not decide whether a note is found, and a query that
+    /// is not valid regex is a literal, not an error.
+    #[tokio::test]
+    async fn pattern_search_ignores_case_and_survives_bad_regex() {
+        let _home = scoped_home();
+        let k = create("notes", KmsScope::User).unwrap();
+        std::fs::write(k.pages_dir().join("p.md"), "Jevons Paradox (1865) and C++").unwrap();
+        let hit = |p: &str| kms_search_pattern_scoped(&k, "notes", p, SearchScope::Pages).unwrap();
+        assert!(
+            hit("jevons paradox").contains("pages/p:1"),
+            "case-insensitive"
+        );
+        assert!(
+            hit("Paradox (1865").contains("pages/p:1"),
+            "unbalanced paren is literal"
+        );
+        assert!(hit("C++").contains("pages/p:1"), "`C++` is literal");
     }
 
     #[tokio::test]

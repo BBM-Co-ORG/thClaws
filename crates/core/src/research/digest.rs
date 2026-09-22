@@ -8,7 +8,7 @@
 //! `<kms>/.research/digests/` so a re-run on a neighbouring query never
 //! pays for the same page twice.
 
-use super::llm_calls::{oneshot, ResearchSource};
+use super::llm_calls::ResearchSource;
 use super::pipeline::{ResearchTools, SearchHit};
 use crate::cancel::CancelToken;
 use crate::error::Result;
@@ -98,19 +98,26 @@ pub fn build_digest_prompt(
     known_slugs: &[String],
     language: &str,
 ) -> String {
-    let mut s = String::new();
-    s.push_str(&format!(
+    build_digest_prompt_split(query, src, known_slugs, language).joined()
+}
+
+/// The digest prompt, shared part first (see [`super::SplitPrompt`]): the
+/// instructions, the known slugs and the output contract are the same for
+/// every source of a run, and only the source itself differs.
+pub fn build_digest_prompt_split(
+    query: &str,
+    src: &ResearchSource,
+    known_slugs: &[String],
+    language: &str,
+) -> super::SplitPrompt {
+    let mut s = format!(
         "Research query: {query}\n{}\n\n\
          You are extracting structured knowledge from ONE web source so it can \
-         be filed into a zettelkasten (one note per idea). Read the source and \
-         output what it actually says — nothing from your own knowledge.\n\n\
-         === SOURCE [{}] ===\nTitle: {}\nURL: {}\n\n{}\n\n",
+         be filed into a zettelkasten (one note per idea). The source comes in the \
+         message. Read it and output what it actually says — nothing from your own \
+         knowledge.\n\n",
         super::today_context(),
-        src.index,
-        src.title,
-        src.url,
-        head_chars(&src.body, DIGEST_BODY_CHARS)
-    ));
+    );
     if !known_slugs.is_empty() {
         s.push_str("=== Notes that already exist in the knowledge base (slugs) ===\n");
         for k in known_slugs.iter().take(80) {
@@ -132,7 +139,7 @@ pub fn build_digest_prompt(
          Rules:\n\
          - At most {} claims; take every load-bearing fact (definitions, numbers, dates, rules, attributions, comparisons, who-did-what) — a rich article should yield close to the cap, a thin one a few. Keep `text` under 20 words.\n\
          - Output compact JSON on one line per claim; no explanations.\n\
-         - `quote` MUST be copied character-for-character from the source text above. Do not paraphrase, do not translate, do not merge two passages. If you cannot find a verbatim span, omit the claim.\n\
+         - `quote` MUST be copied character-for-character from the source text in the message. Do not paraphrase, do not translate, do not merge two passages. If you cannot find a verbatim span, omit the claim.\n\
          - Entity slugs: the idea's own name, stable across sources (`labour-protection-act-2541`, `overtime-pay`, `andrej-karpathy`). Reuse an existing slug from the list above when it is the same thing.\n\
          - `links_to_known`: existing slugs this source substantively discusses.\n\
          - If the source is navigation, a listing, or off-topic, output {{\"entities\": [], \"claims\": [], \"links_to_known\": []}}.\n\
@@ -140,7 +147,16 @@ pub fn build_digest_prompt(
         MAX_CLAIMS_PER_SOURCE,
         super::language_rule(language)
     ));
-    s
+    let item = format!(
+        "=== SOURCE [{}] ===\nTitle: {}\nURL: {}\n\n{}\n\n\
+         === END OF SOURCE ===\nOutput the JSON now. Every `quote` is copied \
+         character-for-character from the source above; no fence, no commentary.",
+        src.index,
+        src.title,
+        src.url,
+        head_chars(&src.body, DIGEST_BODY_CHARS)
+    );
+    super::SplitPrompt { shared: s, item }
 }
 
 // ── Parsing + verification ───────────────────────────────────────────
@@ -287,12 +303,61 @@ pub fn quote_check(body_norm: &str, quote: &str) -> bool {
     !q.is_empty() && body_norm.contains(&q)
 }
 
+/// The form two strings are compared in when deciding whether a quote
+/// really appears in a source (and whether two claims are the same).
+///
+/// NFC plus "drop whitespace" looked sufficient and is not, for Thai:
+/// - NFC does **not** order a Thai above-vowel and a tone mark — above
+///   vowels have combining class 0 — so `เกิ่ย` typed vowel-first and
+///   tone-first stay different strings. Keyboards, PDF extraction and OCR
+///   produce both, and a claim whose quote disagreed with its source on
+///   that was dropped as unverifiable, silently.
+/// - U+200B and friends are not `White_Space`. Thai web pages and PDFs are
+///   full of zero-width spaces as line-break hints; a model transcribing
+///   what it sees leaves them out.
+/// - A source that prints `๒๕๖๙` and a quote that says `2569`.
 pub fn normalize_for_match(s: &str) -> String {
     use unicode_normalization::UnicodeNormalization;
-    s.nfc()
-        .filter(|c| !c.is_whitespace())
-        .flat_map(|c| c.to_lowercase())
-        .collect()
+    let mut out = String::with_capacity(s.len());
+    // A run of Thai combining marks waiting to be put in one order.
+    let mut marks: Vec<char> = Vec::new();
+    let flush = |marks: &mut Vec<char>, out: &mut String| {
+        marks.sort_by_key(|c| thai_mark_rank(*c));
+        out.extend(marks.drain(..));
+    };
+    for c in s.nfc() {
+        if c.is_whitespace()
+            || matches!(
+                c,
+                '\u{200B}'..='\u{200F}' | '\u{2060}' | '\u{00AD}' | '\u{FEFF}'
+            )
+        {
+            continue;
+        }
+        if thai_mark_rank(c) > 0 {
+            marks.push(c);
+            continue;
+        }
+        flush(&mut marks, &mut out);
+        match c {
+            '๐'..='๙' => out.push(char::from(b'0' + (c as u32 - '๐' as u32) as u8)),
+            _ => out.extend(c.to_lowercase()),
+        }
+    }
+    flush(&mut marks, &mut out);
+    out
+}
+
+/// 0 for anything that is not a Thai combining mark; otherwise the
+/// position it takes in a run: vowel signs, then tone marks, then the
+/// rest. The sort is stable, so marks of one rank keep their order.
+pub(crate) fn thai_mark_rank(c: char) -> u8 {
+    match c {
+        '\u{0E31}' | '\u{0E34}'..='\u{0E3A}' | '\u{0E47}' => 1,
+        '\u{0E48}'..='\u{0E4B}' => 2,
+        '\u{0E4C}'..='\u{0E4E}' => 3,
+        _ => 0,
+    }
 }
 
 fn strip_json_fences(raw: &str) -> &str {
@@ -311,12 +376,28 @@ pub fn extract_json(raw: &str, open: char, close: char) -> &str {
     }
 }
 
+/// Kebab-case a name into something usable as a KMS page name and as a
+/// wikilink target.
+///
+/// Non-ASCII letters are kept, not dropped. Keeping only ASCII turned any
+/// name written entirely in Thai (or CJK, Arabic, …) into the empty
+/// string, and empty is the one page name the KMS refuses — so ingesting
+/// a Thai document as atomic notes died on `invalid page name ''`, and
+/// every Thai entity was silently filtered out of the graph before that.
+/// `kms::sanitize_alias` had the same bug and was fixed the same way; the
+/// KMS has never required ASCII. Thai in particular cannot be filtered
+/// character-class by character-class. Rust counts Thai vowel signs as
+/// alphabetic but not the tone marks (U+0E48–0E4B) or thanthakhat
+/// (U+0E4C), so a filter on `is_alphabetic()` / `is_alphanumeric()` does
+/// not blank a Thai word — it quietly turns it into a different one:
+/// `ก้าวหน้า` becomes `กาวหนา`, and `ก้าว` ("step") now equals `กาว`
+/// ("glue").
 pub fn sanitize_slug(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut last_dash = true;
     for c in raw.trim().chars() {
         let c = c.to_ascii_lowercase();
-        if c.is_ascii_alphanumeric() {
+        if c.is_ascii_alphanumeric() || (!c.is_ascii() && !c.is_whitespace() && !c.is_control()) {
             out.push(c);
             last_dash = false;
         } else if !last_dash {
@@ -345,13 +426,39 @@ fn cache_dir(kref: &KmsRef) -> PathBuf {
     kref.root.join(".research").join("digests")
 }
 
+/// Where a digest of `url` is cached.
+///
+/// The readable part is the archive name; the key is a hash of the
+/// **whole** URL. The archive name alone was the key before, and it is
+/// lossy on purpose — a local document's five `#part-N` windows all map
+/// to its one archive, and a Thai URL path has nothing ASCII to keep — so
+/// five windows raced onto one file (the survivor held 13 of a run's 67
+/// claims) and every Thai Wikipedia article shared `th-wikipedia-org-wiki`.
 pub fn cache_path(kref: &KmsRef, url: &str) -> PathBuf {
+    cache_dir(kref).join(format!(
+        "{}-{}.json",
+        super::kms_writer::url_to_filename(url),
+        super::kms_writer::short_hash(url)
+    ))
+}
+
+/// The pre-hash location, read so caches written by older builds still hit.
+fn legacy_cache_path(kref: &KmsRef, url: &str) -> PathBuf {
     cache_dir(kref).join(format!("{}.json", super::kms_writer::url_to_filename(url)))
 }
 
+/// A cached digest of exactly this URL.
+///
+/// The `d.url == url` check is not belt-and-braces: a legacy file is
+/// shared by every URL that collapsed to its name, and serving it
+/// unchecked attributed one article's claims to another with nothing to
+/// show for it. A mismatch is a miss.
 pub fn load_cached(kref: &KmsRef, url: &str) -> Option<Digest> {
-    let raw = std::fs::read_to_string(cache_path(kref, url)).ok()?;
-    serde_json::from_str(&raw).ok()
+    [cache_path(kref, url), legacy_cache_path(kref, url)]
+        .into_iter()
+        .filter_map(|p| std::fs::read_to_string(p).ok())
+        .filter_map(|raw| serde_json::from_str::<Digest>(&raw).ok())
+        .find(|d| d.url == url)
 }
 
 pub fn store_cached(kref: &KmsRef, d: &Digest) -> Result<()> {
@@ -359,7 +466,7 @@ pub fn store_cached(kref: &KmsRef, d: &Digest) -> Result<()> {
     std::fs::create_dir_all(&dir)
         .map_err(|e| crate::error::Error::Tool(format!("create {}: {e}", dir.display())))?;
     let path = cache_path(kref, &d.url);
-    std::fs::write(&path, serde_json::to_string_pretty(d).unwrap_or_default())
+    crate::kms::write_file(&path, serde_json::to_string_pretty(d).unwrap_or_default())
         .map_err(|e| crate::error::Error::Tool(format!("write {}: {e}", path.display())))
 }
 
@@ -441,7 +548,18 @@ pub async fn fetch_many(tools: &Arc<dyn ResearchTools>, hits: Vec<SearchHit>) ->
             let _p = sem.acquire().await;
             let body = match tokio::time::timeout(FETCH_TIMEOUT, tools.fetch(&hit.url)).await {
                 Ok(Ok(b)) if !b.trim().is_empty() => b,
-                Ok(_) => hit.snippet.clone(),
+                // Silent until now: a refusal fell back to the search
+                // snippet with no trace, so a whole source could be
+                // digested — and quote-checked — against one paragraph
+                // while the run looked entirely healthy.
+                Ok(Ok(_)) => {
+                    eprintln!("[research] fetch returned an empty body: {}", hit.url);
+                    hit.snippet.clone()
+                }
+                Ok(Err(e)) => {
+                    eprintln!("[research] fetch failed ({e}): {}", hit.url);
+                    hit.snippet.clone()
+                }
                 Err(_) => {
                     eprintln!(
                         "[research] fetch timed out ({}s): {}",
@@ -511,10 +629,19 @@ pub async fn digest_many(context: DigestBatch<'_>) -> Vec<Digest> {
             }
             let waited = std::time::Instant::now();
             let _p = sem.acquire().await;
-            let prompt = build_digest_prompt(&query, &src, &known, &language);
-            let prompt_chars = prompt.chars().count();
+            let prompt = build_digest_prompt_split(&query, &src, &known, &language);
+            let prompt_chars = prompt.shared.chars().count() + prompt.item.chars().count();
             let t = std::time::Instant::now();
-            let d = match oneshot(provider.as_ref(), &model, prompt, timeout, &cancel).await {
+            let d = match super::llm_calls::oneshot_split(
+                provider.as_ref(),
+                &model,
+                prompt,
+                timeout,
+                &cancel,
+                super::llm_calls::CallKind::Mechanical,
+            )
+            .await
+            {
                 Ok(raw) => {
                     eprintln!(
                         "[research] digest [{}] {}: {} chars in → {} chars out, {:.1}s (queued {:.1}s, model {})",
@@ -554,6 +681,23 @@ fn rebase_claim_ids(d: &mut Digest, index: u32) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_digest_of_a_run_shares_one_opening() {
+        let src = |i: u32, body: &str| ResearchSource {
+            index: i,
+            title: format!("T{i}"),
+            url: format!("https://s{i}"),
+            body: body.into(),
+        };
+        let known = vec!["alpha".to_string()];
+        let a = build_digest_prompt_split("q", &src(1, "first body"), &known, "th");
+        let b = build_digest_prompt_split("q", &src(2, "second body"), &known, "th");
+        assert_eq!(a.shared, b.shared);
+        assert!(a.shared.contains("Output STRICT JSON") && a.shared.contains("- alpha"));
+        assert!(!a.shared.contains("first body"));
+        assert!(a.item.contains("first body") && a.item.contains("URL: https://s1"));
+    }
+
     use super::*;
 
     fn src(body: &str) -> ResearchSource {
@@ -623,11 +767,57 @@ mod tests {
         assert!(!wants_recent("Alibaba AI Labs founding 2017", "2026"));
     }
 
+    /// A quote that is in the source must verify, however the two copies
+    /// happen to be encoded. Each of these used to drop a valid claim,
+    /// silently — the only trace was an integer in the run log.
+    #[test]
+    fn a_thai_quote_verifies_across_encodings() {
+        // Same syllable, above-vowel and tone mark typed in either order.
+        // NFC leaves these different: the vowel is combining class 0.
+        let vowel_first = "เก\u{0E34}\u{0E48}ย";
+        let tone_first = "เก\u{0E48}\u{0E34}ย";
+        assert_ne!(vowel_first, tone_first);
+        assert_eq!(
+            normalize_for_match(vowel_first),
+            normalize_for_match(tone_first)
+        );
+
+        // Zero-width spaces as line-break hints, as Thai web text has them.
+        let body = normalize_for_match("มาตรฐาน\u{200B}การ\u{200B}ครองชีพ ของครัวเรือน");
+        assert!(quote_check(&body, "มาตรฐานการครองชีพ"));
+
+        // Thai digits in the source, Arabic in the quote.
+        let body = normalize_for_match("พ.ศ. ๒๕๖๙ ค่าจ้างขั้นต่ำ ๔๐๐ บาท");
+        assert!(quote_check(&body, "2569"));
+        assert!(quote_check(&body, "ค่าจ้างขั้นต่ำ 400 บาท"));
+
+        // And it must not start matching things that are not there.
+        assert!(!quote_check(&body, "ค่าจ้างขั้นต่ำ 500 บาท"));
+        // Tone marks are kept: step ≠ glue.
+        assert_ne!(normalize_for_match("ก้าว"), normalize_for_match("กาว"));
+    }
+
     #[test]
     fn slug_sanitizer() {
         assert_eq!(sanitize_slug("  Andrej Karpathy! "), "andrej-karpathy");
-        assert_eq!(sanitize_slug("พ.ร.บ. คุ้มครองแรงงาน 2541"), "2541");
         assert_eq!(sanitize_slug("---"), "");
+
+        // A Thai name keeps its letters. This used to return "2541" —
+        // the ASCII digits and nothing else — which is why a Thai
+        // document produced no entities and no topic page.
+        assert_eq!(
+            sanitize_slug("พ.ร.บ. คุ้มครองแรงงาน 2541"),
+            "พ-ร-บ-คุ้มครองแรงงาน-2541"
+        );
+        assert_eq!(sanitize_slug("ยุคที่ความฉลาดล้นเหลือ"), "ยุคที่ความฉลาดล้นเหลือ");
+        assert_eq!(sanitize_slug("日本語"), "日本語");
+
+        // Tone marks are not `is_alphabetic()` (vowel signs are), so a
+        // filter written on it respells the word instead of dropping it:
+        // "ก้าวหน้า" would come back as "กาวหนา". Both must survive whole.
+        assert_eq!(sanitize_slug("ก้าวหน้า"), "ก้าวหน้า");
+        assert_eq!(sanitize_slug("ยุค"), "ยุค");
+        assert_ne!(sanitize_slug("ก้าว"), sanitize_slug("กาว"), "step ≠ glue");
     }
 
     #[test]
@@ -643,5 +833,69 @@ mod tests {
         let back = load_cached(&kref, "https://ex.ample/p").unwrap();
         assert_eq!(back, d);
         assert!(load_cached(&kref, "https://ex.ample/other").is_none());
+    }
+
+    /// Each window of a local document has its own cache entry. They
+    /// used to share one: a 5-window ingest left a single file holding
+    /// window 3's 13 claims out of the run's 67, and a re-ingest replayed
+    /// that one window five times while reporting nothing was cached.
+    #[test]
+    fn every_window_of_a_document_is_cached_separately() {
+        let _h = super::super::test_helpers::scoped_home();
+        let kref = crate::kms::create("cache-win", crate::kms::KmsScope::Project).unwrap();
+        let window = |i: u32| {
+            let mut s = src("say hello");
+            s.url = format!("kms://cache-win/sources/ยุคที่ความฉลาดล้นเหลือ#part-{i}-9814");
+            s.index = 1;
+            parse_digest(
+                &format!(r#"{{"claims":[{{"text":"window {i}","quote":"hello"}}]}}"#),
+                &s,
+                "2026-09-19",
+            )
+        };
+        for i in 1..=5 {
+            store_cached(&kref, &window(i)).unwrap();
+        }
+        for i in 1..=5 {
+            let url = format!("kms://cache-win/sources/ยุคที่ความฉลาดล้นเหลือ#part-{i}-9814");
+            let d = load_cached(&kref, &url).expect("each window hits its own entry");
+            assert_eq!(d.claims[0].text, format!("window {i}"));
+        }
+    }
+
+    /// A cache file written before the key carried a hash is shared by
+    /// every URL that collapsed to its name. It may only be served to the
+    /// URL it was made from.
+    #[test]
+    fn a_legacy_cache_file_is_only_served_to_its_own_url() {
+        let _h = super::super::test_helpers::scoped_home();
+        let kref = crate::kms::create("cache-old", crate::kms::KmsScope::Project).unwrap();
+        // Exactly what is on disk in a vault ingested by an older build:
+        // one `<alias>.json`, holding whichever window won the race.
+        let part = |i: u32| format!("kms://cache-old/sources/my-doc#part-{i}-9814");
+        let mut s = src("say hello");
+        s.url = part(3);
+        let survivor = parse_digest(
+            r#"{"claims":[{"text":"window 3","quote":"hello"}]}"#,
+            &s,
+            "2026-09-19",
+        );
+        std::fs::create_dir_all(cache_dir(&kref)).unwrap();
+        let legacy = legacy_cache_path(&kref, &part(3));
+        assert_eq!(
+            legacy,
+            legacy_cache_path(&kref, &part(1)),
+            "the shared name"
+        );
+        std::fs::write(&legacy, serde_json::to_string(&survivor).unwrap()).unwrap();
+
+        assert!(
+            load_cached(&kref, &part(3)).is_some(),
+            "its own URL still hits"
+        );
+        assert!(
+            load_cached(&kref, &part(1)).is_none(),
+            "window 1 must not be served window 3's claims"
+        );
     }
 }

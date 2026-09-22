@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { ViewerTarget } from "./KmsBrowserSidebar";
 import { ChevronRight, X, Search } from "lucide-react";
 import { send, subscribe } from "../hooks/useIPC";
+import { money } from "./kmsRunCost";
 
 /// M6.39.5: verbose right-edge sidebar for active research jobs.
 /// Mirrors the visual rhythm of `PlanSidebar` / `TodoSidebar` but shows
@@ -34,6 +35,16 @@ type ResearchJobInfo = {
   error: string | null;
   started_at: number | null;
   finished_at: number | null;
+  /// dev-plan/64 P5.4: what the run has spent so far, priced by the
+  /// engine (only it has the catalogue) and refreshed as it goes.
+  cost_usd?: number | null;
+  /// How many pages the run wrote. Absent until it finishes.
+  pages_written?: number | null;
+  /// dev-plan/64 P5.5: the command that would run this job again, built
+  /// by the engine at registration. `null` where a correct retry cannot
+  /// be written — an ingest whose path the job never kept, a page
+  /// researched out of another page's selection.
+  retry_command?: string | null;
 };
 
 /// Per-job in-memory progression log accumulated by the frontend
@@ -329,6 +340,14 @@ export function ResearchSidebar({
   const cancel = () => {
     send({ type: "chat_prompt", text: `/research cancel ${view.id}` });
   };
+  // Digests are cached per source, so a second attempt pays only for
+  // what the first never reached — which is what makes a retry worth
+  // offering rather than asking the owner to retype the query.
+  const retry = () => {
+    if (view.retry_command) {
+      send({ type: "chat_prompt", text: view.retry_command });
+    }
+  };
 
   return (
     <div
@@ -361,6 +380,40 @@ export function ResearchSidebar({
           >
             {STATUS_LABEL[view.status]}
           </span>
+          {typeof view.cost_usd === "number" && (
+            <span
+              className="px-1.5 py-px rounded font-mono"
+              style={{
+                fontSize: "9px",
+                background: "var(--bg-tertiary)",
+                color: "var(--text-secondary)",
+                border: "1px solid var(--border)",
+              }}
+              title={
+                isRunning
+                  ? "What this run has spent so far"
+                  : "What this run spent"
+              }
+            >
+              {money(view.cost_usd)}
+            </span>
+          )}
+          {typeof view.pages_written === "number" && view.pages_written > 0 && (
+            <span
+              className="px-1.5 py-px rounded"
+              style={{
+                fontSize: "9px",
+                background: "var(--bg-tertiary)",
+                color: "var(--accent)",
+                border: "1px solid var(--accent)",
+              }}
+              title="Pages this run wrote into the knowledge base"
+            >
+              {view.pages_written === 1
+                ? "1 new page"
+                : `${view.pages_written} new pages`}
+            </span>
+          )}
         </div>
         <button
           type="button"
@@ -639,6 +692,22 @@ export function ResearchSidebar({
             Show result
           </button>
         )}
+        {!isRunning &&
+          (view.status === "failed" || view.status === "cancelled") &&
+          view.retry_command && (
+            <button
+              onClick={retry}
+              className="px-2 py-1 rounded font-medium"
+              style={{
+                background: "var(--bg-tertiary)",
+                color: "var(--accent)",
+                border: "1px solid var(--accent)",
+              }}
+              title={`Run it again: ${view.retry_command}\nSources already digested are cached, so this pays only for what the first attempt never reached.`}
+            >
+              Retry
+            </button>
+          )}
         {isRunning && (
           <button
             onClick={cancel}

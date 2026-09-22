@@ -564,6 +564,18 @@ impl Session {
     /// Same per-line skip-with-warning behavior as `load_from` (corrupt
     /// lines logged + skipped). Same headerless-file salvage path.
     pub fn load_meta_from(path: &Path) -> Result<SessionMeta> {
+        let (meta, skipped) = Self::scan_meta(path)?;
+        if skipped > 0 {
+            eprintln!(
+                "\x1b[33m[session] {}: meta scan skipped {skipped} corrupt line(s)\x1b[0m",
+                path.display()
+            );
+        }
+        Ok(meta)
+    }
+
+    /// The scan, and how many lines it could not place.
+    fn scan_meta(path: &Path) -> Result<(SessionMeta, usize)> {
         let file = std::fs::File::open(path)?;
         let reader = BufReader::new(file);
 
@@ -658,6 +670,11 @@ impl Session {
                     // line" on every sidebar refresh (May 2026 user
                     // report).
                 }
+                "turn_usage" => {
+                    // The per-turn cost line shown under a reply. Written
+                    // after every turn, so without an arm of its own every
+                    // session ever used was "corrupt" on every refresh.
+                }
                 "user" | "assistant" | "system" => {
                     if let Some(ts) = val.get("timestamp").and_then(|v| v.as_u64()) {
                         if ts > last_timestamp {
@@ -679,13 +696,6 @@ impl Session {
                     skipped += 1;
                 }
             }
-        }
-
-        if skipped > 0 {
-            eprintln!(
-                "\x1b[33m[session] {}: meta scan skipped {skipped} corrupt line(s)\x1b[0m",
-                path.display()
-            );
         }
 
         // Headerless-file salvage path — mirrors load_from.
@@ -712,7 +722,7 @@ impl Session {
             }
         });
 
-        Ok(SessionMeta {
+        let meta = SessionMeta {
             owner_agent: h.owner_agent,
             id: h.id,
             updated_at: if last_timestamp > 0 {
@@ -723,7 +733,8 @@ impl Session {
             model: latest_model.unwrap_or(h.model),
             message_count,
             title,
-        })
+        };
+        Ok((meta, skipped))
     }
 
     /// Load a session from a JSONL file. Reads the header + all message events.
@@ -1184,6 +1195,37 @@ struct TurnUsageEvent {
     after: usize,
     text: String,
     timestamp: u64,
+}
+
+/// Where `/dream` finds sessions, as glob patterns the agent's tools
+/// resolve — they resolve against the workspace, while an agent under a
+/// workspace host keeps its sessions under its own folder.
+///
+/// Two lists, because they answer different questions. `mine` is what
+/// this agent digests. `live` is every session in the workspace, and is
+/// what decides whether a `sess-…` in a page's `sources:` still exists:
+/// since dev-plan/64 D1 the `dreams` base is shared by all agents, and an
+/// agent that judged liveness by its own folder would strip every other
+/// agent's provenance as "deleted".
+pub fn dream_session_globs() -> (String, Vec<String>) {
+    const SESSIONS: &str = ".thclaws/state/sessions/*.jsonl";
+    let ws = crate::workdir::workspace_root();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| ws.clone());
+    let rel = |p: &Path| -> Option<String> {
+        let (p, ws) = (p.canonicalize().ok()?, ws.canonicalize().ok()?);
+        let r = p
+            .strip_prefix(&ws)
+            .ok()?
+            .to_string_lossy()
+            .replace('\\', "/");
+        Some(r)
+    };
+    let mine = match rel(&cwd) {
+        Some(r) if !r.is_empty() => format!("{r}/{SESSIONS}"),
+        _ => SESSIONS.to_string(),
+    };
+    let live = vec![SESSIONS.to_string(), format!(".thclaws/bots/*/{SESSIONS}")];
+    (mine, live)
 }
 
 /// Append a per-turn usage footer. Called once per completed turn, so a
@@ -1845,6 +1887,77 @@ mod tests {
         // plan_snapshot's 99999 timestamp must NOT bump updated_at —
         // M6.16.1 fix preserved.
         assert_eq!(streamed.updated_at, 1300);
+    }
+
+    /// dev-plan/64 D1 made `dreams` workspace-wide while sessions stayed
+    /// per agent. `/dream` judges a `sess-…` source dead when no session
+    /// file has that id — so it must look in every agent's folder, and at
+    /// the path sessions are really kept under.
+    #[test]
+    fn dream_looks_for_sessions_where_they_are() {
+        let _g = crate::kms::test_env_lock();
+        let prev_cwd = std::env::current_dir().unwrap();
+        let prev_ws = std::env::var("THCLAWS_WORKSPACE_ROOT").ok();
+        let ws = tempdir().unwrap();
+        let bot = ws.path().join(".thclaws/bots/writer");
+        std::fs::create_dir_all(&bot).unwrap();
+
+        std::env::set_var("THCLAWS_WORKSPACE_ROOT", ws.path());
+        std::env::set_current_dir(&bot).unwrap();
+        let (mine, live) = dream_session_globs();
+        assert_eq!(mine, ".thclaws/bots/writer/.thclaws/state/sessions/*.jsonl");
+        assert!(live.contains(&".thclaws/bots/*/.thclaws/state/sessions/*.jsonl".to_string()));
+        assert!(live.contains(&".thclaws/state/sessions/*.jsonl".to_string()));
+
+        std::env::remove_var("THCLAWS_WORKSPACE_ROOT");
+        std::env::set_current_dir(ws.path()).unwrap();
+        assert_eq!(dream_session_globs().0, ".thclaws/state/sessions/*.jsonl");
+
+        std::env::set_current_dir(prev_cwd).unwrap();
+        if let Some(v) = prev_ws {
+            std::env::set_var("THCLAWS_WORKSPACE_ROOT", v);
+        }
+    }
+
+    /// Every record the engine writes is one the sidebar's scan can place.
+    /// Built with the real writers, not hand-typed JSON: `turn_usage` was
+    /// added to the writers and never to the scan, so every session that
+    /// had taken a turn was reported "corrupt" on every sidebar refresh —
+    /// eight times in a 25-line log.
+    #[test]
+    fn the_meta_scan_places_every_record_the_engine_writes() {
+        let td = tempdir().unwrap();
+        let path = td.path().join("sess-all.jsonl");
+        let mut s = Session::new("claude-sonnet-4-5", "/tmp");
+        s.messages.push(Message::user("q"));
+        s.messages.push(Message::assistant("a"));
+        s.append_to(&path).unwrap();
+        s.append_turn_usage_to(&path, "1.2k in · 300 out").unwrap();
+        s.append_rename_to(&path, "a title").unwrap();
+        s.append_provider_state_to(&path, Some("abcd".into()))
+            .unwrap();
+        let goal = crate::goal_state::GoalState::new("g".into(), None, None, false);
+        s.append_goal_snapshot_to(&path, Some(&goal)).unwrap();
+        s.append_compaction_to(&path, &[Message::user("summary")])
+            .unwrap();
+
+        let (meta, skipped) = Session::scan_meta(&path).unwrap();
+        assert_eq!(skipped, 0, "a record type the scan does not know");
+        assert_eq!(meta.title.as_deref(), Some("a title"));
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .and_then(|mut f| {
+                use std::io::Write as _;
+                writeln!(f, r#"{{"type":"from_the_future"}}"#)
+            })
+            .unwrap();
+        assert_eq!(
+            Session::scan_meta(&path).unwrap().1,
+            1,
+            "still counts strangers"
+        );
     }
 
     /// Regression for the May 2026 user report: every session file

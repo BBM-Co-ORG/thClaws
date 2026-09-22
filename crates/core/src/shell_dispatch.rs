@@ -68,6 +68,7 @@ pub async fn dispatch(
             }
         }
         SlashCommand::Version => emit(events_tx, crate::version::one_line()),
+        SlashCommand::Logs { panic, lines } => emit(events_tx, crate::util::tail_log(panic, lines)),
         SlashCommand::Cwd => {
             let cwd = std::env::current_dir()
                 .map(|p| p.to_string_lossy().into_owned())
@@ -2191,6 +2192,10 @@ pub async fn dispatch(
             }
         }
         SlashCommand::KmsUse(name) => {
+            // Settle on the base's real name before anything is compared or
+            // saved: `resolve` also finds a base by slug, and recording the
+            // spelling that found it would attach one base under two names.
+            let name = crate::kms::resolve(&name).map(|k| k.name).unwrap_or(name);
             if crate::kms::resolve(&name).is_none() {
                 emit(
                     events_tx,
@@ -2227,6 +2232,9 @@ pub async fn dispatch(
                     .register(std::sync::Arc::new(crate::tools::KmsAppendTool));
                 state
                     .tool_registry
+                    .register(std::sync::Arc::new(crate::tools::KmsEditTool));
+                state
+                    .tool_registry
                     .register(std::sync::Arc::new(crate::tools::KmsDeleteTool));
                 state.rebuild_system_prompt();
                 if let Err(e) = state.rebuild_agent(true) {
@@ -2241,6 +2249,10 @@ pub async fn dispatch(
             }
         }
         SlashCommand::KmsOff(name) => {
+            // Settle on the base's real name before anything is compared or
+            // saved: `resolve` also finds a base by slug, and recording the
+            // spelling that found it would attach one base under two names.
+            let name = crate::kms::resolve(&name).map(|k| k.name).unwrap_or(name);
             let before = state.config.kms_active.len();
             state.config.kms_active.retain(|n| n != &name);
             if state.config.kms_active.len() == before {
@@ -2259,6 +2271,7 @@ pub async fn dispatch(
                     state.tool_registry.remove("KmsSearch");
                     state.tool_registry.remove("KmsWrite");
                     state.tool_registry.remove("KmsAppend");
+                    state.tool_registry.remove("KmsEdit");
                     // M6.38.2 audit fix (Bug A): KmsDelete was added in
                     // M6.27 (`/dream` work) but never paired with a remove
                     // here. After the last /kms off it lingered in the
@@ -2411,7 +2424,7 @@ pub async fn dispatch(
             } else {
                 state.cwd.join(&source)
             };
-            match crate::kms::ingest_pdf(&k, &source, alias.as_deref(), force).await {
+            match crate::kms::ingest_pdf(&k, &source, alias.as_deref(), force, None).await {
                 Ok(r) => {
                     let verb = if r.overwrote { "replaced" } else { "ingested" };
                     let cascade = if r.cascaded > 0 {
@@ -2655,10 +2668,11 @@ pub async fn dispatch(
                     emit(
                         events_tx,
                         format!(
-                            "deleted KMS '{name}' ({} page(s), {} source(s)) from {}.",
+                            "dropped KMS '{name}' ({} page(s), {} source(s)). It is kept for {} days — `/kms restore {}` brings it back.",
                             report.pages_removed,
                             report.sources_removed,
-                            report.root.display()
+                            crate::kms_trash::KEEP_DAYS,
+                            crate::repl::quote_slash_arg(&name)
                         ),
                     );
                     // Refresh the GUI sidebar so the dropped KMS
@@ -2779,6 +2793,19 @@ pub async fn dispatch(
                 Err(e) => emit(events_tx, format!("/kms reindex {name} failed: {e}")),
             }
         }
+        SlashCommand::KmsTrash(name) => match crate::kms_trash::apply_list(&name) {
+            Ok(msg) => emit(events_tx, msg),
+            Err(e) => emit(events_tx, format!("/kms trash: {e}")),
+        },
+        SlashCommand::KmsRestore { name, page } => {
+            match crate::kms_trash::apply_restore(&name, page.as_deref()) {
+                Ok(msg) => {
+                    emit(events_tx, msg);
+                    broadcast_kms_update(events_tx);
+                }
+                Err(e) => emit(events_tx, format!("/kms restore: {e}")),
+            }
+        }
         SlashCommand::KmsEntry { name, set, clear } => {
             let Some(kname) = name.or_else(|| state.config.kms_active.last().cloned()) else {
                 emit(
@@ -2802,6 +2829,7 @@ pub async fn dispatch(
             stale_days,
             page,
             fix,
+            ground,
         } => {
             let Some(kname) = name.or_else(|| state.config.kms_active.last().cloned()) else {
                 emit(
@@ -2816,6 +2844,7 @@ pub async fn dispatch(
                 page,
                 llm,
                 fix,
+                ground,
             };
             let provider = if llm {
                 match crate::repl::build_provider(&state.config) {
@@ -3849,11 +3878,19 @@ pub async fn dispatch(
                 );
             }
 
-            let scope_note = if all_sessions {
-                "\n\n[scope: ALL_SESSIONS — process every .jsonl file under .thclaws/sessions/, not just the 10 most recent. Widen Pass 3b targeted reconciliation to every page Pass 3 touched.]"
-            } else {
-                ""
-            };
+            let (mine, live) = crate::session::dream_session_globs();
+            let scope_note = format!(
+                "\n\n[sessions: your sessions are `{mine}`. A session id is LIVE if its file matches any of: {}. Use these patterns wherever the procedure says `.thclaws/sessions/`.]{}",
+                live.iter()
+                    .map(|g| format!("`{g}`"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if all_sessions {
+                    "\n\n[scope: ALL_SESSIONS — process every one of your session files, not just the 10 most recent. Widen Pass 3b targeted reconciliation to every page Pass 3 touched.]"
+                } else {
+                    ""
+                }
+            );
             let prompt = if focus.trim().is_empty() {
                 format!(
                     "Consolidate the project's knowledge by mining recent sessions into per-session digests and canonical topic pages. Follow your standard multi-pass procedure.{scope_note}"

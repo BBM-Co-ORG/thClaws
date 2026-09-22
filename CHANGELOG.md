@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.134.0] — 2026-09-21
+
+**A knowledge-management release.** The knowledge base now takes a document in four ways, a citation can be hovered and clicked, and an audit removes only what nothing supports — plus a long tail of research-run and GUI fixes.
+
+### Added
+- **Documents come in four ways.** A document can be taken in four ways, matching what a researcher actually has.
+- **Citations you can hover and click.** Hovering a citation shows what it stands on, clicking it lands on the passage, and a citation points where a reader can actually go.
+- **An audit that removes only what nothing supports.** `/kms verify --ground` looks in the source for what supports a sentence, and `/kms verify --llm --fix` removes what no claim supports and keeps its report.
+- **Titles, runs, cost, and trash in the sidebar.** A page's title appears in the sidebar with what it stands on beneath it, the runs show what each one cost, a click's cost is shown before the click, and the trash is visible.
+- **Thai is found.** Search finds Thai, and the search box actually searches.
+- **KmsEdit changes part of a page.** Change part of a page without resending the rest.
+- **A knowledge base by slug, in the workspace.** A knowledge base can be named by its slug, and a project knowledge base belongs to the workspace.
+- **Removal never destroys what a base held.** Nothing a knowledge base held is destroyed by the command that removes it.
+- **A research run reports itself.** A running job says what it has spent, Retry re-runs what ran, and a run that dies stops claiming the page.
+- **A refresh keeps the page and adds references.** A refresh only refreshes, and a judgement is allowed to think.
+- **A note writes in the language it was given.** A note is as long as its citations and written in the language of what it was given.
+- **The planner sees the notes that matter.** What a note does not cite is measured, and the planner sees the notes that matter.
+- **The slash popup knows the subcommands.**
+- **Drag the KMS sidebar wider.**
+- **The desktop window keeps its stderr.**
+- **A page says what it is about.**
+
+### Fixed
+- **A URL that serves a paper is a paper.**
+- **The web fetchers send a User-Agent.** They previously sent none at all.
+- **An ingest consolidates, never rewrites.** An ingest consolidates into an existing page instead of rewriting it.
+- **Frontmatter the parser doesn't understand is carried.** Frontmatter the parser does not understand is carried, not dropped.
+- **A rename reaches `related:`.** A rename reaches `related:`, and a re-ingest reaches the pages that cite it.
+- **A write replaces the file whole, under a lock.** Shared JSON is changed under a lock.
+- **The dates are the user's dates.** The dates a knowledge base writes are the user's dates.
+- **A title with nothing under it.**
+- **A knowledge base is never changed silently.**
+- **Grounding finds the passage with the rare words.** Grounding finds the passage with the rare words, and says why it found none.
+- **A bare number no longer kills the run.** A bare number in search results no longer kills the run.
+- **A Thai document can be ingested as atomic notes.**
+- **An archived source is in the catalogue.**
+- **A quoted name works on the subcommands.** A quoted name works on the subcommands that never needed quoting.
+- **A knowledge base with a space in its name can be deleted.**
+- **Thai links open; a truncated page can't save over itself.**
+- **/dream describes the header the engine writes.**
+- **Sessions are found in every agent's folder.**
+- **The picker's model list agrees with itself.**
+- **A turn_usage record is not a corrupt line.**
+- **/logs has something to show from a terminal.**
+- **A settings watcher that hangs doesn't hang the session.**
+- **A confirmation dialog is the window's job.**
+- **Cache reads are shown, priced once, and recorded.** Cache reads are shown, priced once, and a research run's cost is recorded.
+
+### Changed
+- **A page is read only when it changes.** A page is read and parsed only when it has changed.
+- **Every call of a batch shares one opening.**
+- **An attached knowledge base stops re-billing.** An attached knowledge base stops re-billing the conversation.
+- **The search index lives beside the vault, not in it.**
+- **Plans do not think by default.**
+
 ## [0.133.0] — 2026-09-18
 
 **A bugfix release.** The provider list now shows only providers that can actually be reached, xAI's thinking is no longer dropped, and GUI shells resolve their agent from their own files.

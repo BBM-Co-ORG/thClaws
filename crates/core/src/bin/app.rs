@@ -1342,6 +1342,16 @@ async fn main() {
         #[cfg(feature = "gui")]
         {
             detach_console_for_gui();
+            // The desktop window is the one surface whose stderr genuinely
+            // has no reader: double-clicked, it is wired to nothing, and
+            // every `[research] …` line the engine writes about what it is
+            // doing is discarded. Keep it. Only here — `--cli`, `-p` and
+            // `--serve` all have someone listening, and a supervised
+            // `--serve` child in particular is read by this very process,
+            // which relays it prefixed and keeps a tail to explain a child
+            // that dies before it serves. Redirecting there would take that
+            // away; redirecting here captures it, relayed lines included.
+            thclaws_core::util::redirect_stderr_to_log();
             // dev-plan/59 §7.6 step 2: in a v3 workspace the supervisor runs
             // alongside the window, which is still the window that shipped —
             // same protocol, same IPC bridge, same untouched bundle. Nothing

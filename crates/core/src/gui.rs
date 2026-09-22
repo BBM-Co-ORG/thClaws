@@ -438,6 +438,9 @@ fn research_job_to_json(j: &crate::research::JobView) -> serde_json::Value {
         "kms_target": j.kms_target,
         "result_page": j.result_page,
         "error": j.error,
+        "retry_command": j.retry_command,
+        "cost_usd": j.cost_usd,
+        "pages_written": j.pages_written,
         "started_at": j.started_at
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -1315,6 +1318,40 @@ fn run_gui_inner(
                             "initial_tab": initial_tab,
                         })
                         .to_string(),
+                    ));
+                    return;
+                }
+                // A confirmation dialog belongs to the window, like the folder
+                // picker above it: it opens a native OS panel, which a bot's
+                // `--serve` has none of. Forwarded, it reached a process with
+                // no `confirm` arm at all, so nothing replied, the page's
+                // promise never settled, and the action it guarded — deleting
+                // a KMS, among others — did nothing at all with no error to
+                // show for it. `--serve` in a browser was unaffected: no
+                // `window.ipc` there, so it uses the browser's own dialog.
+                if kind == "confirm" {
+                    let id = parsed
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let title = parsed
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Confirm");
+                    let message = parsed.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                    let yes_label = parsed
+                        .get("yes_label")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("OK");
+                    let no_label = parsed
+                        .get("no_label")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Cancel");
+                    let ok = native_confirm(title, message, yes_label, no_label);
+                    let _ = proxy_for_bots.send_event(UserEvent::Dispatch(
+                        serde_json::json!({ "type": "confirm_result", "id": id, "ok": ok })
+                            .to_string(),
                     ));
                     return;
                 }

@@ -296,6 +296,13 @@ fn mcp_server_names_in_scope(user: bool) -> std::collections::HashSet<String> {
 /// (`gui_shell_key_set`) stores keys through the exact same rules
 /// instead of a parallel implementation that could drift.
 fn store_provider_key(provider: &str, key: &str) -> (bool, String, &'static str) {
+    // The model picker lists only providers the user can reach and caches that
+    // answer for a minute. Saving a key changes the answer, so the cache has
+    // to go now — otherwise the provider you just configured stays missing
+    // from the picker for up to a minute, which looks exactly like the key
+    // not having been accepted. Cleared here because this function is the one
+    // place keys are stored, by design.
+    crate::providers::invalidate_picker_cache();
     if provider.is_empty() || key.is_empty() {
         (false, "provider and key are required".to_string(), "")
     } else {
@@ -572,6 +579,169 @@ pub(crate) fn parse_session_attachments(
         images.push((media.to_owned(), data.to_owned()));
     }
     Ok(images)
+}
+
+/// What one ingest produced, whichever route produced it (dev-plan/64
+/// P5.3). A file and a directory finish synchronously, a URL and a PDF
+/// on a spawned task — and all four owe the tab the same answer.
+struct IngestOutcome {
+    ok: bool,
+    alias: String,
+    images_copied: usize,
+    overwrote: bool,
+    error: String,
+    /// A directory ingest's own summary; there is no single alias.
+    bulk: Option<String>,
+}
+
+impl IngestOutcome {
+    fn failed(error: String) -> Self {
+        IngestOutcome {
+            ok: false,
+            alias: String::new(),
+            images_copied: 0,
+            overwrote: false,
+            error,
+            bulk: None,
+        }
+    }
+}
+
+impl From<crate::kms::IngestResult> for IngestOutcome {
+    fn from(r: crate::kms::IngestResult) -> Self {
+        IngestOutcome {
+            ok: true,
+            alias: r.alias,
+            images_copied: r.images_copied,
+            overwrote: r.overwrote,
+            error: String::new(),
+            bulk: None,
+        }
+    }
+}
+
+/// Everything an ingest owes the tab once it knows how it went: the
+/// result envelope, the follow-up the chosen mode implies, and a KMS
+/// list refresh. Held so the async routes can do exactly what the sync
+/// ones do instead of a second copy that drifts.
+struct IngestJob {
+    dispatch: DispatchFn,
+    id: Value,
+    raw_path: String,
+    kms_name: String,
+    mode: crate::kms::IngestMode,
+    force: bool,
+}
+
+impl IngestJob {
+    fn finish(self, out: IngestOutcome) {
+        // An alias collision is recoverable: the frontend surfaces a
+        // "Replace" action that re-sends with `force: true`. Flag it so
+        // the tab can tell a collision apart from a hard failure. Only
+        // meaningful when the caller didn't already force.
+        let collision = !out.ok && !self.force && out.error.contains("already exists");
+
+        // A directory has no single page to write up or research, so
+        // neither follow-up applies to one.
+        let single = out.ok && out.bulk.is_none();
+        let mut research_id = String::new();
+        let mut research_err = String::new();
+        if single && self.mode.is_research() {
+            let cfg = crate::config::AppConfig::load().unwrap_or_default();
+            match crate::repl::build_provider(&cfg) {
+                Ok(provider) => {
+                    let model = cfg.model.clone();
+                    let kms = self.kms_name.clone();
+                    let alias_c = out.alias.clone();
+                    let dispatch = self.dispatch.clone();
+                    let cap = self.mode.research_max_notes();
+                    tokio::spawn(async move {
+                        let mut jc = crate::research::JobConfig {
+                            append: true,
+                            ..crate::research::JobConfig::default()
+                        };
+                        // An ingest must never rewrite a page the user
+                        // already has. When the planner lands on an
+                        // existing note it adds a dated section instead,
+                        // and the old text is carried in code rather than
+                        // re-emitted by the model. Found live: an English
+                        // source rewrote a curated Thai page in English
+                        // and dropped the citations it had.
+                        if let Some(cap) = cap {
+                            jc.max_notes = cap;
+                        }
+                        match crate::research::start_ingest(
+                            kms.clone(),
+                            alias_c.clone(),
+                            jc,
+                            provider,
+                            model,
+                            None,
+                        )
+                        .await
+                        {
+                            Ok(id) => {
+                                dispatch(
+                                    serde_json::json!({
+                                        "type": "research_focus", "id": id,
+                                    })
+                                    .to_string(),
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("[kms_ingest] atomic notes failed to start: {e}")
+                            }
+                        }
+                    });
+                    research_id = "pending".to_string();
+                }
+                Err(e) => research_err = format!("provider unavailable: {e}"),
+            }
+        }
+        // On success, hand the tab an agent prompt that upgrades the bare
+        // stub into a real curated page (summary + takeaways + wikilinks).
+        // The tab relays it as a normal chat turn so the main agent authors
+        // it with KmsRead/KmsSearch/KmsWrite. Empty when the ingest failed.
+        let summarize_prompt = if single && self.mode == crate::kms::IngestMode::Summary {
+            crate::kms::resolve(&self.kms_name)
+                .map(|k| {
+                    let src = k.root.join("sources").join(format!("{}.md", out.alias));
+                    crate::repl::build_kms_summarize_prompt(
+                        &self.kms_name,
+                        &out.alias,
+                        &src.to_string_lossy(),
+                    )
+                })
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        (self.dispatch)(
+            serde_json::json!({
+                "type": "kms_ingest_result",
+                "id": self.id,
+                "path": self.raw_path,
+                "kms": self.kms_name,
+                "ok": out.ok,
+                "alias": out.alias,
+                "images_copied": out.images_copied,
+                "overwrote": out.overwrote,
+                "collision": collision,
+                "summarize_prompt": summarize_prompt,
+                "mode": self.mode.as_str(),
+                "atomic": self.mode == crate::kms::IngestMode::Atomic,
+                "research": research_id,
+                "research_error": research_err,
+                "bulk": out.bulk,
+                "error": out.error,
+            })
+            .to_string(),
+        );
+        if out.ok {
+            (self.dispatch)(crate::kms::build_update_payload().to_string());
+        }
+    }
 }
 
 pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
@@ -3298,6 +3468,24 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            // dev-plan/64 P5.5: before listing, clear what dead runs
+            // left behind. A placeholder outliving its run sits in the
+            // index saying "being written" and is read by every later
+            // planner as a subject already covered. Cheap and silent on
+            // a settled vault; a run still beating keeps its page.
+            let cleared = crate::kms::resolve(&name)
+                .map(|k| crate::research::jobs::reconcile(&k))
+                .unwrap_or_default();
+            if !cleared.is_empty() {
+                (ctx.dispatch)(
+                    serde_json::json!({
+                        "type": "kms_reconciled",
+                        "kms": name,
+                        "cleared": cleared,
+                    })
+                    .to_string(),
+                );
+            }
             let payload = match crate::kms::browse(&name) {
                 Some(listing) => serde_json::json!({
                     "type": "kms_browse_result",
@@ -3314,6 +3502,221 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                     "sources": [],
                     "ok": false,
                     "error": format!("KMS '{name}' not found"),
+                }),
+            };
+            (ctx.dispatch)(payload.to_string());
+        }
+
+        // dev-plan/64 P5.6: the provenance ledger. Every research and
+        // verify run already wrote a log with what it read, wrote and
+        // cost; nothing in the GUI could reach one.
+        "kms_runs" => {
+            let name = msg
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let payload = match crate::kms::resolve(&name) {
+                Some(kref) => serde_json::json!({
+                    "type": "kms_runs_result",
+                    "kms": name,
+                    "runs": crate::kms::list_runs(&kref),
+                    "ok": true,
+                }),
+                None => serde_json::json!({
+                    "type": "kms_runs_result",
+                    "kms": name,
+                    "runs": [],
+                    "ok": false,
+                    "error": format!("KMS '{name}' not found"),
+                }),
+            };
+            (ctx.dispatch)(payload.to_string());
+        }
+
+        // dev-plan/64 P5.4: what a run of each kind has cost here, so a
+        // control that spends money can say so before it is clicked.
+        "kms_cost" => {
+            let name = msg
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let modes = crate::kms::resolve(&name)
+                .map(|k| crate::kms::cost_by_mode(&k))
+                .unwrap_or_default();
+            (ctx.dispatch)(
+                serde_json::json!({
+                    "type": "kms_cost_result",
+                    "kms": name,
+                    "modes": modes,
+                    "ok": true,
+                })
+                .to_string(),
+            );
+        }
+
+        // dev-plan/64 P5.1: what each `[n]` in a page stands on, so the
+        // viewer can say it on hover instead of sending the reader to
+        // the archive to search it by hand.
+        "kms_citations" => {
+            let name = msg
+                .get("kms")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let page = msg
+                .get("page")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let cites = crate::kms::resolve(&name)
+                .map(|k| crate::kms_verify::citation_evidence(&k, &page))
+                .unwrap_or_default();
+            (ctx.dispatch)(
+                serde_json::json!({
+                    "type": "kms_citations_result",
+                    "kms": name,
+                    "page": page,
+                    "citations": cites,
+                    "ok": true,
+                })
+                .to_string(),
+            );
+        }
+
+        // dev-plan/64 P5.6: the structural audit, in the sidebar. Free
+        // and instant — it reads the vault and nothing else — where
+        // `/kms verify --llm` costs a model call per page and belongs
+        // in the chat, which already shows progress and can cancel.
+        "kms_lint" => {
+            let name = msg
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let payload = match crate::kms::resolve(&name)
+                .ok_or_else(|| format!("KMS '{name}' not found"))
+                .and_then(|k| crate::kms::lint(&k).map_err(|e| e.to_string()))
+            {
+                Ok(report) => serde_json::json!({
+                    "type": "kms_lint_result",
+                    "kms": name,
+                    "findings": crate::kms::lint_findings(&report),
+                    "ok": true,
+                }),
+                Err(e) => serde_json::json!({
+                    "type": "kms_lint_result",
+                    "kms": name, "findings": [], "ok": false, "error": e,
+                }),
+            };
+            (ctx.dispatch)(payload.to_string());
+        }
+
+        // dev-plan/64 P5.6: the trash, which has kept every overwritten
+        // and deleted page since P3.1 with no way to see it from the GUI.
+        "kms_trash" => {
+            let name = msg
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let payload = match crate::kms::resolve(&name) {
+                Some(kref) => serde_json::json!({
+                    "type": "kms_trash_result",
+                    "kms": name,
+                    "items": crate::kms_trash::list_rows(&kref),
+                    "keep_days": crate::kms_trash::KEEP_DAYS,
+                    "ok": true,
+                }),
+                None => serde_json::json!({
+                    "type": "kms_trash_result",
+                    "kms": name,
+                    "items": [],
+                    "ok": false,
+                    "error": format!("KMS '{name}' not found"),
+                }),
+            };
+            (ctx.dispatch)(payload.to_string());
+        }
+
+        // A restore is itself undoable — it goes through `write_page`,
+        // which keeps what it replaces — so this needs no confirmation.
+        "kms_restore_page" => {
+            let name = msg
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let page = msg
+                .get("page")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let result = crate::kms_trash::apply_restore(&name, Some(&page));
+            let payload = match &result {
+                Ok(note) => serde_json::json!({
+                    "type": "kms_restore_result",
+                    "kms": name, "page": page, "note": note, "ok": true,
+                }),
+                Err(e) => serde_json::json!({
+                    "type": "kms_restore_result",
+                    "kms": name, "page": page, "ok": false,
+                    "error": e.to_string(),
+                }),
+            };
+            (ctx.dispatch)(payload.to_string());
+            if result.is_ok() {
+                // The page changed and so did the trash: refresh both.
+                if let Some(listing) = crate::kms::browse(&name) {
+                    (ctx.dispatch)(
+                        serde_json::json!({
+                            "type": "kms_browse_result",
+                            "kms": listing.kms,
+                            "pages": listing.pages,
+                            "sources": listing.sources,
+                            "entry": listing.entry,
+                            "ok": true,
+                        })
+                        .to_string(),
+                    );
+                }
+                if let Some(kref) = crate::kms::resolve(&name) {
+                    (ctx.dispatch)(
+                        serde_json::json!({
+                            "type": "kms_trash_result",
+                            "kms": name,
+                            "items": crate::kms_trash::list_rows(&kref),
+                            "keep_days": crate::kms_trash::KEEP_DAYS,
+                            "ok": true,
+                        })
+                        .to_string(),
+                    );
+                }
+            }
+        }
+
+        // dev-plan/64 P1.7: the sidebar's search box. Until this verb the
+        // only search in the GUI was a filename filter, while ranked
+        // full-text search sat behind a slash command.
+        "kms_search" => {
+            let name = msg.get("kms").and_then(|v| v.as_str()).unwrap_or("");
+            let query = msg.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            // Echoed so the box can drop a reply to a query it has moved on from.
+            let id = msg.get("id").cloned().unwrap_or(Value::Null);
+            let payload = match crate::kms::resolve(name) {
+                Some(kref) => {
+                    let (hits, note) = crate::tools::kms::ui_search(&kref, query, 30);
+                    serde_json::json!({
+                        "type": "kms_search_result",
+                        "kms": name, "query": query, "id": id,
+                        "ok": true, "hits": hits, "note": note,
+                    })
+                }
+                None => serde_json::json!({
+                    "type": "kms_search_result",
+                    "kms": name, "query": query, "id": id,
+                    "ok": false, "hits": [], "error": format!("KMS '{name}' not found"),
                 }),
             };
             (ctx.dispatch)(payload.to_string());
@@ -3384,7 +3787,11 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                     // them (images stay unresolved there — links are harmless).
                     let asset_base = crate::kms::resolve(&kms_name)
                         .map(|k| {
-                            let sub = if kind == "source" { "sources" } else { "pages" };
+                            let sub = match kind.as_str() {
+                                "source" => "sources",
+                                "run" => "runs",
+                                _ => "pages",
+                            };
                             k.root.join(sub).to_string_lossy().to_string()
                         })
                         .unwrap_or_default();
@@ -3392,7 +3799,7 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                     // a backlink is a property of the graph, and a page
                     // that carried its own list would go stale the
                     // moment another note linked or unlinked it.
-                    let backlinks: Vec<serde_json::Value> = if kind == "source" {
+                    let backlinks: Vec<serde_json::Value> = if kind != "page" {
                         Vec::new()
                     } else {
                         let stem = file.trim_end_matches(".md");
@@ -5455,7 +5862,9 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                     .shared
                     .input_tx
                     .send(crate::shared_session::ShellInput::Line(format!(
-                        "/kms rename {name} {new_name}"
+                        "/kms rename {} {}",
+                        crate::repl::quote_slash_arg(name),
+                        crate::repl::quote_slash_arg(new_name)
                     )));
             }
         }
@@ -5470,7 +5879,8 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                     .shared
                     .input_tx
                     .send(crate::shared_session::ShellInput::Line(format!(
-                        "/kms drop {name} --force"
+                        "/kms drop {} --force",
+                        crate::repl::quote_slash_arg(name)
                     )));
             }
         }
@@ -5556,9 +5966,20 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
         // `INGEST_EXTENSIONS`). Path is sandbox-checked. Echoes an
         // `kms_ingest_result` with the minted alias + local-image count so
         // the tab can toast the outcome; refreshes the KMS sidebar on success.
+        // dev-plan/64 P5.3: ingest whatever the owner has. This used to
+        // refuse everything but `.md` — a second, narrower rule beside
+        // the engine's own, so the GUI could not take the PDFs and web
+        // pages a researcher actually starts from, and the slash command
+        // could. Now it routes the same way `/kms ingest` does and lets
+        // the engine decide what it accepts.
         "kms_ingest" => {
             let id = msg.get("id").cloned().unwrap_or(serde_json::Value::Null);
-            let raw_path = msg.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let raw_path = msg
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
             let kms_name = msg
                 .get("kms")
                 .and_then(|v| v.as_str())
@@ -5566,149 +5987,93 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                 .trim()
                 .to_string();
             let force = msg.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
-            // `summary` (default): the main agent upgrades the stub page.
-            // `atomic`: a research job digests the document and writes a
-            // topic page + one note per idea (zettelkasten).
-            let atomic = msg.get("mode").and_then(|v| v.as_str()) == Some("atomic");
-
-            let (ok, alias, images_copied, overwrote, error): (bool, String, usize, bool, String) =
-                (|| {
-                    if kms_name.is_empty() {
-                        return (
-                            false,
-                            String::new(),
-                            0,
-                            false,
-                            "no KMS selected".to_string(),
-                        );
-                    }
-                    let path = match crate::sandbox::Sandbox::check(raw_path) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            return (
-                                false,
-                                String::new(),
-                                0,
-                                false,
-                                format!("access denied: {e}"),
-                            )
-                        }
-                    };
-                    let ext_ok = path
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .map(|e| matches!(e.to_ascii_lowercase().as_str(), "md" | "markdown"))
-                        .unwrap_or(false);
-                    if !ext_ok {
-                        return (
-                            false,
-                            String::new(),
-                            0,
-                            false,
-                            "only .md files can be added to a KMS".to_string(),
-                        );
-                    }
-                    let Some(k) = crate::kms::resolve(&kms_name) else {
-                        return (
-                            false,
-                            String::new(),
-                            0,
-                            false,
-                            format!("KMS '{kms_name}' not found"),
-                        );
-                    };
-                    match crate::kms::ingest(&k, &path, None, force) {
-                        Ok(r) => (true, r.alias, r.images_copied, r.overwrote, String::new()),
-                        Err(e) => (false, String::new(), 0, false, e.to_string()),
-                    }
-                })();
-
-            // An alias collision is recoverable: the frontend surfaces a
-            // "Replace" action that re-sends with `force: true`. Flag it so
-            // the tab can tell a collision apart from a hard failure. Only
-            // meaningful when the caller didn't already force.
-            let collision = !ok && !force && error.contains("already exists");
-
-            // On success, hand the tab an agent prompt that upgrades the bare
-            // stub into a real curated page (summary + takeaways + wikilinks).
-            // The tab relays it as a normal chat turn so the main agent authors
-            // it with KmsRead/KmsSearch/KmsWrite. Empty when the ingest failed.
-            let mut research_id = String::new();
-            let mut research_err = String::new();
-            if ok && atomic {
-                let cfg = crate::config::AppConfig::load().unwrap_or_default();
-                match crate::repl::build_provider(&cfg) {
-                    Ok(provider) => {
-                        let model = cfg.model.clone();
-                        let kms = kms_name.clone();
-                        let alias_c = alias.clone();
-                        let dispatch = ctx.dispatch.clone();
-                        tokio::spawn(async move {
-                            match crate::research::start_ingest(
-                                kms.clone(),
-                                alias_c.clone(),
-                                crate::research::JobConfig::default(),
-                                provider,
-                                model,
-                                None,
-                            )
-                            .await
-                            {
-                                Ok(id) => {
-                                    dispatch(
-                                        serde_json::json!({
-                                            "type": "research_focus", "id": id,
-                                        })
-                                        .to_string(),
-                                    );
-                                }
-                                Err(e) => {
-                                    eprintln!("[kms_ingest] atomic notes failed to start: {e}")
-                                }
-                            }
-                        });
-                        research_id = "pending".to_string();
-                    }
-                    Err(e) => research_err = format!("provider unavailable: {e}"),
-                }
-            }
-            let summarize_prompt = if ok && !atomic {
-                crate::kms::resolve(&kms_name)
-                    .map(|k| {
-                        let src = k.root.join("sources").join(format!("{alias}.md"));
-                        crate::repl::build_kms_summarize_prompt(
-                            &kms_name,
-                            &alias,
-                            &src.to_string_lossy(),
-                        )
-                    })
-                    .unwrap_or_default()
-            } else {
-                String::new()
+            // dev-plan/64 P4.9: what to do once it is archived — see
+            // `IngestMode`. Absent means `summary`, which is what every
+            // caller that predates the choice meant.
+            let mode = crate::kms::IngestMode::parse(
+                msg.get("mode").and_then(|v| v.as_str()).unwrap_or(""),
+            );
+            let job = IngestJob {
+                dispatch: ctx.dispatch.clone(),
+                id,
+                raw_path: raw_path.clone(),
+                kms_name: kms_name.clone(),
+                mode,
+                force,
             };
 
-            (ctx.dispatch)(
-                serde_json::json!({
-                    "type": "kms_ingest_result",
-                    "id": id,
-                    "path": raw_path,
-                    "kms": kms_name,
-                    "ok": ok,
-                    "alias": alias,
-                    "images_copied": images_copied,
-                    "overwrote": overwrote,
-                    "collision": collision,
-                    "summarize_prompt": summarize_prompt,
-                    "atomic": atomic,
-                    "research": research_id,
-                    "research_error": research_err,
-                    "error": error,
-                })
-                .to_string(),
-            );
-            if ok {
-                (ctx.dispatch)(crate::kms::build_update_payload().to_string());
+            let Some(kref) = crate::kms::resolve(&kms_name) else {
+                job.finish(IngestOutcome::failed(if kms_name.is_empty() {
+                    "no KMS selected".into()
+                } else {
+                    format!("KMS '{kms_name}' not found")
+                }));
+                return true;
+            };
+
+            let is_url = raw_path.starts_with("http://") || raw_path.starts_with("https://");
+            if is_url {
+                // No sandbox check: a URL is not a path, and the fetch
+                // is the engine's own, the same one `/kms ingest` uses.
+                tokio::spawn(async move {
+                    let out = match crate::kms::ingest_url(&kref, &raw_path, None, force).await {
+                        Ok(r) => IngestOutcome::from(r),
+                        Err(e) => IngestOutcome::failed(e.to_string()),
+                    };
+                    job.finish(out);
+                });
+                return true;
             }
+
+            let path = match crate::sandbox::Sandbox::check(&raw_path) {
+                Ok(p) => p,
+                Err(e) => {
+                    job.finish(IngestOutcome::failed(format!("access denied: {e}")));
+                    return true;
+                }
+            };
+
+            if path.is_dir() {
+                // A folder of notes seeds a whole knowledge base; doing
+                // it one file at a time from a GUI is not a workflow.
+                let out = match crate::kms::ingest_dir(&kref, &path, force) {
+                    Ok(r) => IngestOutcome {
+                        ok: true,
+                        alias: String::new(),
+                        images_copied: 0,
+                        overwrote: false,
+                        error: String::new(),
+                        bulk: Some(r.summary()),
+                    },
+                    Err(e) => IngestOutcome::failed(e.to_string()),
+                };
+                job.finish(out);
+                return true;
+            }
+
+            let is_pdf = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("pdf"))
+                .unwrap_or(false);
+            if is_pdf {
+                tokio::spawn(async move {
+                    let out = match crate::kms::ingest_pdf(&kref, &path, None, force, None).await {
+                        Ok(r) => IngestOutcome::from(r),
+                        Err(e) => IngestOutcome::failed(e.to_string()),
+                    };
+                    job.finish(out);
+                });
+                return true;
+            }
+
+            // Everything else: the engine's own extension list decides,
+            // and its error names what is allowed.
+            let out = match crate::kms::ingest(&kref, &path, None, force) {
+                Ok(r) => IngestOutcome::from(r),
+                Err(e) => IngestOutcome::failed(e.to_string()),
+            };
+            job.finish(out);
         }
 
         // Create a new blank KMS page from the per-KMS browser's `+`.
@@ -6337,9 +6702,24 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
 
         // ── Cross-provider model picker (M6.36 SERVE9g) ────────────
         "request_all_models" => {
+            // The page may send an `id`; we echo it back so a reply to an
+            // earlier, abandoned open cannot overwrite the list of a later
+            // one. Optional, so an older frontend keeps working — it just
+            // gets a reply with no id, which it ignores the id of anyway.
+            let request_id = msg.get("id").and_then(|v| v.as_str()).map(str::to_string);
             let dispatch = ctx.dispatch.clone();
             tokio::spawn(async move {
-                let payload = crate::providers::build_all_models_payload().await;
+                let payload = crate::providers::all_models_payload_cached().await;
+                let payload = match request_id {
+                    None => payload,
+                    Some(id) => match serde_json::from_str::<serde_json::Value>(&payload) {
+                        Ok(mut v) => {
+                            v["id"] = serde_json::Value::String(id);
+                            v.to_string()
+                        }
+                        Err(_) => payload,
+                    },
+                };
                 dispatch(payload);
             });
         }

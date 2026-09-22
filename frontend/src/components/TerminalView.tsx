@@ -241,12 +241,23 @@ export function TerminalView({ active, modalOpen }: Props) {
     };
 
     // Recompute the slash-popup state from the current `lineBuffer`.
-    // The popup is open iff the buffer starts with `/` AND the user
-    // hasn't typed a space yet (once we hit "/model gpt-5", we're past
-    // composing the name). Index is preserved across keystrokes so the
-    // user's selection doesn't jump back to the top on every char.
+    // The popup is open while the buffer is still composing a command
+    // NAME. A space no longer ends that on its own: dev-plan/64 P5.8
+    // gave `/kms` and `/research` their subcommands as real entries, so
+    // `/kms ver` is still a name being typed. Once what is typed is a
+    // prefix of nothing — `/model gpt-5`, `/research what is abundance`
+    // — the name is done and the menu goes away. Index is preserved
+    // across keystrokes so the selection doesn't jump to the top on
+    // every char.
+    const stillNaming = (buf: string) => {
+      const raw = buf.slice(1);
+      if (!raw.includes(" ")) return true;
+      return slashCommandsRef.current.some((c) =>
+        c.name.toLowerCase().startsWith(raw.toLowerCase()),
+      );
+    };
     const recomputeSlash = () => {
-      const open = lineBuffer.startsWith("/") && !lineBuffer.includes(" ");
+      const open = lineBuffer.startsWith("/") && stillNaming(lineBuffer);
       if (!open) {
         if (slashViewRef.current.open) setSlashView(SLASH_VIEW_CLOSED);
         return;
@@ -413,7 +424,7 @@ export function TerminalView({ active, modalOpen }: Props) {
             // Enter accepts the highlighted item — same UX as the chat
             // tab. Once they've typed past the name into args, Enter
             // falls through and the existing onData path submits.
-            if (!lineBuffer.includes(" ")) {
+            if (stillNaming(lineBuffer)) {
               const cmd = sv.filtered[sv.index];
               if (cmd) acceptSlashCommand(cmd);
               return false;

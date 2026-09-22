@@ -5,6 +5,11 @@ use super::digest::{normalize_for_match, Digest};
 use crate::kms::KmsRef;
 use std::collections::HashSet;
 
+/// Per-note budget for the summary the planner sees. Paired with the
+/// 150-note cap on that list in `plan.rs`, the section stays bounded as
+/// the knowledge base grows.
+pub const SUMMARY_MAX_CHARS: usize = 400;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct KnownNote {
     pub slug: String,
@@ -14,6 +19,61 @@ pub struct KnownNote {
     pub kind: String,
     /// `updated:` frontmatter (`YYYY-MM-DD`) when present.
     pub updated: Option<String>,
+}
+
+/// What a text is "about", cheaply: lower-cased words of three letters or
+/// more for scripts that put spaces between words, and character pairs for
+/// the ones that do not — a Thai sentence is one unbroken run, and as a
+/// single "word" it matches nothing.
+pub(crate) fn relevance_terms(text: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for token in text.split(|c: char| !c.is_alphanumeric() && !crate::kms::is_spaceless_script(c)) {
+        if token.is_empty() {
+            continue;
+        }
+        if token.is_ascii() {
+            if token.len() >= 3 {
+                out.insert(token.to_ascii_lowercase());
+            }
+            continue;
+        }
+        let chars: Vec<char> = token.chars().flat_map(|c| c.to_lowercase()).collect();
+        if chars.len() == 1 {
+            out.insert(chars[0].to_string());
+        }
+        for pair in chars.windows(2) {
+            out.insert(pair.iter().collect());
+        }
+    }
+    out
+}
+
+/// dev-plan/64 P4.6: the notes a run is most likely to touch, first.
+///
+/// The planner is shown the first 150 existing notes and each digest the
+/// first 80 slugs, and both lists were alphabetical — so in a vault past
+/// that size a run about `zoning` was told about `abundance-…` through
+/// `m…` and nothing else, planned a new note for one that existed, and the
+/// vault grew a duplicate. `about` is whatever describes the run: the
+/// query, and once there are digests, the entities they found. A note
+/// whose slug IS one of `exact` (an entity of this run) always leads.
+pub fn rank_known(known: &[KnownNote], about: &str, exact: &HashSet<&str>) -> Vec<KnownNote> {
+    let want = relevance_terms(about);
+    let mut scored: Vec<(usize, &KnownNote)> = known
+        .iter()
+        .map(|k| {
+            let have = relevance_terms(&format!("{} {} {}", k.slug, k.title, k.summary));
+            let overlap = want.intersection(&have).count();
+            let bonus = if exact.contains(k.slug.as_str()) {
+                1_000_000
+            } else {
+                0
+            };
+            (overlap + bonus, k)
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.slug.cmp(&b.1.slug)));
+    scored.into_iter().map(|(_, k)| k.clone()).collect()
 }
 
 /// Every page in the KMS as `(slug, title, first prose line)`. Reads
@@ -39,6 +99,12 @@ pub fn load_known(kref: &KmsRef) -> Vec<KnownNote> {
             continue;
         };
         let (fm, body) = crate::kms::parse_frontmatter(&raw);
+        // A placeholder is not knowledge. Listed here, its "this page is
+        // being written by /research" line told the planner the subject
+        // was already covered, so it planned an `update` of nothing.
+        if fm.get("status").map(|s| s.trim()) == Some("researching") {
+            continue;
+        }
         let title = fm
             .get("title")
             .map(|t| t.trim_matches('"').to_string())
@@ -56,7 +122,16 @@ pub fn load_known(kref: &KmsRef) -> Vec<KnownNote> {
 }
 
 /// First line that is not a heading, the injected `Description:` line,
-/// a rule, or blank. Clamped to 200 chars.
+/// a rule, or blank. Clamped to [`SUMMARY_MAX_CHARS`].
+///
+/// This feeds one line per existing note into the planner's prompt, and
+/// it is the only thing the planner has to judge whether a note already
+/// covers what it is about to create. A summary cut too short is how a
+/// near-duplicate gets planned, and how a note about one aspect of a
+/// thing ends up taking the thing's own name. Now that a note opens with
+/// a deliberate description rather than a bare definition, there is more
+/// worth passing on — bounded, because this is multiplied by every note
+/// in the knowledge base.
 pub fn first_prose_line(body: &str) -> String {
     for line in body.lines() {
         let t = line.trim();
@@ -68,8 +143,8 @@ pub fn first_prose_line(body: &str) -> String {
         {
             continue;
         }
-        let mut s: String = t.chars().take(200).collect();
-        if t.chars().count() > 200 {
+        let mut s: String = t.chars().take(SUMMARY_MAX_CHARS).collect();
+        if t.chars().count() > SUMMARY_MAX_CHARS {
             s.push('…');
         }
         return s;
@@ -134,6 +209,40 @@ impl Novelty {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn known_notes_are_ranked_by_what_the_run_is_about() {
+        let note = |slug: &str, title: &str| KnownNote {
+            slug: slug.into(),
+            title: title.into(),
+            summary: String::new(),
+            kind: String::new(),
+            updated: None,
+        };
+        let mut known: Vec<KnownNote> = (0..200)
+            .map(|i| note(&format!("aaa-filler-{i:03}"), "Unrelated filler"))
+            .collect();
+        known.push(note("zoning-reform", "Zoning reform and housing supply"));
+        known.push(note("hidden-poverty-households", "ครัวเรือนยากจนแฝง"));
+        known.push(note("zz-entity", "Named by the run"));
+
+        let none = HashSet::new();
+        let en = rank_known(&known, "how does zoning limit housing", &none);
+        assert_eq!(en[0].slug, "zoning-reform");
+        // Thai has no spaces: the query is one run, the title another.
+        let th = rank_known(&known, "ครัวเรือนยากจนแฝงคืออะไร วัดยังไง", &none);
+        assert_eq!(th[0].slug, "hidden-poverty-households");
+        // An entity of the run outranks any amount of word overlap.
+        let exact: HashSet<&str> = ["zz-entity"].into_iter().collect();
+        assert_eq!(
+            rank_known(&known, "zoning housing", &exact)[0].slug,
+            "zz-entity"
+        );
+        // Nothing is dropped, and ties keep a stable order.
+        assert_eq!(en.len(), known.len());
+        assert_eq!(en[1].slug, "aaa-filler-000");
+        assert_eq!(en[2].slug, "aaa-filler-001");
+    }
+
     use super::*;
     use crate::research::digest::{Claim, Entity};
 

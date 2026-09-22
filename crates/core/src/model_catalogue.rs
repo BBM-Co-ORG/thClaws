@@ -209,6 +209,29 @@ pub struct TokenUsage {
     pub reasoning_tokens: u32,
 }
 
+impl TokenUsage {
+    /// From what a provider reported for one call.
+    ///
+    /// `Usage::input_tokens` is the UNCACHED input on every provider — it is
+    /// Anthropic's native meaning, and the OpenAI-compatible parser subtracts
+    /// the cached part to match. `prompt_tokens` here is the TOTAL, from
+    /// which `compute_cost_usd` subtracts the cached part itself. Passing
+    /// `input_tokens` straight through subtracted it twice: a turn with
+    /// 9.5k new tokens and 80k cached was priced as 0 new tokens, so the
+    /// session cost read low exactly when a conversation was long — and
+    /// lower the better the cache worked.
+    pub fn from_usage(u: &crate::providers::Usage) -> Self {
+        let cached = u.cache_read_input_tokens.unwrap_or(0);
+        Self {
+            prompt_tokens: u.input_tokens.saturating_add(cached),
+            completion_tokens: u.output_tokens,
+            cached_input_tokens: cached,
+            cache_creation_tokens: u.cache_creation_input_tokens.unwrap_or(0),
+            reasoning_tokens: u.reasoning_output_tokens.unwrap_or(0),
+        }
+    }
+}
+
 /// All models known for one provider, plus the provider-level metadata
 /// (list URL, default context fallback).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -2137,6 +2160,27 @@ mod tests {
 
 #[cfg(test)]
 mod known_model_tests {
+    /// A provider's `input_tokens` is the uncached part; the cost formula
+    /// wants the total and subtracts the cached part itself. Handing the
+    /// one to the other subtracted it twice.
+    #[test]
+    fn cached_tokens_are_subtracted_once() {
+        let u = crate::providers::Usage {
+            input_tokens: 9_500,
+            output_tokens: 1_000,
+            cache_read_input_tokens: Some(80_000),
+            ..Default::default()
+        };
+        let t = super::TokenUsage::from_usage(&u);
+        assert_eq!(t.prompt_tokens, 89_500);
+        assert_eq!(t.cached_input_tokens, 80_000);
+        assert_eq!(
+            t.prompt_tokens.saturating_sub(t.cached_input_tokens),
+            9_500,
+            "what gets the full input rate is the uncached part — it was 0"
+        );
+    }
+
     use super::{is_known_model, EffectiveCatalogue};
 
     /// Any id the catalogue currently carries for `provider`. Taking the

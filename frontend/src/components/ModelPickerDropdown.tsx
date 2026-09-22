@@ -68,6 +68,9 @@ function stripProviderPrefix(id: string, provider: string): string {
 export function ModelPickerDropdown({ current, onClose }: Props) {
   const [groups, setGroups] = useState<Group[]>([]);
   const [loading, setLoading] = useState(true);
+  // Set when the request times out, so the panel says something instead of
+  // showing an empty list that looks like "you have no models".
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   // `openrouter/fusion+` opens a config modal instead of switching
   // immediately — the model only takes effect once the panel/judge
@@ -77,15 +80,42 @@ export function ModelPickerDropdown({ current, onClose }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
 
   // Fetch on mount.
+  //
+  // Issue #215. Two guards, both for failures that used to be silent:
+  //
+  //  - A request id. Every open remounts this component and asks again; the
+  //    backend probes live endpoints, so replies can arrive out of order or
+  //    after the open that asked for them is gone. Without an id, whichever
+  //    frame landed last won.
+  //  - A deadline. If no reply comes at all, the panel used to sit on
+  //    "Loading models…" for as long as the user cared to look at it.
   useEffect(() => {
+    const requestId =
+      typeof crypto !== "undefined" && "randomUUID" in crypto
+        ? crypto.randomUUID()
+        : `mp-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    let settled = false;
     const unsub = subscribe((msg) => {
-      if (msg.type === "all_models_list") {
-        setGroups((msg.groups as Group[]) ?? []);
-        setLoading(false);
-      }
+      if (msg.type !== "all_models_list") return;
+      // An older backend echoes no id; accept those rather than hang.
+      if (typeof msg.id === "string" && msg.id !== requestId) return;
+      settled = true;
+      setGroups((msg.groups as Group[]) ?? []);
+      setLoadError(null);
+      setLoading(false);
     });
-    send({ type: "request_all_models" });
-    return unsub;
+    send({ type: "request_all_models", id: requestId });
+    // Longer than the backend's own probe budget so a slow-but-working
+    // endpoint is not reported as a failure.
+    const deadline = setTimeout(() => {
+      if (settled) return;
+      setLoading(false);
+      setLoadError("Could not load the model list. Close and reopen to retry.");
+    }, 8000);
+    return () => {
+      clearTimeout(deadline);
+      unsub();
+    };
   }, []);
 
   // Esc closes; click outside closes.
@@ -204,6 +234,13 @@ export function ModelPickerDropdown({ current, onClose }: Props) {
             style={{ color: "var(--text-secondary)" }}
           >
             Loading models…
+          </div>
+        ) : loadError ? (
+          <div
+            className="px-2 py-3 text-xs text-center"
+            style={{ color: "var(--danger, #e06c75)" }}
+          >
+            {loadError}
           </div>
         ) : filtered.length === 0 ? (
           <div

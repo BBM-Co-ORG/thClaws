@@ -636,6 +636,84 @@ pub fn build_todos_reminder() -> Option<String> {
     ))
 }
 
+/// What pre-retrieval found for a user message, kept so the same note goes
+/// back on the same message in every later request.
+///
+/// A provider's prompt cache is a prefix cache: the request must repeat,
+/// byte for byte, up to the point where it is new. A note that is there on
+/// the turn it was made and gone on the next changes the middle of the
+/// conversation and forfeits everything after it. So a note, once made,
+/// stays with its message for as long as this agent lives. History itself
+/// is never touched — the note exists only on the outgoing copy — so the
+/// transcript, the session file and compaction see what the user typed.
+///
+/// Keyed by the message's text rather than its position: compaction
+/// renumbers history, and the note is a function of the text anyway.
+#[derive(Default)]
+pub struct TurnNotes {
+    notes: std::collections::VecDeque<(u64, String)>,
+}
+
+impl TurnNotes {
+    /// Past this the oldest note goes, at the cost of one cache miss deep
+    /// in a conversation long enough that compaction is already at work.
+    const MAX: usize = 64;
+
+    fn key(text: &str) -> u64 {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut h);
+        h.finish()
+    }
+
+    /// The first note made for a text is the one that stays: a later search
+    /// of a changed KMS must not rewrite what an earlier turn was sent.
+    pub fn remember(&mut self, user_text: &str, note: String) {
+        let key = Self::key(user_text);
+        if self.notes.iter().any(|(k, _)| *k == key) {
+            return;
+        }
+        if self.notes.len() == Self::MAX {
+            self.notes.pop_front();
+        }
+        self.notes.push_back((key, note));
+    }
+
+    pub fn tokens(&self) -> usize {
+        self.notes
+            .iter()
+            .map(|(_, n)| crate::tokens::estimate_tokens(n))
+            .sum()
+    }
+
+    /// Put each note back on its message in an outgoing copy of history.
+    pub fn attach(&self, messages: &mut [Message]) {
+        if self.notes.is_empty() {
+            return;
+        }
+        for m in messages.iter_mut().filter(|m| m.role == Role::User) {
+            let text = m
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            if text.is_empty() {
+                continue;
+            }
+            let key = Self::key(&text);
+            if let Some((_, note)) = self.notes.iter().find(|(k, _)| *k == key) {
+                m.content.push(ContentBlock::text(format!(
+                    "<system-reminder>\n{note}\n</system-reminder>"
+                )));
+            }
+        }
+    }
+}
+
 /// Strip tantivy query-syntax metacharacters so a raw user message can be
 /// used as a search query without `QueryParser` choking on stray `:`/`(`/
 /// `?` etc. Turns the message into a safe bag-of-words.
@@ -849,6 +927,9 @@ pub struct Agent {
     /// `stream_chunk_timeout_secs` setting. `None` means: defer to the
     /// global setting via `providers::stream_chunk_timeout()`.
     pub(crate) next_turn_chunk_timeout: Arc<Mutex<Option<std::time::Duration>>>,
+    /// dev-plan/64 P2.1: what pre-retrieval found for each user message,
+    /// re-attached to that message on every request. See [`TurnNotes`].
+    pub(crate) turn_notes: Arc<Mutex<TurnNotes>>,
     /// Queue of user messages submitted while the agent was busy. Drained
     /// at the boundary after a tool_result message lands in history, so
     /// the user can "steer" the leader between tool calls without
@@ -919,6 +1000,7 @@ impl Agent {
             origin: crate::permissions::AgentOrigin::Main,
             model_override: Arc::new(Mutex::new(None)),
             next_turn_chunk_timeout: Arc::new(Mutex::new(None)),
+            turn_notes: Arc::new(Mutex::new(TurnNotes::default())),
             injection_queue: Arc::new(Mutex::new(std::collections::VecDeque::new())),
         }
     }
@@ -1155,6 +1237,7 @@ impl Agent {
         let model = self.model.clone();
         let model_override = self.model_override.clone();
         let next_turn_chunk_timeout = self.next_turn_chunk_timeout.clone();
+        let turn_notes = self.turn_notes.clone();
         // Compose the per-turn system prompt: base + dynamic plan-mode
         // reminder + dynamic todos reminder so the model sees fresh
         // state every turn (plan mode active? plan submitted but not
@@ -1176,10 +1259,6 @@ impl Agent {
             let active_plan = crate::tools::plan_state::get();
             let plan_reminder = build_plan_reminder(mode, active_plan.as_ref());
             let todos_reminder = build_todos_reminder();
-            // Deterministic pre-retrieval: pull relevant KMS pages for this
-            // message so the model answers from stored knowledge without
-            // having to decide to call KmsSearch first.
-            let kms_reminder = build_kms_context_reminder(&kms_query);
             // Chain reminders. Plan reminder dominates when active —
             // it has the strongest per-turn discipline and would be
             // redundant with todos guidance. Otherwise surface todos
@@ -1190,20 +1269,24 @@ impl Agent {
                 (None, Some(t)) => Some(t),
                 (None, None) => None,
             };
-            // Retrieved KMS context is independent of plan/todos — always
-            // append it when present.
-            let chained = match (chained, kms_reminder) {
-                (Some(c), Some(k)) => Some(format!("{c}\n\n{k}")),
-                (Some(c), None) => Some(c),
-                (None, Some(k)) => Some(k),
-                (None, None) => None,
-            };
             match chained {
                 Some(r) if !base.is_empty() => format!("{base}\n\n{r}"),
                 Some(r) => r,
                 None => base,
             }
         };
+        // Deterministic pre-retrieval: name the KMS pages that match this
+        // message so the model reads them without having to decide to
+        // search first. It rides on the user message, not in `system` —
+        // it differs every turn, and in `system` it sat ahead of the whole
+        // history, so every turn re-billed the prompt, the tool
+        // definitions and the conversation at full price.
+        if let Some(found) = build_kms_context_reminder(&kms_query) {
+            turn_notes
+                .lock()
+                .expect("turn_notes lock")
+                .remember(&kms_query, found);
+        }
         let budget_tokens = self.budget_tokens;
         let base_max_tokens = self.max_tokens;
         let max_iterations = self.max_iterations;
@@ -1269,9 +1352,11 @@ impl Agent {
                     // the request comfortably inside the window.
                     let system_tokens = crate::tokens::estimate_tokens(&system);
                     let tools_reserve_tokens = 1024;
+                    let notes_tokens = turn_notes.lock().expect("turn_notes lock").tokens();
                     let messages_budget = budget_tokens
                         .saturating_sub(system_tokens)
-                        .saturating_sub(tools_reserve_tokens);
+                        .saturating_sub(tools_reserve_tokens)
+                        .saturating_sub(notes_tokens);
 
                     // M6.35 HOOK4: pre_compact / post_compact fire only
                     // when compaction actually trims (history is over
@@ -1326,6 +1411,10 @@ impl Agent {
                     // this outgoing copy only; stored history is untouched and
                     // gets redacted post-send.
                     fit_outgoing_image_payload(&mut compacted);
+                    turn_notes
+                        .lock()
+                        .expect("turn_notes lock")
+                        .attach(&mut compacted);
                     compacted
                 };
                 let tool_defs = tools.tool_defs();
@@ -2744,6 +2833,54 @@ pub struct AgentTurnOutcome {
 
 #[cfg(test)]
 mod tests {
+    /// dev-plan/64 P2.1. A provider's prompt cache is a prefix cache, so
+    /// what one request said about a message, every later request must
+    /// say again, byte for byte — and history itself must never carry it.
+    #[test]
+    fn a_kms_note_stays_with_its_message_and_out_of_history() {
+        let mut notes = TurnNotes::default();
+        notes.remember("ยุคที่ความฉลาดล้นเหลือคืออะไร", "pages: a".into());
+        notes.remember("ยุคที่ความฉลาดล้นเหลือคืออะไร", "pages: CHANGED".into());
+
+        let history = vec![
+            Message::user("ยุคที่ความฉลาดล้นเหลือคืออะไร"),
+            Message::assistant("คำตอบ"),
+            Message::user("ขอบคุณ"),
+        ];
+        let mut first = history.clone();
+        notes.attach(&mut first);
+        notes.remember("ขอบคุณ", "pages: b".into());
+        let mut second = history.clone();
+        notes.attach(&mut second);
+
+        assert_eq!(first[0], second[0], "an earlier turn must not change");
+        assert_eq!(first[0].content.len(), 2);
+        let ContentBlock::Text { text } = &first[0].content[1] else {
+            panic!("note is a text block");
+        };
+        assert_eq!(text, "<system-reminder>\npages: a\n</system-reminder>");
+        assert_eq!(second[2].content.len(), 2);
+        assert_eq!(
+            history[0].content.len(),
+            1,
+            "history is what the user typed"
+        );
+        assert_eq!(first[1], history[1], "only user messages carry notes");
+    }
+
+    #[test]
+    fn turn_notes_are_bounded() {
+        let mut notes = TurnNotes::default();
+        for i in 0..(TurnNotes::MAX + 5) {
+            notes.remember(&format!("q{i}"), "n".into());
+        }
+        assert_eq!(notes.notes.len(), TurnNotes::MAX);
+        let mut m = vec![Message::user("q0"), Message::user("q68")];
+        notes.attach(&mut m);
+        assert_eq!(m[0].content.len(), 1, "the oldest went");
+        assert_eq!(m[1].content.len(), 2);
+    }
+
     use super::*;
     use crate::error::Error;
     use crate::providers::{EventStream, ProviderEvent};

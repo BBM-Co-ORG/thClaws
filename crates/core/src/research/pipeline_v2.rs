@@ -23,6 +23,90 @@ const SEED_FETCH: usize = 5;
 const SEED_FETCH_RECENT: usize = 3;
 const HITS_PER_GAP_QUERY: u32 = 5;
 
+/// The page name for a topic the caller pinned by slug. Never empty: an
+/// empty page name is the one thing the KMS refuses outright, and every
+/// downstream step treats this as a filename.
+fn pinned_slug(raw: &str) -> String {
+    let slug = super::digest::sanitize_slug(raw);
+    if slug.is_empty() {
+        "research".into()
+    } else {
+        slug
+    }
+}
+
+/// The page name for an ingest run's topic page.
+///
+/// The ingest has already written the stub this run is about to adopt, at
+/// `pages/<alias>.md`, where `alias` came from `kms::sanitize_alias`. So
+/// the only correct answer is that same alias — kebab-casing it here
+/// would fold its '_' to '-' and write a second page beside the stub
+/// instead of filling it in. `sanitize_alias` is idempotent, and is
+/// applied again only so a hand-passed alias cannot smuggle in a path
+/// separator.
+fn ingest_slug(alias: &str) -> String {
+    let name = crate::kms::sanitize_alias(alias);
+    if name.is_empty() {
+        "research".into()
+    } else {
+        name
+    }
+}
+
+/// How often the running cost is re-priced. Pricing re-parses the
+/// baseline catalogue and reads two files; a run writing thirty notes
+/// would otherwise do that thirty times for a figure nobody can read
+/// changing that fast.
+const COST_REFRESH_SECS: u64 = 10;
+
+/// Where an archived source actually came from.
+///
+/// A source the run fetched carries its own address. One the user
+/// ingested carries `kms://<base>/sources/<alias>` — the right thing to
+/// resolve the in-page link against, and a path no reader can open. The
+/// address is not lost: `ingest_url` stamps `origin:` on the archived
+/// file. Returns "" for anything that is already an address, or when
+/// there is no `origin:` to find.
+fn archived_origin(kref: &crate::kms::KmsRef, url: &str) -> String {
+    let Some(rest) = url.strip_prefix("kms://") else {
+        return String::new();
+    };
+    let Some((_, alias)) = rest.split_once("/sources/") else {
+        return String::new();
+    };
+    let alias = alias.split('#').next().unwrap_or(alias);
+    let path = kref.root.join("sources").join(format!("{alias}.md"));
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return String::new();
+    };
+    let (fm, _) = crate::kms::parse_frontmatter(&raw);
+    fm.get("origin")
+        .map(|o| o.trim().trim_matches('"').to_string())
+        .filter(|o| o.contains("://"))
+        .unwrap_or_default()
+}
+
+/// The language one note is written in.
+///
+/// The run's language comes from the document being ingested
+/// (dev-plan/64 D6), which is right for a new note and wrong for one
+/// that already exists: an English source must not re-language the
+/// Thai page it is updating. `detect_language` answers "query" when it
+/// cannot tell, and that is not an answer worth overriding the run's
+/// choice with.
+fn note_language(action: Action, existing: Option<&str>, run: &str) -> String {
+    if action != Action::Update {
+        return run.to_string();
+    }
+    match existing {
+        Some(body) if !body.trim().is_empty() => match super::detect_language(body) {
+            "query" => run.to_string(),
+            lang => lang.to_string(),
+        },
+        _ => run.to_string(),
+    }
+}
+
 pub struct PipelineRequest<'a> {
     pub job_id: &'a str,
     pub query: String,
@@ -56,6 +140,23 @@ pub async fn run_with_tools(context: PipelineRequest<'_>) -> Result<String> {
     // plan/write phases only honour cancellation — throwing away a run that
     // already read 30 sources because the slow worker crossed a timer is
     // worse than a late result (the failure users actually saw).
+    // dev-plan/64 P5.4: the running cost, refreshed as the run goes, so
+    // a job in flight can say what it has spent instead of only telling
+    // the owner afterwards. Throttled: pricing re-parses the baseline
+    // catalogue and reads two files, and `phase` is called per note.
+    let cost_at = std::sync::atomic::AtomicU64::new(0);
+    let tick_cost = || {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let last = cost_at.load(std::sync::atomic::Ordering::Relaxed);
+        if now.saturating_sub(last) < COST_REFRESH_SECS {
+            return;
+        }
+        cost_at.store(now, std::sync::atomic::Ordering::Relaxed);
+        mgr.update_cost(job_id, llm_calls::usage_so_far().cost_usd());
+    };
     let alive = |phase: &str| -> Result<()> {
         if cancel.is_cancelled() {
             return Err(Error::Tool("research cancelled".into()));
@@ -64,6 +165,7 @@ pub async fn run_with_tools(context: PipelineRequest<'_>) -> Result<String> {
             return Err(Error::Tool("research time budget exhausted".into()));
         }
         mgr.update_phase(job_id, phase);
+        tick_cost();
         Ok(())
     };
     let phase = |phase: &str| -> Result<()> {
@@ -71,6 +173,7 @@ pub async fn run_with_tools(context: PipelineRequest<'_>) -> Result<String> {
             return Err(Error::Tool("research cancelled".into()));
         }
         mgr.update_phase(job_id, phase);
+        tick_cost();
         Ok(())
     };
 
@@ -85,10 +188,11 @@ pub async fn run_with_tools(context: PipelineRequest<'_>) -> Result<String> {
         &config.local_source,
         &config.refresh_slug,
     ) {
-        (Some(fixed), _, _) => super::digest::sanitize_slug(fixed),
+        (Some(fixed), _, _) => pinned_slug(fixed),
         // The ingest stub `pages/<alias>.md` becomes the topic page.
-        (None, Some(alias), _) => super::digest::sanitize_slug(alias),
+        (None, Some(alias), _) => ingest_slug(alias),
         (None, None, Some(slug)) => format!("refresh-{slug}"),
+
         (None, None, None) => llm_calls::derive_topic_slug(
             dprov.as_ref(),
             &dmodel,
@@ -102,11 +206,44 @@ pub async fn run_with_tools(context: PipelineRequest<'_>) -> Result<String> {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "research".into()),
     };
+    // dev-plan/64 P5.4: what kind of run this is, decided from the same
+    // three fields that name it, and stamped on the run log so the GUI
+    // can price a click from runs of the same kind.
+    let mode = match (
+        &config.topic_slug,
+        &config.local_source,
+        &config.refresh_slug,
+    ) {
+        (Some(_), _, _) => "selection",
+        (None, Some(_), _) => "ingest",
+        (None, None, Some(_)) => "refresh",
+        (None, None, None) => "research",
+    };
     let kms_name = config
         .kms_target
         .clone()
         .unwrap_or_else(|| topic_slug.clone());
     let kref = kms_writer::resolve_or_create(&kms_name)?;
+    // dev-plan/64 P5.5: claim the page for as long as this run is
+    // alive, so a run that dies without unwinding can be told from one
+    // that is still working. Dropped on every exit path — including the
+    // panic the caller catches — which releases the claim.
+    let _claim = super::jobs::Guard::start(&kref, job_id, &query, &topic_slug, mode);
+    // dev-plan/64 D6: `auto` follows the document being ingested, else the
+    // query. Decided once, here, so every prompt of the run agrees.
+    let mut config = config;
+    let document_head = config.local_source.as_ref().and_then(|alias| {
+        let raw =
+            std::fs::read_to_string(kref.root.join("sources").join(format!("{alias}.md"))).ok()?;
+        let (_, body) = crate::kms::parse_frontmatter(&raw);
+        Some(body.chars().take(4_000).collect::<String>())
+    });
+    config.language = super::resolve_language(&config.language, &query, document_head.as_deref());
+    // The base's real name from here on. `--kms age-of-abundance` finds
+    // "Age of Abundance", and everything below — the attach, the
+    // `kms://` source URLs, the archive writes — has to say the same name
+    // the base is actually filed under.
+    let kms_name = kref.name.clone();
     // Zettelkasten default: the KMS a run writes into becomes the
     // attached (and therefore default) target of the next run.
     match crate::config::ProjectConfig::attach_kms(&kms_name) {
@@ -123,7 +260,14 @@ pub async fn run_with_tools(context: PipelineRequest<'_>) -> Result<String> {
             )));
         }
     }
-    let known_slugs: Vec<String> = known.iter().map(|k| k.slug.clone()).collect();
+    // Each digest is shown the first 80 of these. Ranked by the query —
+    // and only the query, so the list is the same for every digest of the
+    // run and their shared prompt prefix stays byte-identical.
+    let known_slugs: Vec<String> =
+        graph::rank_known(&known, &query, &std::collections::HashSet::new())
+            .into_iter()
+            .map(|k| k.slug)
+            .collect();
 
     // ── 1. Seed round ───────────────────────────────────────────────
     alive("round 1: seed search")?;
@@ -424,7 +568,7 @@ pub async fn run_with_tools(context: PipelineRequest<'_>) -> Result<String> {
     {
         let dir = kref.root.join(".research");
         let _ = std::fs::create_dir_all(&dir);
-        let _ = std::fs::write(dir.join("last-plan.json"), &plan_raw);
+        let _ = crate::kms::write_file(dir.join("last-plan.json"), &plan_raw);
     }
     eprintln!(
         "[research] planned {} notes from {} claims in {:.1}s (model {})",
@@ -435,12 +579,14 @@ pub async fn run_with_tools(context: PipelineRequest<'_>) -> Result<String> {
     );
 
     let mut all_cited: BTreeSet<u32> = BTreeSet::new();
+    let mut archived: BTreeSet<u32> = BTreeSet::new();
     if config.dry_run {
         let path = write::write_run_log(
             &kref,
             &RunLog {
                 query: &query,
                 topic_slug: &topic_slug,
+                mode,
                 today: &today,
                 rounds: &rounds,
                 sources_digested: sources.len() as u32 - cached_hits,
@@ -477,7 +623,14 @@ pub async fn run_with_tools(context: PipelineRequest<'_>) -> Result<String> {
     // an updated note keeps `[N]` markers from earlier runs and its
     // Sources block must still resolve them.
     registry.save(&kref)?;
-    let sources_meta: Vec<(u32, String, String)> = registry.meta();
+    let sources_meta: Vec<(u32, String, String, String)> = registry
+        .meta()
+        .into_iter()
+        .map(|(i, t, u)| {
+            let origin = archived_origin(&kref, &u);
+            (i, t, u, origin)
+        })
+        .collect();
     let (moc_plans, atomic): (Vec<&NotePlan>, Vec<&NotePlan>) =
         plan_notes.iter().partition(|n| n.kind == NoteKind::Moc);
 
@@ -497,6 +650,7 @@ pub async fn run_with_tools(context: PipelineRequest<'_>) -> Result<String> {
         } else {
             None
         };
+        let note_lang = note_language(n.action, existing.as_deref(), &config.language);
         let inp = NoteInput {
             query: &query,
             note: n,
@@ -504,9 +658,14 @@ pub async fn run_with_tools(context: PipelineRequest<'_>) -> Result<String> {
             sources: &sources,
             link_targets: &targets,
             existing_body: existing,
-            append: false,
-            language: &config.language,
+            // Was hardcoded `false`, which left the one page an ingest
+            // is most likely to collide with — the source's own — open
+            // to a full rewrite even when the run was told never to
+            // rewrite an existing note.
+            append: config.append,
+            language: &note_lang,
             parent_overview: None,
+            refresh: false,
         };
         let body = match write::write_note_body(
             dprov.as_ref(),
@@ -529,7 +688,9 @@ pub async fn run_with_tools(context: PipelineRequest<'_>) -> Result<String> {
             }
         };
         let (rewritten, cited) = write::rewrite_claim_markers(&body, &claim_source);
+        let rewritten = prune_new_note(n, rewritten, &mut plan_warnings);
         let rewritten = write::fix_wikilinks(&rewritten, &targets);
+        let rewritten = write::drop_self_links(&rewritten, &n.slug);
         let rewritten = write::autolink(
             &rewritten,
             &n.slug,
@@ -541,7 +702,8 @@ pub async fn run_with_tools(context: PipelineRequest<'_>) -> Result<String> {
         let rewritten = write::unbold_links(&rewritten);
         parent_overview = Some(opening_of(&rewritten, write::PARENT_OVERVIEW_CHARS));
         let conf = mean_confidence(n, &claim_by_id);
-        let w = write::persist_note(write::NoteToPersist {
+        archive_cited(&kms_name, &query, &today, &sources, &cited, &mut archived);
+        match write::persist_note(write::NoteToPersist {
             kref: &kref,
             note: n,
             body: &rewritten,
@@ -551,12 +713,22 @@ pub async fn run_with_tools(context: PipelineRequest<'_>) -> Result<String> {
             today: &today,
             append: false,
             sources_meta: &sources_meta,
-        })?;
-        all_cited.extend(cited.iter().copied());
-        written.push(w);
+        }) {
+            Ok(w) => {
+                all_cited.extend(cited.iter().copied());
+                written.push(w);
+            }
+            Err(e) => {
+                let w = format!("topic page `{}` could not be saved: {e}", n.slug);
+                eprintln!("[research] {w}");
+                plan_warnings.push(w);
+            }
+        }
     }
 
     phase(&format!("writing {} linked notes", atomic.len()))?;
+    // What each refreshed page said before, to check the refresh kept it.
+    let mut refresh_before: HashMap<String, String> = HashMap::new();
     let sem = Arc::new(tokio::sync::Semaphore::new(write::NOTE_CONCURRENCY));
     let mut futs = Vec::new();
     for n in &atomic {
@@ -570,6 +742,28 @@ pub async fn run_with_tools(context: PipelineRequest<'_>) -> Result<String> {
         } else {
             None
         };
+        // A refresh keeps the page and adds references: only the claims
+        // that bear on what the page already says reach the writer.
+        let refreshing = config.refresh_slug.is_some() && existing.is_some();
+        let claims = match (&existing, refreshing) {
+            (Some(body), true) => {
+                let all = claims.len();
+                let kept = write::claims_for_refresh(body, claims);
+                let w = format!(
+                    "refresh of `{}`: {} of the run's {all} claims bear on what the page says and were offered as references",
+                    n.slug,
+                    kept.len()
+                );
+                eprintln!("[research] {w}");
+                plan_warnings.push(w);
+                kept
+            }
+            _ => claims,
+        };
+        if refreshing {
+            refresh_before.insert(n.slug.clone(), existing.clone().unwrap_or_default());
+        }
+        let note_lang = note_language(n.action, existing.as_deref(), &config.language);
         let inp = NoteInput {
             query: &query,
             note: n,
@@ -578,10 +772,11 @@ pub async fn run_with_tools(context: PipelineRequest<'_>) -> Result<String> {
             link_targets: &targets,
             existing_body: existing,
             append: config.append,
-            language: &config.language,
+            language: &note_lang,
             parent_overview: parent_overview.clone(),
+            refresh: refreshing,
         };
-        let prompt = write::build_note_prompt(&inp);
+        let prompt = write::build_note_prompt_split(&inp);
         let dprov = dprov.clone();
         let dmodel = dmodel.clone();
         let sem = sem.clone();
@@ -589,7 +784,15 @@ pub async fn run_with_tools(context: PipelineRequest<'_>) -> Result<String> {
         let timeout = config.llm_timeout;
         futs.push(async move {
             let _p = sem.acquire().await;
-            llm_calls::oneshot_pub(dprov.as_ref(), &dmodel, prompt, timeout, &cancel).await
+            llm_calls::oneshot_split(
+                dprov.as_ref(),
+                &dmodel,
+                prompt,
+                timeout,
+                &cancel,
+                llm_calls::CallKind::Writing,
+            )
+            .await
         });
     }
     let t = std::time::Instant::now();
@@ -600,6 +803,10 @@ pub async fn run_with_tools(context: PipelineRequest<'_>) -> Result<String> {
         t.elapsed().as_secs_f32()
     );
 
+    // One index rebuild for the whole loop instead of one per note — each
+    // is two full scans of `pages/`. The guard is thread-local, which is
+    // sound here only because nothing below awaits.
+    let index_batch = crate::kms::IndexBatch::new(&kref);
     for (n, body) in atomic.iter().zip(bodies) {
         let body = match body {
             Ok(b) => b,
@@ -611,7 +818,46 @@ pub async fn run_with_tools(context: PipelineRequest<'_>) -> Result<String> {
             }
         };
         let (rewritten, cited) = write::rewrite_claim_markers(&strip_heading(&body), &claim_source);
+        let rewritten = prune_new_note(n, rewritten, &mut plan_warnings);
+        // "Keep the page" is checked, not hoped for: a refresh that loses
+        // the page's own citations, or comes back several times the size,
+        // rewrote it. The previous version is in the trash either way.
+        if let Some(before) = refresh_before.get(&n.slug) {
+            let had = kms_writer::parse_citation_indices(before);
+            let has = kms_writer::parse_citation_indices(&rewritten);
+            let lost: Vec<String> = had.difference(&has).map(|i| format!("[{i}]")).collect();
+            // Size is not the test: a page that gained 27 references is
+            // longer, and a real run was warned about for exactly that with
+            // every paragraph intact. What was there must still be there.
+            let paragraphs: Vec<&str> = before
+                .split("\n\n")
+                .map(str::trim)
+                .filter(|p| !p.starts_with('#') && p.chars().count() >= 80)
+                .collect();
+            let gone = paragraphs
+                .iter()
+                .filter(|p| {
+                    let head: String = p.chars().take(60).collect();
+                    !rewritten.contains(&head)
+                })
+                .count();
+            if !lost.is_empty() || gone > 0 {
+                let w = format!(
+                    "refresh of `{}` did not keep the page: {gone} of its {} paragraph(s) no longer open the same way{}. The version before is in the trash (`/kms restore`).",
+                    n.slug,
+                    paragraphs.len(),
+                    if lost.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", and it no longer cites {}", lost.join(" "))
+                    }
+                );
+                eprintln!("[research] {w}");
+                plan_warnings.push(w);
+            }
+        }
         let rewritten = write::fix_wikilinks(&rewritten, &targets);
+        let rewritten = write::drop_self_links(&rewritten, &n.slug);
         let parent = if config.refresh_slug.is_some() {
             None
         } else {
@@ -627,7 +873,15 @@ pub async fn run_with_tools(context: PipelineRequest<'_>) -> Result<String> {
         );
         let rewritten = write::unbold_links(&rewritten);
         let conf = mean_confidence(n, &claim_by_id);
-        let w = write::persist_note(write::NoteToPersist {
+        // Sources first: a note must never be on disk citing an archive
+        // that is not. They used to be written after every note, so a run
+        // that died in this loop left citations that all 404.
+        archive_cited(&kms_name, &query, &today, &sources, &cited, &mut archived);
+        // One note that cannot be saved — a full disk, a reserved name —
+        // is a warning, the same as one the model failed to write. `?`
+        // here threw away every note after it, the sources and the run
+        // log, once all the LLM calls had been paid for.
+        match write::persist_note(write::NoteToPersist {
             kref: &kref,
             note: n,
             body: &rewritten,
@@ -637,10 +891,19 @@ pub async fn run_with_tools(context: PipelineRequest<'_>) -> Result<String> {
             today: &today,
             append: config.append,
             sources_meta: &sources_meta,
-        })?;
-        all_cited.extend(cited.iter().copied());
-        written.push(w);
+        }) {
+            Ok(w) => {
+                all_cited.extend(cited.iter().copied());
+                written.push(w);
+            }
+            Err(e) => {
+                let w = format!("note `{}` could not be saved: {e}", n.slug);
+                eprintln!("[research] {w}");
+                plan_warnings.push(w);
+            }
+        }
     }
+    drop(index_batch);
 
     if written.is_empty() {
         return Err(Error::Tool(format!(
@@ -649,29 +912,77 @@ pub async fn run_with_tools(context: PipelineRequest<'_>) -> Result<String> {
         )));
     }
 
-    // ── 5. Sources + run log ────────────────────────────────────────
-    phase("writing sources")?;
-    let mut sources_written = 0u32;
-    for s in &sources {
-        // Locally ingested sources are already archived under their alias.
-        if s.url.starts_with("kms://") {
-            continue;
-        }
-        if all_cited.contains(&s.index) {
-            match kms_writer::write_source(
-                &kms_name, &query, &today, s.index, &s.title, &s.url, &s.body,
-            ) {
-                Ok(_) => sources_written += 1,
-                Err(e) => eprintln!("[research] source [{}] not written: {e}", s.index),
-            }
+    // dev-plan/64 P4.2: say which notes are mostly unanchored prose. The
+    // page carries the number too (`uncited:`), but a number nobody is told
+    // about is not a check.
+    for w in &written {
+        if let Some(u) = w.uncited.filter(|u| *u > write::UNCITED_WARN) {
+            let msg = format!(
+                "`{}`: {:.0}% of its prose sits in paragraphs with no citation — read it before relying on it",
+                w.slug,
+                u * 100.0
+            );
+            eprintln!("[research] {msg}");
+            plan_warnings.push(msg);
         }
     }
-    eprintln!("[research] wrote {sources_written} cited sources into '{kms_name}'");
+
+    // ── 5. Sources + run log ────────────────────────────────────────
+    phase("writing sources")?;
+    // Anything cited that the per-note pass missed (it should be nothing).
+    archive_cited(
+        &kms_name,
+        &query,
+        &today,
+        &sources,
+        &all_cited,
+        &mut archived,
+    );
+    eprintln!(
+        "[research] wrote {} cited sources into '{kms_name}'",
+        archived.len()
+    );
+    // dev-plan/64 D5: what the run read and did not cite is kept too, out
+    // of the way, for ninety days.
+    let mut uncited = 0usize;
+    for s in &sources {
+        if archived.contains(&s.index)
+            || all_cited.contains(&s.index)
+            || s.url.starts_with("kms://")
+        {
+            continue;
+        }
+        match kms_writer::write_uncited_source(&kms_name, &query, &today, &s.title, &s.url, &s.body)
+        {
+            Ok(Some(_)) => uncited += 1,
+            Ok(None) => {}
+            Err(e) => eprintln!("[research] uncited source not kept: {e}"),
+        }
+    }
+    let pruned = kms_writer::prune_uncited_sources(&kref);
+    if uncited > 0 || pruned > 0 {
+        eprintln!(
+            "[research] kept {uncited} read-but-uncited source(s) under sources/{}/ ({pruned} older than {} days removed)",
+            kms_writer::UNCITED_DIR,
+            kms_writer::UNCITED_KEEP_DAYS
+        );
+    }
+    // The last note-driven rebuild ran before the sources were complete,
+    // so `index.md` listed 1 of a vault's 33 sources. Once more, at the end.
+    if let Err(e) = crate::kms::rebuild_index(&kref) {
+        eprintln!("[research] index rebuild failed: {e}");
+    }
+    // dev-plan/64 P5.4: what the run produced, recorded once and only
+    // now — a count kept while the run is in flight invites reading a
+    // job that died as a job that produced something.
+    mgr.record_pages_written(job_id, written.len() as u32);
+    mgr.update_cost(job_id, llm_calls::usage_so_far().cost_usd());
     let _ = write::write_run_log(
         &kref,
         &RunLog {
             query: &query,
             topic_slug: &topic_slug,
+            mode,
             today: &today,
             rounds: &rounds,
             sources_digested: sources.len() as u32 - cached_hits,
@@ -697,6 +1008,29 @@ pub async fn run_with_tools(context: PipelineRequest<'_>) -> Result<String> {
             .unwrap_or_else(|| topic_slug.clone()),
     };
     Ok(format!("{kms_name}/{result_slug}.md"))
+}
+
+/// Archive every cited source that is not on disk yet. Locally ingested
+/// sources are skipped — they were archived under their alias at ingest.
+fn archive_cited(
+    kms_name: &str,
+    query: &str,
+    today: &str,
+    sources: &[ResearchSource],
+    cited: &BTreeSet<u32>,
+    archived: &mut BTreeSet<u32>,
+) {
+    for s in sources {
+        if !cited.contains(&s.index) || archived.contains(&s.index) || s.url.starts_with("kms://") {
+            continue;
+        }
+        match kms_writer::write_source(kms_name, query, today, s.index, &s.title, &s.url, &s.body) {
+            Ok(_) => {
+                archived.insert(s.index);
+            }
+            Err(e) => eprintln!("[research] source [{}] not written: {e}", s.index),
+        }
+    }
 }
 
 /// Two URLs naming the same document (tracking parameters, fragment,
@@ -894,6 +1228,25 @@ fn opening_of(body: &str, max_chars: usize) -> String {
     out
 }
 
+/// A NEW note keeps only the paragraphs it can cite (`write::prune_uncited`).
+/// An update is left alone: it merges a page that may hold what a person
+/// wrote, and a person's paragraphs carry no markers.
+fn prune_new_note(n: &NotePlan, body: String, warnings: &mut Vec<String>) -> String {
+    if n.action != plan::Action::Create {
+        return body;
+    }
+    let (pruned, dropped) = write::prune_uncited(&body);
+    if dropped > 0 {
+        let w = format!(
+            "`{}`: removed {dropped} paragraph(s) the model wrote without a citation",
+            n.slug
+        );
+        eprintln!("[research] {w}");
+        warnings.push(w);
+    }
+    pruned
+}
+
 fn strip_heading(s: &str) -> String {
     let mut lines = s.trim().lines().peekable();
     while let Some(l) = lines.peek() {
@@ -914,6 +1267,69 @@ mod tests {
     use futures::stream;
     use std::sync::Mutex;
 
+    /// An ingest run's topic page must land on the stub the ingest just
+    /// wrote, and every topic name must be one the KMS will accept.
+    /// Ingesting a Thai document failed with `invalid page name ''`
+    /// *after* the ingest had written `pages/<Thai alias>.md`.
+    #[test]
+    fn an_update_keeps_the_page_its_own_language() {
+        let thai = "Collingridge Dilemma คือกรอบคิดที่ชี้ว่าเทคโนโลยีใหม่มีช่วงเวลาที่เรารู้ผลกระทบช้า";
+        // The run is English because the ingested document is; the page
+        // being updated is Thai and stays Thai.
+        assert_eq!(note_language(Action::Update, Some(thai), "en"), "th");
+        // A new note follows the run, whatever happens to sit on disk.
+        assert_eq!(note_language(Action::Create, Some(thai), "en"), "en");
+        // Nothing to read, or nothing decisive in it: the run decides.
+        assert_eq!(note_language(Action::Update, None, "en"), "en");
+        assert_eq!(note_language(Action::Update, Some("   "), "en"), "en");
+        assert_eq!(note_language(Action::Update, Some("123 456"), "en"), "en");
+    }
+
+    #[test]
+    fn a_topic_page_lands_on_the_stub_the_ingest_wrote() {
+        // `kms::ingest` names the stub with `sanitize_alias`, so that is
+        // the only spelling that fills it in rather than writing beside it.
+        for alias in ["ยุคที่ความฉลาดล้นเหลือ", "日本語", "my_report", "notes-2026"]
+        {
+            assert_eq!(
+                ingest_slug(alias),
+                crate::kms::sanitize_alias(alias),
+                "topic page must match pages/{alias}.md"
+            );
+        }
+
+        assert_eq!(
+            pinned_slug("Quantum Error Correction"),
+            "quantum-error-correction"
+        );
+
+        // Neither helper may return the empty string — it is the one page
+        // name `writable_page_path` refuses outright, and both feed a
+        // filename.
+        let kref = crate::kms::KmsRef {
+            name: "t".into(),
+            scope: crate::kms::KmsScope::Project,
+            root: std::env::temp_dir().join("thclaws-page-slug-test"),
+        };
+        for raw in [
+            "ยุคที่ความฉลาดล้นเหลือ",
+            "日本語",
+            "  ",
+            "///",
+            "---",
+            "..",
+            "a/b",
+        ] {
+            for slug in [ingest_slug(raw), pinned_slug(raw)] {
+                assert!(!slug.is_empty(), "empty slug for {raw:?}");
+                assert!(
+                    crate::kms::writable_page_path(&kref, &slug).is_ok(),
+                    "KMS refused {slug:?} (from {raw:?})"
+                );
+            }
+        }
+    }
+
     /// Answers by what the prompt is for, so parallel digests can't
     /// desynchronise a scripted queue.
     struct KeyedProvider {
@@ -933,6 +1349,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
+            let prompt = format!("{}\n{prompt}", req.system.clone().unwrap_or_default());
             let body = if prompt.contains("You are extracting structured knowledge") {
                 self.calls.lock().unwrap().push("digest".into());
                 if prompt.contains("URL: https://s1") {
@@ -991,7 +1408,12 @@ mod tests {
                 Ok(ProviderEvent::TextDelta(body)),
                 Ok(ProviderEvent::MessageStop {
                     stop_reason: Some("end_turn".into()),
-                    usage: None,
+                    usage: Some(crate::providers::Usage {
+                        input_tokens: 100,
+                        output_tokens: 10,
+                        cache_read_input_tokens: Some(40),
+                        ..Default::default()
+                    }),
                 }),
             ];
             Ok(Box::pin(stream::iter(events)))
@@ -1083,6 +1505,111 @@ mod tests {
         }
     }
 
+    /// Answers a local-document ingest entirely in Thai — which is what
+    /// the model does when the document is Thai.
+    struct ThaiProvider;
+
+    #[async_trait]
+    impl Provider for ThaiProvider {
+        async fn stream(&self, req: StreamRequest) -> Result<EventStream> {
+            let prompt = req
+                .messages
+                .iter()
+                .flat_map(|m| m.content.iter())
+                .filter_map(|b| match b {
+                    crate::types::ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let prompt = format!("{}\n{prompt}", req.system.clone().unwrap_or_default());
+            let body = if prompt.contains("You are extracting structured knowledge") {
+                r#"{"entities":[{"name":"ความอุดมสมบูรณ์","slug":"ความอุดมสมบูรณ์","kind":"concept"}],
+                    "claims":[{"text":"ความฉลาดจะถูกลง","quote":"ความฉลาดจะถูกลง","entities":["ความอุดมสมบูรณ์"],"confidence":0.9}],
+                    "links_to_known":[]}"#
+                    .to_string()
+            } else if prompt.contains("planning a knowledge-base entry") {
+                r#"[{"slug":"ความอุดมสมบูรณ์","kind":"concept","title":"ความอุดมสมบูรณ์","action":"create","claim_ids":["s1c1"],"related":[]}]"#
+                    .to_string()
+            } else if prompt.contains("You are writing ONE zettelkasten note") {
+                "ความฉลาดจะถูกลงเรื่อย ๆ [c:s1c1].".to_string()
+            } else {
+                String::new()
+            };
+            let events: Vec<Result<ProviderEvent>> = vec![
+                Ok(ProviderEvent::MessageStart {
+                    model: "mock".into(),
+                }),
+                Ok(ProviderEvent::TextDelta(body)),
+                Ok(ProviderEvent::MessageStop {
+                    stop_reason: Some("end_turn".into()),
+                    usage: None,
+                }),
+            ];
+            Ok(Box::pin(stream::iter(events)))
+        }
+    }
+
+    /// Ingesting a Thai document as atomic notes, end to end.
+    ///
+    /// This is the run that failed with `tool error: invalid page name ''`
+    /// — after the ingest had already written the source and the stub, so
+    /// the KMS was left holding a document with no notes. It broke in two
+    /// places, and a helper-level test caught only the first, so this
+    /// drives the whole pipeline: the topic page must fill in the stub the
+    /// ingest wrote, under its Thai name, and the Thai note beside it must
+    /// exist rather than having been filtered out for sanitising to "".
+    #[tokio::test]
+    async fn a_thai_document_ingests_into_the_stub_the_ingest_wrote() {
+        let _h = crate::research::test_helpers::scoped_home();
+        let alias = "ยุคที่ความฉลาดล้นเหลือ";
+        let kref = crate::kms::create("abundance", crate::kms::KmsScope::Project).unwrap();
+        std::fs::create_dir_all(kref.root.join("sources")).unwrap();
+        std::fs::create_dir_all(kref.root.join("pages")).unwrap();
+        std::fs::write(
+            kref.root.join("sources").join(format!("{alias}.md")),
+            "---\ntitle: \"ยุคที่ความฉลาดล้นเหลือ\"\n---\n\nความฉลาดจะถูกลง\n",
+        )
+        .unwrap();
+        // What `kms::ingest` leaves behind for the run to adopt.
+        std::fs::write(
+            kref.root.join("pages").join(format!("{alias}.md")),
+            "---\ntitle: \"ยุคที่ความฉลาดล้นเหลือ\"\ntype: note\n---\n\nstub\n",
+        )
+        .unwrap();
+
+        let cfg = JobConfig {
+            kms_target: Some("abundance".into()),
+            local_source: Some(alias.into()),
+            legacy: false,
+            min_iter: 1,
+            max_iter: 1,
+            ..JobConfig::default()
+        };
+        let (id, cancel) = manager().register(alias.into(), &cfg);
+        let result = run_with_tools(PipelineRequest {
+            job_id: &id,
+            query: alias.into(),
+            config: cfg,
+            provider: Arc::new(ThaiProvider),
+            model: "mock".into(),
+            cancel,
+            tools: Arc::new(Tools),
+            digest: None,
+        })
+        .await
+        .expect("a Thai document must ingest");
+
+        assert_eq!(result, format!("abundance/{alias}.md"));
+        let moc = std::fs::read_to_string(kref.root.join("pages").join(format!("{alias}.md")))
+            .expect("the topic page is the stub, filled in");
+        assert!(moc.contains("kind: moc"), "stub not adopted as MOC: {moc}");
+        assert!(
+            kref.root.join("pages/ความอุดมสมบูรณ์.md").exists(),
+            "a Thai note slug must survive planning"
+        );
+    }
+
     #[tokio::test]
     async fn v2_writes_atomic_notes_and_moc_with_verified_citations() {
         let _h = crate::research::test_helpers::scoped_home();
@@ -1095,7 +1622,7 @@ mod tests {
             max_iter: 4,
             ..JobConfig::default()
         };
-        let result = run_with_tools(PipelineRequest {
+        let result = llm_calls::track_usage(run_with_tools(PipelineRequest {
             job_id: &id,
             query: "กฎหมายแรงงานไทย".into(),
             config: cfg,
@@ -1104,7 +1631,7 @@ mod tests {
             cancel,
             tools: Arc::new(Tools),
             digest: None,
-        })
+        }))
         .await
         .unwrap();
         assert_eq!(result, "thai-labour-law/thai-labour-law.md");
@@ -1134,6 +1661,27 @@ mod tests {
         assert!(kref.root.join("sources").read_dir().unwrap().count() >= 2);
         let runs: Vec<_> = kref.root.join("runs").read_dir().unwrap().collect();
         assert_eq!(runs.len(), 1);
+        // dev-plan/64 P2.7: the run log says what the run cost. Every call
+        // of the run is in it — digests and notes run concurrently, and the
+        // ledger has to follow them.
+        let log = std::fs::read_to_string(runs[0].as_ref().unwrap().path()).unwrap();
+        let calls = provider.calls.lock().unwrap().len();
+        assert!(
+            log.contains(&format!("llm_calls: {calls}\n")),
+            "{calls} calls:\n{log}"
+        );
+        assert!(
+            log.contains(&format!("input_tokens: {}\n", calls * 100)),
+            "{log}"
+        );
+        assert!(
+            log.contains(&format!("cached_input_tokens: {}\n", calls * 40)),
+            "{log}"
+        );
+        assert!(
+            !log.contains("cost_usd"),
+            "an unpriced model has no cost: {log}"
+        );
         let calls = provider.calls.lock().unwrap().clone();
         assert_eq!(calls.iter().filter(|c| *c == "digest").count(), 2);
         assert_eq!(calls.iter().filter(|c| *c == "plan").count(), 1);

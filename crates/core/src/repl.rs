@@ -442,6 +442,12 @@ pub enum SlashCommand {
         mode: SystemPromptViewMode,
     },
     Version,
+    /// `/logs [<lines>] [panic]` — tail the engine's own log files.
+    /// `panic` reads `panic.log` instead, and is never truncated.
+    Logs {
+        panic: bool,
+        lines: usize,
+    },
     Cwd,
     Thinking(String),
     Compact,
@@ -684,6 +690,9 @@ pub enum SlashCommand {
         page: Option<String>,
         /// Repair wikilinks a linker wrote inside a URL.
         fix: bool,
+        /// `--ground`: look in the archived source for what supports each
+        /// flagged sentence, and record it. Implies `--llm`.
+        ground: bool,
     },
     /// dev-plan/36 Tier 3.B: drop `<kms_root>/.index/` and rebuild
     /// from `pages/` on disk. Used after a `merge_into` /
@@ -694,6 +703,14 @@ pub enum SlashCommand {
     /// self-healing case. No-op when the `kms_search_index` Cargo
     /// feature is off (the slash command prints a clear message).
     KmsReindex(String),
+    /// `/kms trash <name>` — what dev-plan/64 P3.1 has kept.
+    KmsTrash(String),
+    /// `/kms restore <name> [page]` — a page's newest kept version, or,
+    /// with no page, a dropped KMS.
+    KmsRestore {
+        name: String,
+        page: Option<String>,
+    },
     /// dev-plan/36 follow-up: operator-facing one-shot search
     /// without a model round-trip. `name` accepts `*` to fan out
     /// across every visible KMS (project + user scope per
@@ -1310,7 +1327,8 @@ fn parse_research_refresh(args: &str) -> SlashCommand {
     let mut older_than_days: Option<u32> = None;
     let mut digest_model: Option<String> = None;
     let mut language: Option<String> = None;
-    let mut it = args.split_whitespace().peekable();
+    let owned = kms_tokens(args);
+    let mut it = owned.iter().map(String::as_str).peekable();
     while let Some(t) = it.next() {
         match t {
             "--all" => all = true,
@@ -1379,7 +1397,10 @@ fn bad_flag_value(flag: &str, got: &str) -> SlashCommand {
 }
 
 fn parse_research_start(args: &str) -> SlashCommand {
-    let mut tokens = args.split_whitespace().collect::<Vec<&str>>();
+    // `--kms "Age of Abundance"` and `--kms Age of Abundance` both name the
+    // KMS; splitting on whitespace researched into one called `Age`.
+    let owned = kms_tokens(args);
+    let mut tokens = owned.iter().map(String::as_str).collect::<Vec<&str>>();
     let mut kms_target: Option<String> = None;
     let mut min_iter: Option<u32> = None;
     let mut max_iter: Option<u32> = None;
@@ -1896,6 +1917,25 @@ pub fn parse_slash(input: &str) -> Option<SlashCommand> {
             SlashCommand::System { mode }
         }
         "version" | "v" => SlashCommand::Version,
+        "logs" | "log" => {
+            let mut panic = false;
+            // Enough to cover a research round without burying the answer.
+            let mut lines = 120usize;
+            for tok in args.split_whitespace() {
+                match tok {
+                    "panic" | "panics" => panic = true,
+                    n => match n.parse::<usize>() {
+                        Ok(n) => lines = n.clamp(1, 2000),
+                        Err(_) => {
+                            return Some(SlashCommand::Unknown(format!(
+                                "unknown argument '{n}' — usage: /logs [<lines>] [panic]"
+                            )))
+                        }
+                    },
+                }
+            }
+            SlashCommand::Logs { panic, lines }
+        }
         "cwd" | "pwd" => SlashCommand::Cwd,
         "thinking" => SlashCommand::Thinking(args.to_string()),
         "compact" => SlashCommand::Compact,
@@ -3235,6 +3275,186 @@ fn parse_goal_start_args(rest: &str) -> SlashCommand {
     }
 }
 
+/// Split slash-command arguments on whitespace, keeping a `"quoted"` or
+/// `'quoted'` group together as one argument.
+///
+/// A KMS name may contain spaces — the sidebar happily creates
+/// "Age of Abundance" — so a subcommand that takes two names, or a name
+/// plus flags, cannot just `split_whitespace()` and hope.
+fn split_slash_args(rest: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut started = false;
+    for c in rest.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => cur.push(c),
+            None if c == '"' || c == '\'' => {
+                quote = Some(c);
+                started = true;
+            }
+            None if c.is_whitespace() => {
+                if started || !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                    started = false;
+                }
+            }
+            None => cur.push(c),
+        }
+    }
+    if started || !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Wrap a name so `split_slash_args` gives it back whole. Used where the
+/// GUI hands a user-chosen name to the slash dispatcher as text.
+pub fn quote_slash_arg(name: &str) -> String {
+    if name.contains('"') {
+        format!("'{name}'")
+    } else {
+        format!("\"{name}\"")
+    }
+}
+
+/// A KMS whose name is spelled exactly `name`.
+///
+/// Not the same as the filesystem finding it: on a case-insensitive disk
+/// `notes my` opens the folder `Notes My`. Deciding where a name ends on
+/// that basis pulled `dump notes my idea` into a base the user never
+/// named, when a base called `notes` was sitting right there.
+fn exact_kms(name: &str) -> Option<crate::kms::KmsRef> {
+    crate::kms::resolve_exact(name).filter(|k| k.name == name)
+}
+
+/// Tokens of a `/kms` argument string, with a KMS name kept whole.
+///
+/// A name may contain spaces — the GUI creates "Age of Abundance" — and
+/// every subcommand here used to split on whitespace, so eleven of them
+/// quietly retargeted at a KMS called "Age" (`/kms dump` went further and
+/// wrote the rest of the name into the note). Two ways to keep a name
+/// whole: quote it, or just type it — a run of tokens that spells the
+/// name of a KMS that exists is merged back into one.
+fn kms_tokens(rest: &str) -> Vec<String> {
+    let toks = split_slash_args(rest);
+    let mut out: Vec<String> = Vec::with_capacity(toks.len());
+    let mut i = 0;
+    while i < toks.len() {
+        let mut merged = None;
+        if !toks[i].starts_with("--") {
+            // Longest run first, so "Age of Abundance 2" beats "Age of
+            // Abundance". Exact names only on the first pass; the loose
+            // match `resolve` also does is tried second, and not at all
+            // when the first word is already a base's exact name — or
+            // `dump notes my idea` would be pulled into a base called
+            // "Notes My" that the user never mentioned.
+            let runs = |loose: bool| {
+                (i + 2..=toks.len()).rev().find_map(|j| {
+                    if toks[i..j].iter().any(|t| t.starts_with("--")) {
+                        return None;
+                    }
+                    let candidate = toks[i..j].join(" ");
+                    let found = if loose {
+                        crate::kms::resolve(&candidate)
+                    } else {
+                        exact_kms(&candidate)
+                    };
+                    found.map(|k| (k.name, j))
+                })
+            };
+            merged = runs(false);
+            if merged.is_none() && exact_kms(&toks[i]).is_none() {
+                merged = runs(true);
+            }
+        }
+        match merged {
+            Some((name, j)) => {
+                out.push(name);
+                i = j;
+            }
+            None => {
+                out.push(toks[i].clone());
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// The whole rest of the line as a KMS name, minus one pair of quotes.
+///
+/// `use`, `off`, `show`, `lint` and `reindex` take everything after the
+/// subcommand as the name, so a spaced name always worked bare — and a
+/// quoted one did not: `/kms lint "Age of Abundance"` looked for a KMS
+/// whose name began and ended with a quotation mark. Quoting has to be
+/// harmless everywhere, since it is what the other subcommands need.
+fn whole_name(rest: &str) -> String {
+    let t = rest.trim();
+    for q in ['"', '\''] {
+        if t.len() >= 2 && t.starts_with(q) && t.ends_with(q) {
+            return t[1..t.len() - 1].trim().to_string();
+        }
+    }
+    t.to_string()
+}
+
+/// `(<kms name>, <rest of the line, verbatim>)` for subcommands of the
+/// shape `<kms> <free text…>`. The name is quoted, or names an existing
+/// KMS however many words that takes, or is the first word.
+fn split_kms_name(rest: &str) -> (String, &str) {
+    let rest = rest.trim_start();
+    if let Some(q) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') {
+        if let Some(close) = rest[1..].find(q) {
+            return (
+                rest[1..1 + close].to_string(),
+                rest[2 + close..].trim_start(),
+            );
+        }
+    }
+    // Byte offset of the end of each whitespace-separated word.
+    let mut ends: Vec<usize> = Vec::new();
+    let mut in_word = false;
+    for (i, c) in rest.char_indices() {
+        if c.is_whitespace() {
+            if in_word {
+                ends.push(i);
+                in_word = false;
+            }
+        } else {
+            in_word = true;
+        }
+    }
+    if in_word {
+        ends.push(rest.len());
+    }
+    // Same two passes as `kms_tokens`: exact names first, the loose match
+    // only when the first word is not itself a base.
+    let run = |loose: bool| {
+        ends.iter().skip(1).rev().find_map(|&end| {
+            let candidate = rest[..end].split_whitespace().collect::<Vec<_>>().join(" ");
+            let found = if loose {
+                crate::kms::resolve(&candidate)
+            } else {
+                exact_kms(&candidate)
+            };
+            found.map(|k| (k.name, end))
+        })
+    };
+    let first_is_exact = ends
+        .first()
+        .is_some_and(|&end| exact_kms(&rest[..end]).is_some());
+    if let Some((name, end)) = run(false).or_else(|| if first_is_exact { None } else { run(true) })
+    {
+        return (name, rest[end..].trim_start());
+    }
+    match ends.first() {
+        Some(&end) => (rest[..end].to_string(), rest[end..].trim_start()),
+        None => (String::new(), ""),
+    }
+}
+
 fn parse_kms_subcommand(args: &str) -> SlashCommand {
     let (sub, rest) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
     let rest = rest.trim();
@@ -3248,7 +3468,8 @@ fn parse_kms_subcommand(args: &str) -> SlashCommand {
             // as a no-op alias so muscle memory from the old default
             // doesn't break on upgrade.
             let mut project = true;
-            let mut parts: Vec<&str> = rest.split_whitespace().collect();
+            let toks = kms_tokens(rest);
+            let mut parts: Vec<&str> = toks.iter().map(String::as_str).collect();
             if let Some(i) = parts.iter().position(|p| *p == "--user") {
                 project = false;
                 parts.remove(i);
@@ -3269,21 +3490,21 @@ fn parse_kms_subcommand(args: &str) -> SlashCommand {
             if rest.is_empty() {
                 SlashCommand::Unknown("usage: /kms use <name>".into())
             } else {
-                SlashCommand::KmsUse(rest.to_string())
+                SlashCommand::KmsUse(whole_name(rest))
             }
         }
         "off" | "unuse" => {
             if rest.is_empty() {
                 SlashCommand::Unknown("usage: /kms off <name>".into())
             } else {
-                SlashCommand::KmsOff(rest.to_string())
+                SlashCommand::KmsOff(whole_name(rest))
             }
         }
         "show" | "cat" => {
             if rest.is_empty() {
                 SlashCommand::Unknown("usage: /kms show <name>".into())
             } else {
-                SlashCommand::KmsShow(rest.to_string())
+                SlashCommand::KmsShow(whole_name(rest))
             }
         }
         "ingest" | "add" => {
@@ -3292,7 +3513,8 @@ fn parse_kms_subcommand(args: &str) -> SlashCommand {
             // M6.25 BUG #8: detect URL vs PDF vs text and dispatch to the
             // matching ingest variant. URL: starts with http:// or https://.
             // PDF: file extension is .pdf. Otherwise: standard text ingest.
-            let mut parts: Vec<&str> = rest.split_whitespace().collect();
+            let toks = kms_tokens(rest);
+            let mut parts: Vec<&str> = toks.iter().map(String::as_str).collect();
             let mut force = false;
             if let Some(i) = parts.iter().position(|p| *p == "--force" || *p == "-f") {
                 force = true;
@@ -3361,7 +3583,8 @@ fn parse_kms_subcommand(args: &str) -> SlashCommand {
         "entry" | "home" => {
             let mut name: Option<String> = None;
             let (mut set, mut clear) = (None, false);
-            let mut it = rest.split_whitespace();
+            let toks = kms_tokens(rest);
+            let mut it = toks.iter().map(String::as_str);
             while let Some(tok) = it.next() {
                 match tok {
                     "--set" => set = it.next().map(|s| s.trim_end_matches(".md").to_string()),
@@ -3383,11 +3606,17 @@ fn parse_kms_subcommand(args: &str) -> SlashCommand {
         "verify" | "audit" => {
             let mut name: Option<String> = None;
             let (mut llm, mut stale_days, mut page, mut fix) = (false, None, None, false);
-            let mut it = rest.split_whitespace();
+            let mut ground = false;
+            let toks = kms_tokens(rest);
+            let mut it = toks.iter().map(String::as_str);
             while let Some(tok) = it.next() {
                 match tok {
                     "--llm" => llm = true,
                     "--fix" => fix = true,
+                    "--ground" => {
+                        ground = true;
+                        llm = true;
+                    }
                     "--stale-days" => stale_days = it.next().and_then(|v| v.parse::<i64>().ok()),
                     "--page" => page = it.next().map(|s| s.trim_end_matches(".md").to_string()),
                     other if !other.starts_with("--") => {
@@ -3397,7 +3626,7 @@ fn parse_kms_subcommand(args: &str) -> SlashCommand {
                     }
                     other => {
                         return SlashCommand::Unknown(format!(
-                            "unknown flag '{other}' — usage: /kms verify [<name>] [--llm] [--fix] [--stale-days N] [--page <slug>]"
+                            "unknown flag '{other}' — usage: /kms verify [<name>] [--llm] [--ground] [--fix] [--stale-days N] [--page <slug>]"
                         ));
                     }
                 }
@@ -3408,6 +3637,7 @@ fn parse_kms_subcommand(args: &str) -> SlashCommand {
                 stale_days,
                 page,
                 fix,
+                ground,
             }
         }
         "lint" | "check" | "doctor" => {
@@ -3415,7 +3645,7 @@ fn parse_kms_subcommand(args: &str) -> SlashCommand {
             if rest.is_empty() {
                 SlashCommand::Unknown("usage: /kms lint <name>".into())
             } else {
-                SlashCommand::KmsLint(rest.to_string())
+                SlashCommand::KmsLint(whole_name(rest))
             }
         }
         "reindex" => {
@@ -3426,7 +3656,35 @@ fn parse_kms_subcommand(args: &str) -> SlashCommand {
             if rest.is_empty() {
                 SlashCommand::Unknown("usage: /kms reindex <name>".into())
             } else {
-                SlashCommand::KmsReindex(rest.to_string())
+                SlashCommand::KmsReindex(whole_name(rest))
+            }
+        }
+        "trash" => {
+            if rest.is_empty() {
+                SlashCommand::Unknown("usage: /kms trash <name>".into())
+            } else {
+                SlashCommand::KmsTrash(whole_name(rest))
+            }
+        }
+        "restore" | "undelete" | "undrop" => {
+            // A dropped KMS does not resolve, so its name cannot be found
+            // by asking which prefix of the line is a KMS. Quote a spaced
+            // name; an unquoted line is a name, then a page.
+            let toks = split_slash_args(rest);
+            match toks.as_slice() {
+                [] => SlashCommand::Unknown("usage: /kms restore <name> [page]".into()),
+                [name] => SlashCommand::KmsRestore {
+                    name: name.clone(),
+                    page: None,
+                },
+                _ => {
+                    let (name, page) = split_kms_name(rest);
+                    let page = page.trim();
+                    SlashCommand::KmsRestore {
+                        name,
+                        page: (!page.is_empty()).then(|| whole_name(page)),
+                    }
+                }
             }
         }
         "search" => {
@@ -3441,23 +3699,14 @@ fn parse_kms_subcommand(args: &str) -> SlashCommand {
             //   /kms search * token refresh
             //   /kms search notes --pattern bearer
             //   /kms search * --pattern ^TODO
-            let mut tokens = rest.split_whitespace();
-            let name = match tokens.next() {
-                Some(n) => n.to_string(),
-                None => {
-                    return SlashCommand::Unknown(
-                        "usage: /kms search <name|*> <query> | --pattern <regex>".into(),
-                    );
-                }
-            };
-            // The rest of the line is the query body. Manually
-            // re-slice to preserve internal whitespace ("token
-            // refresh" stays two words separated by one space, not
-            // re-joined arbitrarily).
-            let after_name = rest
-                .strip_prefix(&name)
-                .map(|s| s.trim_start())
-                .unwrap_or("");
+            // The name may have spaces in it; the rest of the line is the
+            // query body, kept verbatim so quotes and spacing survive.
+            let (name, after_name) = split_kms_name(rest);
+            if name.is_empty() {
+                return SlashCommand::Unknown(
+                    "usage: /kms search <name|*> <query> | --pattern <regex>".into(),
+                );
+            }
             let (is_pattern, query_body) =
                 if let Some(rest_after_flag) = after_name.strip_prefix("--pattern ") {
                     (true, rest_after_flag.trim().to_string())
@@ -3483,7 +3732,8 @@ fn parse_kms_subcommand(args: &str) -> SlashCommand {
             // --fix hands the report to the kms-linker subagent.
             let mut name: Option<String> = None;
             let mut fix = false;
-            for tok in rest.split_whitespace() {
+            let toks = kms_tokens(rest);
+            for tok in toks.iter().map(String::as_str) {
                 match tok {
                     "--fix" => fix = true,
                     other if !other.starts_with("--") => {
@@ -3510,7 +3760,8 @@ fn parse_kms_subcommand(args: &str) -> SlashCommand {
             // pipeline; dry-run by default, --apply executes.
             let mut name: Option<String> = None;
             let mut apply = false;
-            for tok in rest.split_whitespace() {
+            let toks = kms_tokens(rest);
+            for tok in toks.iter().map(String::as_str) {
                 match tok {
                     "--apply" | "--execute" => apply = true,
                     "--dry-run" | "--plan" => apply = false,
@@ -3536,8 +3787,8 @@ fn parse_kms_subcommand(args: &str) -> SlashCommand {
         "dump" | "capture" => {
             // `/kms dump <name> <text...>` — rest of the line after the
             // KMS name is the dump body. Multi-line paste is fine.
-            let mut parts = rest.splitn(2, char::is_whitespace);
-            match (parts.next(), parts.next()) {
+            let (kms_name, kms_text) = split_kms_name(rest);
+            match (Some(kms_name.as_str()), Some(kms_text)) {
                 (Some(name), Some(text))
                     if !name.is_empty() && !text.trim().is_empty() =>
                 {
@@ -3554,8 +3805,8 @@ fn parse_kms_subcommand(args: &str) -> SlashCommand {
         "challenge" | "redteam" => {
             // `/kms challenge <name> <idea...>` — searches the vault for
             // counter-evidence to the user's current position. Read-only.
-            let mut parts = rest.splitn(2, char::is_whitespace);
-            match (parts.next(), parts.next()) {
+            let (kms_name, kms_text) = split_kms_name(rest);
+            match (Some(kms_name.as_str()), Some(kms_text)) {
                 (Some(name), Some(idea))
                     if !name.is_empty() && !idea.trim().is_empty() =>
                 {
@@ -3572,7 +3823,8 @@ fn parse_kms_subcommand(args: &str) -> SlashCommand {
         "merge" | "combine" => {
             // `/kms merge <src> <dst>` — copy <src> into <dst> with
             // rename-on-collision. Both positional, both required.
-            let mut parts = rest.split_whitespace();
+            let toks = kms_tokens(rest);
+            let mut parts = toks.iter().map(String::as_str);
             match (parts.next(), parts.next(), parts.next()) {
                 (Some(src), Some(dst), None) if !src.is_empty() && !dst.is_empty() => {
                     SlashCommand::KmsMerge {
@@ -3589,7 +3841,8 @@ fn parse_kms_subcommand(args: &str) -> SlashCommand {
             let mut name: Option<String> = None;
             let mut scope = crate::kms::KmsScope::Project;
             let mut drop = false;
-            for tok in rest.split_whitespace() {
+            let toks = kms_tokens(rest);
+            for tok in toks.iter().map(String::as_str) {
                 match tok {
                     "--user" => scope = crate::kms::KmsScope::User,
                     "--project" => scope = crate::kms::KmsScope::Project,
@@ -3616,7 +3869,8 @@ fn parse_kms_subcommand(args: &str) -> SlashCommand {
             let mut apply = false;
             let mut min_len: usize = 4;
             let mut llm = false;
-            let mut tokens = rest.split_whitespace().peekable();
+            let toks = kms_tokens(rest);
+            let mut tokens = toks.iter().map(String::as_str).peekable();
             while let Some(tok) = tokens.next() {
                 match tok {
                     "--apply" | "--execute" => apply = true,
@@ -3658,29 +3912,35 @@ fn parse_kms_subcommand(args: &str) -> SlashCommand {
             SlashCommand::KmsLink { name, apply, min_len, llm }
         }
         "rename" | "mv" => {
-            let mut it = rest.split_whitespace();
+            // Two names, so spaces have to be quoted — there is no way to
+            // tell where one name ends otherwise. The GUI quotes both.
+            let mut it = kms_tokens(rest).into_iter();
             match (it.next(), it.next()) {
-                (Some(o), Some(n)) => SlashCommand::KmsRename {
-                    old: o.to_string(),
-                    new: n.to_string(),
-                },
-                _ => SlashCommand::Unknown("usage: /kms rename <old> <new>".into()),
+                (Some(o), Some(n)) if !o.is_empty() && !n.is_empty() => {
+                    SlashCommand::KmsRename { old: o, new: n }
+                }
+                _ => SlashCommand::Unknown(
+                    "usage: /kms rename <old> <new> (quote a name that has spaces)".into(),
+                ),
             }
         }
         "drop" | "delete" | "rm" => {
             // `/kms drop <name> [--force]` — destructive. Dry-run by
             // default; `--force` actually removes the directory tree.
-            let mut name: Option<String> = None;
+            //
+            // The name is every non-flag argument joined back together.
+            // Taking only the first token quietly retargeted the command
+            // at a KMS that does not exist — "Age of Abundance" became
+            // "Age" — so the sidebar's Delete could not remove any KMS
+            // whose name has a space in it, and reported "no KMS named
+            // 'Age'" about a name the user never typed.
+            let mut words: Vec<String> = Vec::new();
             let mut force = false;
-            for tok in rest.split_whitespace() {
-                match tok {
+            for tok in kms_tokens(rest) {
+                match tok.as_str() {
                     "--force" | "-f" => force = true,
                     "--dry-run" => force = false,
-                    other if !other.starts_with("--") => {
-                        if name.is_none() {
-                            name = Some(other.to_string());
-                        }
-                    }
+                    other if !other.starts_with("--") => words.push(tok),
                     other => {
                         return SlashCommand::Unknown(format!(
                             "unknown flag '{other}' — usage: /kms drop <name> [--force]"
@@ -3688,11 +3948,11 @@ fn parse_kms_subcommand(args: &str) -> SlashCommand {
                     }
                 }
             }
-            match name {
-                Some(n) => SlashCommand::KmsDrop { name: n, force },
-                None => {
-                    SlashCommand::Unknown("usage: /kms drop <name> [--force]".into())
-                }
+            let name = words.join(" ");
+            if name.is_empty() {
+                SlashCommand::Unknown("usage: /kms drop <name> [--force]".into())
+            } else {
+                SlashCommand::KmsDrop { name, force }
             }
         }
         "reconcile" | "resolve" => {
@@ -3701,7 +3961,8 @@ fn parse_kms_subcommand(args: &str) -> SlashCommand {
             let mut name: Option<String> = None;
             let mut focus: Option<String> = None;
             let mut apply = false;
-            for tok in rest.split_whitespace() {
+            let toks = kms_tokens(rest);
+            for tok in toks.iter().map(String::as_str) {
                 match tok {
                     "--apply" | "--execute" => apply = true,
                     "--dry-run" | "--plan" => apply = false,
@@ -3733,7 +3994,8 @@ fn parse_kms_subcommand(args: &str) -> SlashCommand {
             // (defaults to `./<name>-site` resolved by the caller).
             let mut name: Option<String> = None;
             let mut output_dir: Option<String> = None;
-            for tok in rest.split_whitespace() {
+            let toks = kms_tokens(rest);
+            for tok in toks.iter().map(String::as_str) {
                 if tok.starts_with("--") {
                     return SlashCommand::Unknown(format!(
                         "unknown flag '{tok}' — usage: /kms html <name> [<output-dir>]"
@@ -3761,7 +4023,8 @@ fn parse_kms_subcommand(args: &str) -> SlashCommand {
             // output dir (defaults to `./<name>-okf` at dispatch time).
             let mut name: Option<String> = None;
             let mut output_dir: Option<String> = None;
-            for tok in rest.split_whitespace() {
+            let toks = kms_tokens(rest);
+            for tok in toks.iter().map(String::as_str) {
                 if tok.starts_with("--") {
                     return SlashCommand::Unknown(format!(
                         "unknown flag '{tok}' — usage: /kms export-okf <name> [<output-dir>]"
@@ -3790,7 +4053,8 @@ fn parse_kms_subcommand(args: &str) -> SlashCommand {
             let mut bundle: Option<String> = None;
             let mut name: Option<String> = None;
             let mut scope = crate::kms::KmsScope::User;
-            for tok in rest.split_whitespace() {
+            let toks = kms_tokens(rest);
+            for tok in toks.iter().map(String::as_str) {
                 match tok {
                     "--project" => scope = crate::kms::KmsScope::Project,
                     "--user" => scope = crate::kms::KmsScope::User,
@@ -3824,7 +4088,8 @@ fn parse_kms_subcommand(args: &str) -> SlashCommand {
             // to execute. Order-insensitive so `--apply <name>` also works.
             let mut name: Option<String> = None;
             let mut apply = false;
-            for tok in rest.split_whitespace() {
+            let toks = kms_tokens(rest);
+            for tok in toks.iter().map(String::as_str) {
                 match tok {
                     "--apply" | "--execute" | "--run" => apply = true,
                     "--dry-run" | "--plan" => apply = false,
@@ -3851,8 +4116,8 @@ fn parse_kms_subcommand(args: &str) -> SlashCommand {
             // M6.25 BUG #4: file the latest assistant message as a new
             // KMS page. Syntax: /kms file-answer <kms-name> <title>
             // (everything after the kms name is the title).
-            let mut parts = rest.splitn(2, char::is_whitespace);
-            match (parts.next(), parts.next()) {
+            let (kms_name, kms_text) = split_kms_name(rest);
+            match (Some(kms_name.as_str()), Some(kms_text)) {
                 (Some(name), Some(title)) if !name.is_empty() && !title.trim().is_empty() => {
                     SlashCommand::KmsFileAnswer {
                         name: name.to_string(),
@@ -4131,6 +4396,35 @@ pub fn built_in_commands() -> &'static [BuiltInCommand] {
         BuiltInCommand { name: "system",   description: "Show the active system prompt",               category: "Context", usage: "[stats | grep <pattern>]" },
         BuiltInCommand { name: "memory",   description: "List memory entries",                        category: "Context", usage: "" },
         BuiltInCommand { name: "kms",      description: "List knowledge bases",                       category: "Context", usage: "" },
+        // dev-plan/64 P5.8: the subcommands, as entries a person can
+        // find by typing. `/kms` carried one line and a wall of `|`
+        // alternatives in its usage string, so every one of these was
+        // discoverable only by reading the source or the manual.
+        BuiltInCommand { name: "kms new",     description: "Create a knowledge base",                  category: "Knowledge base", usage: "[--project|--user] NAME" },
+        BuiltInCommand { name: "kms use",     description: "Attach a knowledge base to this session",  category: "Knowledge base", usage: "NAME" },
+        BuiltInCommand { name: "kms off",     description: "Detach a knowledge base from this session", category: "Knowledge base", usage: "[NAME]" },
+        BuiltInCommand { name: "kms show",    description: "Print a page, or the index",               category: "Knowledge base", usage: "NAME [PAGE]" },
+        BuiltInCommand { name: "kms search",  description: "Full-text search inside a knowledge base",  category: "Knowledge base", usage: "NAME QUERY" },
+        BuiltInCommand { name: "kms ingest",  description: "Archive a file, folder or URL as a source", category: "Knowledge base", usage: "NAME PATH|URL" },
+        BuiltInCommand { name: "kms verify",  description: "Re-check claims against their sources; --llm also audits each page", category: "Knowledge base", usage: "NAME [--llm] [--ground] [--fix] [--page SLUG] [--stale-days N]" },
+        BuiltInCommand { name: "kms lint",    description: "Structural check: broken links, uncited archives, unfinished pages", category: "Knowledge base", usage: "NAME" },
+        BuiltInCommand { name: "kms trash",   description: "List versions kept from overwrites and deletes", category: "Knowledge base", usage: "NAME" },
+        BuiltInCommand { name: "kms restore", description: "Bring back a deleted page, or a dropped knowledge base", category: "Knowledge base", usage: "NAME [PAGE]" },
+        BuiltInCommand { name: "kms entry",   description: "Show or set the page a reader lands on",    category: "Knowledge base", usage: "NAME [--set SLUG|--clear]" },
+        BuiltInCommand { name: "kms link",    description: "Propose cross-links between pages",         category: "Knowledge base", usage: "NAME" },
+        BuiltInCommand { name: "kms rename",  description: "Rename a knowledge base or one of its pages", category: "Knowledge base", usage: "NAME [PAGE] NEW" },
+        BuiltInCommand { name: "kms merge",   description: "Copy one knowledge base into another",      category: "Knowledge base", usage: "SRC DST" },
+        BuiltInCommand { name: "kms drop",    description: "Remove a knowledge base (kept in the trash)", category: "Knowledge base", usage: "NAME" },
+        BuiltInCommand { name: "kms reindex", description: "Rebuild the index and the search index",    category: "Knowledge base", usage: "NAME" },
+        BuiltInCommand { name: "kms dump",    description: "Capture this session into a knowledge base", category: "Knowledge base", usage: "NAME" },
+        BuiltInCommand { name: "kms maintain",  description: "Agent pass: tidy, re-link and refresh what is stale", category: "Knowledge base", usage: "NAME" },
+        BuiltInCommand { name: "kms reconcile", description: "Agent pass: resolve pages that disagree", category: "Knowledge base", usage: "NAME" },
+        BuiltInCommand { name: "kms challenge", description: "Agent pass: argue against what the pages claim", category: "Knowledge base", usage: "NAME" },
+        BuiltInCommand { name: "kms wrap-up",   description: "Agent pass: write up what this session learned", category: "Knowledge base", usage: "NAME" },
+        BuiltInCommand { name: "kms html",      description: "Export a knowledge base as a static site", category: "Knowledge base", usage: "NAME [DIR]" },
+        BuiltInCommand { name: "kms export-okf", description: "Export as an Open Knowledge Format bundle", category: "Knowledge base", usage: "NAME [PATH]" },
+        BuiltInCommand { name: "kms import-okf", description: "Import an Open Knowledge Format bundle",  category: "Knowledge base", usage: "PATH [NAME]" },
+        BuiltInCommand { name: "kms file-answer", description: "File an answer from this session into a page", category: "Knowledge base", usage: "NAME" },
 
         // Skills, plugins, MCP
         BuiltInCommand { name: "skills",   description: "List installed skills",                      category: "Extensions", usage: "" },
@@ -4152,7 +4446,13 @@ pub fn built_in_commands() -> &'static [BuiltInCommand] {
         BuiltInCommand { name: "schedule", description: "Manage scheduled (cron) tasks",             category: "Automation", usage: "list | show <id> | run <id> | pause|resume <id> | rm <id>" },
 
         // Research
-        BuiltInCommand { name: "research", description: "Background research → KMS",                  category: "Research", usage: "[--lang th|en] [--max-notes N] [--novelty 0.X] [--worker-model ID] [--append] [--dry-run] [--kms NAME] [--legacy] <query> | refresh [<kms>] <slug>… | refresh [<kms>] --all [--older-than N] | list | status <id> | show <id> | cancel <id> | wait <id>" },
+        BuiltInCommand { name: "research", description: "Research a question into a knowledge base",  category: "Research", usage: "[--kms NAME] [--lang th|en] [--max-notes N] [--novelty 0.X] [--worker-model ID] [--append] [--dry-run] [--legacy] QUERY" },
+        BuiltInCommand { name: "research refresh", description: "Re-research existing notes and add what is new", category: "Research", usage: "[KMS] SLUG… | [KMS] --all [--older-than N]" },
+        BuiltInCommand { name: "research list",    description: "Show research jobs",                   category: "Research", usage: "" },
+        BuiltInCommand { name: "research status",  description: "Where one job has got to",             category: "Research", usage: "ID" },
+        BuiltInCommand { name: "research show",    description: "Print what a finished job produced",    category: "Research", usage: "ID" },
+        BuiltInCommand { name: "research cancel",  description: "Stop a running job",                   category: "Research", usage: "ID" },
+        BuiltInCommand { name: "research wait",    description: "Block until a job finishes",           category: "Research", usage: "ID" },
 
         // Enterprise
         BuiltInCommand { name: "policy", description: "Active org policy + audit sinks",              category: "Enterprise", usage: "status" },
@@ -4170,6 +4470,7 @@ pub fn built_in_commands() -> &'static [BuiltInCommand] {
         // System
         BuiltInCommand { name: "help",     description: "Show this help",                             category: "System", usage: "" },
         BuiltInCommand { name: "version",  description: "Show version",                               category: "System", usage: "" },
+        BuiltInCommand { name: "logs",     description: "Tail the engine log; `panic` for crashes",   category: "System", usage: "[lines] [panic]" },
         BuiltInCommand { name: "cwd",      description: "Show current working directory",             category: "System", usage: "" },
         BuiltInCommand { name: "usage",    description: "Show token usage by provider and model",     category: "System", usage: "" },
         BuiltInCommand { name: "cost",     description: "Show or reset accumulated session cost",     category: "System", usage: "[reset]" },
@@ -5444,6 +5745,7 @@ pub async fn run_print_mode_with(
     tool_registry.register(Arc::new(crate::tools::KmsWriteTool));
     tool_registry.register(Arc::new(crate::tools::KmsWriteSourceTool));
     tool_registry.register(Arc::new(crate::tools::KmsAppendTool));
+    tool_registry.register(Arc::new(crate::tools::KmsEditTool));
     tool_registry.register(Arc::new(crate::tools::KmsDeleteTool));
     // KmsCreate for /dream's `dreams` audit-log KMS bootstrap.
     tool_registry.register(Arc::new(crate::tools::KmsCreateTool));
@@ -5748,15 +6050,7 @@ pub async fn run_print_mode_with(
                 // (piped / scheduler-captured), so a scheduled run log
                 // always ends with a token + duration footer.
                 if verbose || !stdout_is_tty {
-                    let cache_info = match (
-                        usage.cache_creation_input_tokens,
-                        usage.cache_read_input_tokens,
-                    ) {
-                        (Some(c), Some(r)) if c > 0 || r > 0 => {
-                            format!(" · cache: +{}w/{}r", c, r)
-                        }
-                        _ => String::new(),
-                    };
+                    let cache_info = usage.cache_note();
                     let elapsed = format_duration(turn_start.elapsed());
                     eprintln!(
                         "[tokens: {}in/{}out{} · {}]",
@@ -5817,6 +6111,7 @@ pub async fn run_agent_workflow(
     tool_registry.register(Arc::new(crate::tools::KmsWriteTool));
     tool_registry.register(Arc::new(crate::tools::KmsWriteSourceTool));
     tool_registry.register(Arc::new(crate::tools::KmsAppendTool));
+    tool_registry.register(Arc::new(crate::tools::KmsEditTool));
     tool_registry.register(Arc::new(crate::tools::KmsDeleteTool));
     tool_registry.register(Arc::new(crate::tools::KmsCreateTool));
     tool_registry.register(Arc::new(crate::tools::MemoryReadTool));
@@ -6097,6 +6392,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
     tool_registry.register(Arc::new(crate::tools::KmsWriteTool));
     tool_registry.register(Arc::new(crate::tools::KmsWriteSourceTool));
     tool_registry.register(Arc::new(crate::tools::KmsAppendTool));
+    tool_registry.register(Arc::new(crate::tools::KmsEditTool));
     tool_registry.register(Arc::new(crate::tools::KmsDeleteTool));
     // KmsCreate for /dream's `dreams` audit-log KMS bootstrap.
     tool_registry.register(Arc::new(crate::tools::KmsCreateTool));
@@ -8612,6 +8908,9 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     let view = render_system_prompt_view(&system, &mode);
                     println!("{view}");
                 }
+                SlashCommand::Logs { panic, lines } => {
+                    print!("{}", crate::util::tail_log(panic, lines));
+                }
                 SlashCommand::Version => {
                     let v = crate::version::info();
                     println!("{COLOR_DIM}version:  {}{COLOR_RESET}", v.version);
@@ -10384,6 +10683,10 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     }
                 }
                 SlashCommand::KmsUse(name) => {
+                    // Settle on the base's real name before anything is compared or
+                    // saved: `resolve` also finds a base by slug, and recording the
+                    // spelling that found it would attach one base under two names.
+                    let name = crate::kms::resolve(&name).map(|k| k.name).unwrap_or(name);
                     if crate::kms::resolve(&name).is_none() {
                         println!(
                             "{COLOR_YELLOW}no KMS named '{name}' (try /kms list or /kms new {name}){COLOR_RESET}"
@@ -10418,6 +10721,10 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     }
                 }
                 SlashCommand::KmsOff(name) => {
+                    // Settle on the base's real name before anything is compared or
+                    // saved: `resolve` also finds a base by slug, and recording the
+                    // spelling that found it would attach one base under two names.
+                    let name = crate::kms::resolve(&name).map(|k| k.name).unwrap_or(name);
                     let before = config.kms_active.len();
                     config.kms_active.retain(|n| n != &name);
                     if config.kms_active.len() == before {
@@ -10569,7 +10876,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                             .unwrap_or_else(|_| std::path::PathBuf::from("."))
                             .join(&source)
                     };
-                    match crate::kms::ingest_pdf(&k, &source, alias.as_deref(), force).await {
+                    match crate::kms::ingest_pdf(&k, &source, alias.as_deref(), force, None).await {
                         Ok(r) => println!(
                             "{COLOR_DIM}ingested {} → {} — {}{COLOR_RESET}",
                             source.display(),
@@ -10666,6 +10973,16 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                         }
                     }
                 }
+                SlashCommand::KmsTrash(name) => match crate::kms_trash::apply_list(&name) {
+                    Ok(msg) => println!("{COLOR_DIM}{msg}{COLOR_RESET}"),
+                    Err(e) => println!("{COLOR_YELLOW}/kms trash: {e}{COLOR_RESET}"),
+                },
+                SlashCommand::KmsRestore { name, page } => {
+                    match crate::kms_trash::apply_restore(&name, page.as_deref()) {
+                        Ok(msg) => println!("{COLOR_GREEN}{msg}{COLOR_RESET}"),
+                        Err(e) => println!("{COLOR_YELLOW}/kms restore: {e}{COLOR_RESET}"),
+                    }
+                }
                 // M6.25 BUG #3: lint (CLI).
                 SlashCommand::KmsEntry { name, set, clear } => {
                     let Some(kname) = name.or_else(|| config.kms_active.last().cloned()) else {
@@ -10685,6 +11002,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     stale_days,
                     page,
                     fix,
+                    ground,
                 } => {
                     let Some(kname) = name.or_else(|| config.kms_active.last().cloned()) else {
                         println!(
@@ -10698,6 +11016,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                         page,
                         llm,
                         fix,
+                        ground,
                     };
                     // Same reason as `/kms link --llm`: the CLI's boot
                     // provider moved into the Agent, so re-derive one.
@@ -10931,10 +11250,11 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                         match crate::kms::remove(&name) {
                             Ok(report) => {
                                 println!(
-                                    "{COLOR_DIM}deleted KMS '{name}' ({} page(s), {} source(s)) from {}.{COLOR_RESET}",
+                                    "{COLOR_DIM}dropped KMS '{name}' ({} page(s), {} source(s)). It is kept for {} days — `/kms restore {}` brings it back.{COLOR_RESET}",
                                     report.pages_removed,
                                     report.sources_removed,
-                                    report.root.display()
+                                    crate::kms_trash::KEEP_DAYS,
+                                    quote_slash_arg(&name)
                                 );
                                 // Detach if it was attached to this session.
                                 if let Some(pos) =
@@ -12979,27 +13299,13 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                         }
                     }
                     // Show token usage + elapsed turn duration.
-                    let cache_info = match (
-                        usage.cache_creation_input_tokens,
-                        usage.cache_read_input_tokens,
-                    ) {
-                        (Some(c), Some(r)) if c > 0 || r > 0 => {
-                            format!(" · cache: +{}w/{}r", c, r)
-                        }
-                        _ => String::new(),
-                    };
+                    let cache_info = usage.cache_note();
                     let elapsed = format_duration(turn_start.elapsed());
                     // Cost: convert provider Usage → catalogue TokenUsage
                     // (different field names, same numbers), then look up
                     // the active model's pricing. Unknown / tier-billed
                     // models return None — we just skip the cost suffix.
-                    let token_usage = crate::model_catalogue::TokenUsage {
-                        prompt_tokens: usage.input_tokens,
-                        completion_tokens: usage.output_tokens,
-                        cached_input_tokens: usage.cache_read_input_tokens.unwrap_or(0),
-                        cache_creation_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
-                        reasoning_tokens: usage.reasoning_output_tokens.unwrap_or(0),
-                    };
+                    let token_usage = crate::model_catalogue::TokenUsage::from_usage(&usage);
                     let catalogue = crate::model_catalogue::EffectiveCatalogue::load();
                     if let Some(c) = catalogue.compute_cost_usd(&config.model, &token_usage) {
                         session_cost_usd += c;
@@ -13101,6 +13407,172 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// A KMS name may contain spaces — the sidebar creates them — and
+    /// `/kms drop` took only the first token, so deleting "Age of
+    /// Abundance" from the sidebar tried to delete a KMS called "Age"
+    /// and reported that it did not exist. The name is whatever is left
+    /// once the flags are removed, quoted or not.
+    #[test]
+    fn kms_drop_keeps_a_name_that_has_spaces() {
+        for line in [
+            "drop Age of Abundance --force",
+            "drop \"Age of Abundance\" --force",
+            "drop --force 'Age of Abundance'",
+        ] {
+            let SlashCommand::KmsDrop { name, force } = parse_kms_subcommand(line) else {
+                panic!("not a drop command: {line}");
+            };
+            assert_eq!(name, "Age of Abundance", "from: {line}");
+            assert!(force, "from: {line}");
+        }
+
+        // A plain name and the dry-run default still behave.
+        let SlashCommand::KmsDrop { name, force } = parse_kms_subcommand("drop notes") else {
+            panic!("not a drop command");
+        };
+        assert_eq!(name, "notes");
+        assert!(!force);
+
+        assert!(matches!(
+            parse_kms_subcommand("drop --force"),
+            SlashCommand::Unknown(_)
+        ));
+        assert!(matches!(
+            parse_kms_subcommand("drop notes --nope"),
+            SlashCommand::Unknown(_)
+        ));
+    }
+
+    /// Every `/kms` subcommand that takes a KMS name must take one with
+    /// spaces in it. They all split on whitespace, so "Age of Abundance"
+    /// became "Age" — silently, for eleven of them, and `/kms dump` wrote
+    /// the rest of the name into the note it filed in the wrong place.
+    #[test]
+    fn every_kms_subcommand_keeps_a_spaced_name_whole() {
+        let _h = crate::research::test_helpers::scoped_home();
+        crate::kms::create("Age of Abundance", crate::kms::KmsScope::Project).unwrap();
+        let name = "Age of Abundance";
+
+        // Typed bare: the run of words that names an existing KMS is the name.
+        match parse_kms_subcommand("dump Age of Abundance note to self") {
+            SlashCommand::KmsDump { name: n, text } => {
+                assert_eq!(n, name);
+                assert_eq!(text, "note to self");
+            }
+            other => panic!("dump: {other:?}"),
+        }
+        match parse_kms_subcommand("search Age of Abundance ค่าครองชีพ \"exact phrase\"")
+        {
+            SlashCommand::KmsSearch {
+                name: n,
+                query,
+                is_pattern,
+            } => {
+                assert_eq!(n, name);
+                assert_eq!(query, "ค่าครองชีพ \"exact phrase\"", "query kept verbatim");
+                assert!(!is_pattern);
+            }
+            other => panic!("search: {other:?}"),
+        }
+        match parse_kms_subcommand("file-answer Age of Abundance My Title") {
+            SlashCommand::KmsFileAnswer { name: n, title } => {
+                assert_eq!(n, name);
+                assert_eq!(title, "My Title");
+            }
+            other => panic!("file-answer: {other:?}"),
+        }
+        // Quoted works whether or not the KMS exists yet.
+        match parse_kms_subcommand("dump \"Not Yet Made\" some text") {
+            SlashCommand::KmsDump { name: n, text } => {
+                assert_eq!(n, "Not Yet Made");
+                assert_eq!(text, "some text");
+            }
+            other => panic!("quoted dump: {other:?}"),
+        }
+        // Name + flags.
+        for line in [
+            "verify Age of Abundance --fix",
+            "wrap-up Age of Abundance",
+            "maintain Age of Abundance --apply",
+            "link Age of Abundance --apply",
+            "entry Age of Abundance",
+            "consolidate Age of Abundance",
+        ] {
+            let rendered = format!("{:?}", parse_kms_subcommand(line));
+            assert!(
+                rendered.contains("Age of Abundance"),
+                "`{line}` lost the name: {rendered}"
+            );
+            assert!(!rendered.contains("Unknown"), "`{line}`: {rendered}");
+        }
+        // The subcommands that take the whole line as the name must accept
+        // it quoted as well as bare — quoting is what the others need, so it
+        // cannot be the thing that breaks these.
+        for sub in ["use", "off", "show", "lint", "reindex"] {
+            for line in [
+                format!("{sub} Age of Abundance"),
+                format!("{sub} \"Age of Abundance\""),
+                format!("{sub} 'Age of Abundance'"),
+            ] {
+                let rendered = format!("{:?}", parse_kms_subcommand(&line));
+                assert!(
+                    rendered.contains("(\"Age of Abundance\")"),
+                    "`{line}` → {rendered}"
+                );
+            }
+        }
+        // A bare lower-case name is found loosely and comes back canonical.
+        match parse_kms_subcommand("dump age of abundance remember this") {
+            SlashCommand::KmsDump { name: n, text } => {
+                assert_eq!(n, name);
+                assert_eq!(text, "remember this");
+            }
+            other => panic!("loose dump: {other:?}"),
+        }
+        // …but never at the expense of a base the first word names exactly:
+        // "notes my" must not be pulled into a base called "Notes My".
+        crate::kms::create("notes", crate::kms::KmsScope::Project).unwrap();
+        crate::kms::create("Notes My", crate::kms::KmsScope::Project).unwrap();
+        match parse_kms_subcommand("dump notes my idea") {
+            SlashCommand::KmsDump { name: n, text } => {
+                assert_eq!((n.as_str(), text.as_str()), ("notes", "my idea"));
+            }
+            other => panic!("{other:?}"),
+        }
+        // A one-word name is untouched.
+        match parse_kms_subcommand("dump notes hello world") {
+            SlashCommand::KmsDump { name: n, text } => {
+                assert_eq!((n.as_str(), text.as_str()), ("notes", "hello world"));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Two names cannot be told apart without quotes, so the GUI quotes
+    /// them — and the parser has to honour that rather than splitting on
+    /// every space.
+    #[test]
+    fn kms_rename_round_trips_quoted_names() {
+        let line = format!(
+            "rename {} {}",
+            quote_slash_arg("Age of Abundance"),
+            quote_slash_arg("ยุคใหม่ ของความรู้")
+        );
+        let SlashCommand::KmsRename { old, new } = parse_kms_subcommand(&line) else {
+            panic!("not a rename command: {line}");
+        };
+        assert_eq!(old, "Age of Abundance");
+        assert_eq!(new, "ยุคใหม่ ของความรู้");
+
+        // A name carrying a double quote falls back to single quoting.
+        let line = format!("rename {} b", quote_slash_arg("say \"hi\""));
+        let SlashCommand::KmsRename { old, new } = parse_kms_subcommand(&line) else {
+            panic!("not a rename command: {line}");
+        };
+        assert_eq!(old, "say \"hi\"");
+        assert_eq!(new, "b");
+    }
+
     #[test]
     fn parse_kms_verify_reads_every_flag() {
         let SlashCommand::KmsVerify {
@@ -13109,6 +13581,7 @@ mod tests {
             stale_days,
             page,
             fix,
+            ground,
         } = parse_kms_subcommand("verify notes --llm --fix --stale-days 30 --page deepseek.md")
         else {
             panic!("not a verify command");
@@ -13119,6 +13592,16 @@ mod tests {
         assert_eq!(page.as_deref(), Some("deepseek"), "the .md is dropped");
 
         // Bare form: the name falls back to the attached KMS, flags off.
+        assert!(!ground);
+        // `--ground` needs the auditor, so it turns it on.
+        assert!(matches!(
+            parse_kms_subcommand("verify notes --ground"),
+            SlashCommand::KmsVerify {
+                llm: true,
+                ground: true,
+                ..
+            }
+        ));
         let SlashCommand::KmsVerify { name, llm, fix, .. } = parse_kms_subcommand("verify") else {
             panic!("not a verify command");
         };
@@ -14356,6 +14839,67 @@ mod tests {
         assert!(!looks_like_url("skill-creator"));
         assert!(!looks_like_url("frontend-design"));
         assert!(!looks_like_url("webapp-testing"));
+    }
+
+    /// dev-plan/64 P5.8: the slash popup offers these by name, so
+    /// every one of them has to be a subcommand the parser actually
+    /// has. A catalogue entry for a subcommand that does not exist is
+    /// a menu item that fails when it is picked.
+    ///
+    /// Each is tried at more than one arity, because they do not share
+    /// one — `list` takes nothing, `show` takes an id, `restore` takes
+    /// a base and maybe a page — and the claim being tested is only
+    /// that the *word* is recognised, not that any particular usage is.
+    #[test]
+    fn every_catalogued_subcommand_parses() {
+        let subs: Vec<&str> = built_in_commands()
+            .iter()
+            .map(|c| c.name)
+            .filter(|n| n.contains(' '))
+            .collect();
+        assert!(
+            subs.len() > 20,
+            "the catalogue lost its subcommands: {subs:?}"
+        );
+        for name in subs {
+            let (head, sub) = name.split_once(' ').expect("filtered on a space");
+            let arities = [
+                sub.to_string(),
+                format!("{sub} nb"),
+                format!("{sub} nb page"),
+            ];
+            match head {
+                "kms" => {
+                    let recognised = arities.iter().any(|a| {
+                        !matches!(
+                            parse_kms_subcommand(a),
+                            SlashCommand::Unknown(ref m) if m.starts_with("unknown kms subcommand")
+                        )
+                    });
+                    assert!(
+                        recognised,
+                        "/{name} is in the popup but the parser has no `{sub}`"
+                    );
+                }
+                "research" => {
+                    // An unrecognised research subcommand falls through
+                    // into the query, so `Unknown` is not the tell —
+                    // `ResearchStart` is. A popup entry that quietly
+                    // researches the word "refresh" is the bug here.
+                    let recognised = arities.iter().any(|a| {
+                        !matches!(
+                            parse_research_subcommand(a),
+                            SlashCommand::ResearchStart { .. }
+                        )
+                    });
+                    assert!(
+                        recognised,
+                        "/{name} is in the popup but falls through into a query at every arity"
+                    );
+                }
+                other => panic!("catalogue has an unexpected multi-word head: {other}"),
+            }
+        }
     }
 
     #[test]
