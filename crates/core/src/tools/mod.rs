@@ -457,6 +457,45 @@ impl ToolRegistry {
         self.tools.get(name).cloned()
     }
 
+    /// Apply `allowedTools` / `disallowedTools` to this registry.
+    ///
+    /// Idempotent, because it has to run TWICE on the surfaces that register
+    /// `Task` and `WorkflowRun` late: once before the Task factory snapshots
+    /// the registry — a parent forbidden `Bash` must not be able to spawn a
+    /// subagent that has it — and once after those two are added. Running it
+    /// only at the first point is what let them escape both lists entirely:
+    /// an allowlist of `["Read"]` still yielded `Read, Task, WorkflowRun`, and
+    /// naming either in `disallowedTools` was a silent no-op (issue #221).
+    ///
+    /// `keep` names tools that survive both lists — the REPL passes the
+    /// team-essential set, so `--allowed-tools Read` cannot quietly break
+    /// coordination.
+    pub fn apply_filter(
+        &mut self,
+        allowed: Option<&[String]>,
+        disallowed: Option<&[String]>,
+        keep: &std::collections::HashSet<&str>,
+    ) {
+        if let Some(allowed) = allowed {
+            let mut keepers: std::collections::HashSet<&str> =
+                allowed.iter().map(|s| s.as_str()).collect();
+            keepers.extend(keep.iter().copied());
+            let all: Vec<String> = self.names().iter().map(|s| s.to_string()).collect();
+            for name in all {
+                if !keepers.contains(name.as_str()) {
+                    self.remove(&name);
+                }
+            }
+        }
+        if let Some(disallowed) = disallowed {
+            for name in disallowed {
+                if !keep.contains(name.as_str()) {
+                    self.remove(name);
+                }
+            }
+        }
+    }
+
     pub fn remove(&mut self, name: &str) {
         self.tools.remove(name);
     }
@@ -601,6 +640,61 @@ pub fn extract_tool_source(body: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Issue #221: `Task` and `WorkflowRun` register after the filter runs, so
+    /// an allowlist that does not name them still yielded them and naming them
+    /// in the denylist was a silent no-op. The filter is idempotent so the
+    /// caller can run it again once they exist.
+    #[test]
+    fn a_second_filter_pass_catches_late_registrations() {
+        use std::collections::HashSet;
+        let no_keep: HashSet<&str> = HashSet::new();
+        let allow = vec!["Read".to_string()];
+
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(crate::tools::ReadTool));
+        reg.register(Arc::new(crate::tools::LsTool));
+        // First pass — before the late tools exist.
+        reg.apply_filter(Some(&allow), None, &no_keep);
+        assert_eq!(reg.names(), vec!["Read"]);
+
+        // The late registration, as every surface does it.
+        reg.register(Arc::new(crate::tools::GrepTool));
+        assert_eq!(reg.names().len(), 2, "late tool is in the registry");
+
+        // Second pass removes it. Re-running must not disturb the survivor.
+        reg.apply_filter(Some(&allow), None, &no_keep);
+        assert_eq!(reg.names(), vec!["Read"], "an allowlist means what it says");
+
+        // And a denylist naming a late tool is honoured rather than ignored.
+        let mut reg2 = ToolRegistry::new();
+        reg2.register(Arc::new(crate::tools::ReadTool));
+        reg2.register(Arc::new(crate::tools::GrepTool));
+        reg2.apply_filter(None, Some(&["Grep".to_string()]), &no_keep);
+        assert_eq!(reg2.names(), vec!["Read"]);
+    }
+
+    /// `keep` outranks both lists — the REPL passes the team-essential set so
+    /// `--allowed-tools Read` cannot quietly break coordination.
+    #[test]
+    fn kept_tools_survive_both_lists() {
+        use std::collections::HashSet;
+        let keep: HashSet<&str> = ["Grep"].into_iter().collect();
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(crate::tools::ReadTool));
+        reg.register(Arc::new(crate::tools::GrepTool));
+
+        reg.apply_filter(Some(&["Read".to_string()]), None, &keep);
+        let mut names = reg.names();
+        names.sort();
+        assert_eq!(names, vec!["Grep", "Read"], "keep survives an allowlist");
+
+        reg.apply_filter(None, Some(&["Grep".to_string()]), &keep);
+        let mut names = reg.names();
+        names.sort();
+        assert_eq!(names, vec!["Grep", "Read"], "keep survives a denylist");
+    }
+
     use super::*;
 
     /// Process-wide lock to serialize env-var manipulation across the

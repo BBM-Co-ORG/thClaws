@@ -91,6 +91,21 @@ mod fallback {
     pub const MIN_THAI_FOR_GARBLE_CHECK: usize = 40;
     pub const GARBLE_ORPHAN_MARKS: usize = 6;
     pub const GARBLE_ORPHAN_RATIO: f32 = 0.04;
+
+    /// Below this many Thai characters there is not enough text to judge how
+    /// the extractor is treating the script.
+    pub const MIN_THAI_FOR_MODE_CHOICE: usize = 200;
+    /// "Mark, space, consonant" per 1000 Thai characters, above which
+    /// `-layout` is breaking words rather than preserving columns. Measured
+    /// over 24 Thai PDFs: the documents above it gain 1.33x-3.70x average Thai
+    /// run length from `-raw`, the ones at 2.6 and below gain exactly 1.00x,
+    /// and budget tables sit at 0.0-0.8 so their columns are never traded away.
+    pub const SHRED_PER_1K_RETRY: f32 = 10.0;
+    /// Mean length of a contiguous Thai run, below which the text layer holds
+    /// no words at all — every character stands alone. One PDF in that corpus
+    /// reads 1.0 in both modes, and no spacing rule can help it; it belongs on
+    /// the vision path.
+    pub const MIN_THAI_RUN: f32 = 2.0;
 }
 
 pub struct PdfReadTool;
@@ -243,6 +258,58 @@ fn is_thai_trailing_mark(c: char) -> bool {
     matches!(c, '\u{0E30}'..='\u{0E3A}' | '\u{0E47}'..='\u{0E4E}')
 }
 
+/// "Mark, space, consonant" per 1000 Thai characters — the shape `-layout`
+/// leaves when it pads a glyph gap inside a Thai word.
+fn shred_per_1k(text: &str) -> f32 {
+    let chars: Vec<char> = text.chars().collect();
+    let thai = chars.iter().filter(|c| is_thai(**c)).count();
+    if thai == 0 {
+        return 0.0;
+    }
+    let breaks = chars
+        .windows(3)
+        .filter(|w| w[1] == ' ' && is_thai_trailing_mark(w[0]) && is_thai_consonant(w[2]))
+        .count();
+    1000.0 * breaks as f32 / thai as f32
+}
+
+/// Mean length of a contiguous run of Thai characters. Thai writes without
+/// spaces between words, so a healthy run is many characters long; extraction
+/// damage is what cuts it down. No dictionary needed, which matters — the
+/// bundled word list is a 229-word placeholder.
+fn mean_thai_run(text: &str) -> f32 {
+    let (mut runs, mut total, mut cur) = (0usize, 0usize, 0usize);
+    for c in text.chars() {
+        if is_thai(c) {
+            cur += 1;
+        } else if cur > 0 {
+            runs += 1;
+            total += cur;
+            cur = 0;
+        }
+    }
+    if cur > 0 {
+        runs += 1;
+        total += cur;
+    }
+    if runs == 0 {
+        0.0
+    } else {
+        total as f32 / runs as f32
+    }
+}
+
+/// Is `-layout` breaking this Thai text apart rather than laying it out?
+fn thai_is_shredded(text: &str) -> bool {
+    let thai = text.chars().filter(|c| is_thai(*c)).count();
+    thai >= fallback::MIN_THAI_FOR_MODE_CHOICE && shred_per_1k(text) > fallback::SHRED_PER_1K_RETRY
+}
+
+/// Thai consonants — the class a stray `-layout` space lands in front of.
+fn is_thai_consonant(c: char) -> bool {
+    ('\u{0E01}'..='\u{0E2E}').contains(&c)
+}
+
 /// Any character in the Thai block.
 fn is_thai(c: char) -> bool {
     ('\u{0E01}'..='\u{0E5B}').contains(&c)
@@ -341,8 +408,17 @@ fn thai_looks_garbled(text: &str) -> bool {
         .windows(3)
         .filter(|w| w[1] == ' ' && is_thai(w[0]) && is_thai_trailing_mark(w[2]))
         .count();
-    orphan_marks >= fallback::GARBLE_ORPHAN_MARKS
+    if orphan_marks >= fallback::GARBLE_ORPHAN_MARKS
         && (orphan_marks as f32) / (thai_total as f32) > fallback::GARBLE_ORPHAN_RATIO
+    {
+        return true;
+    }
+    // Second signal: a text layer that holds no words. Thai runs together, so
+    // a mean run near one character means every character came out isolated —
+    // no spacing rule can reassemble that, and one PDF in the survey corpus
+    // reads 1.0 in BOTH extraction modes while orphan marks stay at zero, so
+    // the check above never saw it.
+    mean_thai_run(text) < fallback::MIN_THAI_RUN
 }
 
 /// Text-first extraction with Thai post-processing applied. Used by the
@@ -544,8 +620,40 @@ async fn extract_text_raw(
     last: Option<u32>,
     cloud: CloudFallback,
 ) -> Result<String> {
+    let laid_out = run_pdftotext(validated, first, last, "-layout", cloud).await?;
+    // `-layout` reproduces the page by padding with spaces, and it puts one at
+    // every glyph gap. Thai does not space its words, so those land INSIDE
+    // them: `บริษัท` comes out as `บริ ษ ทั`. Measured over 24 Thai PDFs, the
+    // density of "mark, space, consonant" separates the shredded documents
+    // from the intact ones cleanly, and re-reading a shredded one with `-raw`
+    // lengthens the average Thai run by 1.3x-3.7x while changing the Thai
+    // character count by 0.00% (docs/pdf-thai-extraction-modes.md).
+    if !thai_is_shredded(&laid_out) {
+        return Ok(laid_out);
+    }
+    match run_pdftotext(validated, first, last, "-raw", cloud).await {
+        Ok(raw) => {
+            eprintln!(
+                "\x1b[2m[pdf] -layout shredded this Thai text ({:.0} breaks per 1k) — re-read with -raw\x1b[0m",
+                shred_per_1k(&laid_out)
+            );
+            Ok(raw)
+        }
+        // The second read is an improvement, never a requirement.
+        Err(_) => Ok(laid_out),
+    }
+}
+
+/// One `pdftotext` run in the given mode.
+async fn run_pdftotext(
+    validated: &std::path::Path,
+    first: Option<u32>,
+    last: Option<u32>,
+    mode: &str,
+    cloud: CloudFallback,
+) -> Result<String> {
     let mut cmd = Command::new("pdftotext");
-    cmd.arg("-layout");
+    cmd.arg(mode);
     if let Some(f) = first {
         cmd.arg("-f").arg(f.to_string());
     }
@@ -1016,6 +1124,59 @@ mod tests {
         let garbled = "บริ ษ ัท ผู ้ ปฏิบ ัติ หน้ า ค่ าจ้าง ก ำหนด ท ำงาน จ ำเป็น \
                        สิ ทธิ พนักงานทุกคนในองค์กร";
         assert!(thai_looks_garbled(garbled));
+    }
+
+    /// The numbers behind SHRED_PER_1K_RETRY, taken from the survey corpus
+    /// (docs/pdf-thai-extraction-modes.md): the worst document reads 36.3
+    /// breaks per 1k Thai characters under `-layout`, budget tables read
+    /// 0.0-0.8, and Samkok reads 2.3-2.6 with nothing to gain from `-raw`.
+    #[test]
+    fn shredded_thai_is_told_from_merely_spaced_thai() {
+        // Real `-layout` output: the spaces fall inside the words.
+        let shredded = "บริ ษทั ฯ จาแนกประเภทของพนักงานไว้ดงั นี้ พนักงานที่บริ ษทั ฯ                         ตกลงจ้างโดยกำหนดค่าจ้างเป็ นรายเดือน ปฏิบตัิงานเป็ นระยะเวลา                         โดยผูบ้ งั คับบัญชาจะประเมินการทดลองงานจาก ผลการปฏิบตัิงาน                         หากผลการประเมินไม่ผา่ นตามมาตรฐาน บริ ษทั ฯ จะเลิ กจ้าง"
+            .repeat(2);
+        assert!(shred_per_1k(&shredded) > fallback::SHRED_PER_1K_RETRY);
+        assert!(
+            thai_is_shredded(&shredded),
+            "this is the document that needs -raw"
+        );
+
+        // The same prose intact: Thai spaces between phrases, never inside a
+        // word. Must NOT trigger a second extraction.
+        let clean = "พนักงานทุกคนมีสิทธิได้รับค่าจ้างตามที่กฎหมายกำหนดไว้อย่างเป็นธรรม                      บริษัทจำแนกประเภทของพนักงานไว้ดังนี้ พนักงานรายเดือนและพนักงานรายวัน                      ผู้บังคับบัญชาจะประเมินผลการปฏิบัติงานตามมาตรฐานที่บริษัทกำหนด"
+            .repeat(2);
+        assert!(
+            shred_per_1k(&clean) <= fallback::SHRED_PER_1K_RETRY,
+            "{}",
+            shred_per_1k(&clean)
+        );
+        assert!(!thai_is_shredded(&clean));
+
+        // Too little Thai to judge — never spend a second extraction on it.
+        assert!(!thai_is_shredded("บริ ษทั ฯ"));
+    }
+
+    /// A text layer with no words in it reaches the vision path. The orphan-
+    /// mark check cannot see this case: the characters are isolated, so no
+    /// mark ever sits behind a space.
+    #[test]
+    fn a_text_layer_of_isolated_characters_is_garbled() {
+        let isolated: String = "ข้อบังคับเกี่ยวกับการทำงานของพนักงานบริษัท"
+            .chars()
+            .map(|c| format!("{c} "))
+            .collect::<Vec<_>>()
+            .join("")
+            .repeat(3);
+        assert!(mean_thai_run(&isolated) < fallback::MIN_THAI_RUN);
+        assert!(
+            thai_looks_garbled(&isolated),
+            "isolated characters must route to vision"
+        );
+
+        // Ordinary Thai prose runs long and stays on the text path.
+        let prose = "พนักงานทุกคนมีสิทธิได้รับค่าจ้างตามที่กฎหมายกำหนดไว้อย่างเป็นธรรมเสมอ".repeat(2);
+        assert!(mean_thai_run(&prose) > 10.0, "{}", mean_thai_run(&prose));
+        assert!(!thai_looks_garbled(&prose));
     }
 
     /// dev-plan/66: the no-poppler fallback, end to end against a stand-in

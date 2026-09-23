@@ -7,8 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.136.0] — 2026-09-23
+
+**A release about reading Thai, and about limits meaning what they say.** Thai PDFs come out as words instead of fragments, two settings that were quietly ignored are enforced, and a symlink can no longer carry a write out of the workspace.
+
 ### Added
-- **Unifically: a new BYOK provider with an OpenAI-compatible API.** Models use the `unifically/<id>` prefix and the key is read from `UNIFICALLY_API_KEY`.
+- **Unifically: a new BYOK provider with an OpenAI-compatible API.** Models use the `unifically/<id>` prefix and the key is read from `UNIFICALLY_API_KEY`. Contributed by @unifically-dev ([#217](https://github.com/thClaws/thClaws/pull/217)).
+
+### Fixed
+- **Thai PDFs come out as words, not fragments.** Layout mode pads every glyph gap, and Thai does not space its words, so the padding landed inside them — one employment handbook yielded `บริษัท` 6 times where the document has it 209 times. A document whose Thai is being cut up is now re-read in a mode that does not do that, which also lets the existing sara-am repair work again (`ทำงาน`: 0 → 152 in the same file). English and tables are untouched.
+- **A PDF whose text layer holds no words goes to the vision path.** Some PDFs extract one isolated character at a time; no spacing rule can reassemble that, so those pages are read as images instead.
+- **`allowedTools` and `disallowedTools` reach every tool.** `Task` and `WorkflowRun` were registered after the lists were applied, so an allowlist that did not name them still handed them over and naming them in the denylist did nothing ([#221](https://github.com/thClaws/thClaws/issues/221)). The desktop app and `--serve` never applied `allowedTools` at all, and the HTTP API applied neither list; all four now agree.
+- **A symlink cannot carry a write out of the workspace.** A link whose target did not exist yet was treated as an ordinary new file, so a write through it landed wherever the link pointed — outside the workspace, or outside a subagent's `writePaths` ([#219](https://github.com/thClaws/thClaws/issues/219)).
+- **Reading a PDF without poppler gives the same Thai quality as reading one with it.** The no-install extraction service follows the same rule as the engine.
 
 ## [0.135.0] — 2026-09-22
 
