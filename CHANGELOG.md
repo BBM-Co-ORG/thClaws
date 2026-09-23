@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Unifically: a new BYOK provider with an OpenAI-compatible API.** Models use the `unifically/<id>` prefix and the key is read from `UNIFICALLY_API_KEY`.
+
 ## [0.135.0] — 2026-09-22
 
 **A reading release.** A PDF is read whether or not poppler is installed and whether or not there is an account, the live browser view is the size of a real screen and notices when its browser dies, and a model is asked what thinking it takes instead of guessed at.
