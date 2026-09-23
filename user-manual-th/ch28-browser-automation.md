@@ -98,6 +98,18 @@ hosted workspace จึงไม่มี browser tool จนกว่าคุ�
   พร้อมปุ่ม **📷 capture** เนื้อหาที่เป็นภาพล้วน (canvas, chart) จะเห็น
   ที่นี่แม้ accessibility tree จะอธิบายไม่ได้
 
+**ถ้า status card ขึ้นว่า "No Playwright Chromium found"** — แท็บยังใช้ได้
+แต่จะได้ภาพราว 1 เฟรมต่อวินาทีแทน live stream จริง เพราะ live view ต้องใช้
+Chromium ของ Playwright เอง และ engine จะไม่ไปขับ Chrome ที่คุณใช้อยู่
+(ทำแล้วการเบราว์พังทั้งหมด) ติดตั้งครั้งเดียวจบ:
+
+```
+npx playwright install chromium
+```
+
+แล้ว restart thClaws — workspace บน cloud มีให้อยู่แล้ว ส่วน `/doctor` จะพิมพ์
+บรรทัด `browser:` บอกว่าเจออะไร viewport เท่าไร และ Chromium รันอยู่หรือไม่
+
 **Activity feed** — ทุก `browser_*` tool call และผลลัพธ์ไหลเข้ามาพร้อม
 เวลา รวมถึง **console error และการ navigate** ของหน้าแบบสด
 

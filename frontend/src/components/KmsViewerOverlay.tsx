@@ -104,6 +104,9 @@ export function KmsViewerOverlay({ initial, onClose }: Props) {
   // on the very next render — otherwise the old file's HTML flashes
   // briefly under the new title before the fetch effect clears it.
   useEffect(() => {
+    // Same-effect clearing is deliberate — see the note above: doing it
+    // later flashes the old file's HTML under the new title.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setStack([initial]);
     setContent(null);
     setError(null);
@@ -114,6 +117,8 @@ export function KmsViewerOverlay({ initial, onClose }: Props) {
 
   // Fetch content for the top-of-stack file.
   useEffect(() => {
+    // Clear first so the spinner shows instead of the previous file.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setContent(null);
     setError(null);
     setBacklinks([]);
@@ -1030,7 +1035,7 @@ function rewriteWikilinks(s: string): string {
 }
 
 function escapeMd(s: string): string {
-  return s.replace(/([\\\[\]])/g, "\\$1");
+  return s.replace(/([\\[\]])/g, "\\$1");
 }
 
 /// Undo the `encodeURIComponent` the wikilink renderer applies to a slug.
@@ -1058,7 +1063,7 @@ function resolveRelativeLink(
   href: string,
 ): ViewerTarget | null {
   // Strip query / fragment.
-  let path = href.split("#")[0].split("?")[0];
+  const path = href.split("#")[0].split("?")[0];
   // Always lowercase the kind segment for matching.
   // The name is decoded only after the separator checks below, so a
   // `%2F` cannot slip a path separator past them by arriving encoded.

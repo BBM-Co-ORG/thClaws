@@ -154,7 +154,15 @@ impl AnthropicProvider {
 
         if let Some(budget) = req.thinking_budget {
             if budget > 0 {
-                body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
+                match thinking_shape(&req.model) {
+                    ThinkingShape::Adaptive => {
+                        body["thinking"] = json!({"type": "adaptive"});
+                        body["output_config"] = json!({"effort": adaptive_effort(budget)});
+                    }
+                    ThinkingShape::Budget => {
+                        body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
+                    }
+                }
             }
         }
 
@@ -516,8 +524,112 @@ fn merge_usage(start: Option<Usage>, end: Option<Usage>) -> Option<Usage> {
     }
 }
 
+/// Which of Anthropic's two incompatible thinking shapes a model takes.
+///
+/// Measured against the live API on 2026-09-21, because the split is not
+/// guessable from the ids: `claude-opus-4-6` takes a budget while
+/// `claude-opus-4-7` refuses it, and the newest models — `claude-opus-5`
+/// and `claude-sonnet-5` — refuse it too. They answer
+///   400 "thinking.type.enabled" is not supported for this model.
+///       Use "thinking.type.adaptive" and "output_config.effort"…
+/// so before this branch existed, every request carrying a thinking
+/// level to the current flagship models failed outright.
+///
+/// Refreshed by re-running `scripts/probe/reasoning-effort-probe.py`;
+/// the measurements live in `docs/reasoning-effort-measured.json`.
+enum ThinkingShape {
+    /// `thinking:{type:adaptive}` + `output_config:{effort}`.
+    Adaptive,
+    /// `thinking:{type:enabled, budget_tokens}`.
+    Budget,
+}
+
+fn thinking_shape(model: &str) -> ThinkingShape {
+    let id = model
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .to_ascii_lowercase();
+    // Dated aliases behave as their base (`claude-opus-4-7-20260101`).
+    let adaptive = [
+        "claude-opus-5",
+        "claude-sonnet-5",
+        "claude-opus-4-8",
+        "claude-opus-4-7",
+        "claude-fable-5",
+    ];
+    if adaptive.iter().any(|a| id.starts_with(a)) {
+        ThinkingShape::Adaptive
+    } else {
+        ThinkingShape::Budget
+    }
+}
+
+/// Our token budget expressed on Anthropic's adaptive scale.
+///
+/// The API names the set itself: `output_config.effort: Input should be
+/// 'low', 'medium', 'high', 'xhigh' or 'max'`. The thresholds mirror
+/// [`ThinkingLevel::from_budget`] so a user who sets the same level gets
+/// the same intent on either shape; `xhigh` and `max` are reachable only
+/// by asking for a budget past what the old scale topped out at, which
+/// is the honest way to expose a rung our own scale does not have.
+fn adaptive_effort(budget: u32) -> &'static str {
+    match budget {
+        0..=4_096 => "low",
+        4_097..=16_000 => "medium",
+        16_001..=64_000 => "high",
+        64_001..=200_000 => "xhigh",
+        _ => "max",
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_flagship_models_get_the_shape_they_accept() {
+        // Measured 2026-09-21. Before this split, every request carrying
+        // a thinking level to these six failed with
+        //   400 "thinking.type.enabled" is not supported for this model.
+        for adaptive in [
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-fable-5",
+            "claude-fable-5-1",
+            "claude-opus-5-20260101",
+        ] {
+            assert!(
+                matches!(
+                    super::thinking_shape(adaptive),
+                    super::ThinkingShape::Adaptive
+                ),
+                "{adaptive} refuses thinking.type=enabled"
+            );
+        }
+        for budget in [
+            "claude-opus-4-6",
+            "claude-opus-4-5-20251101",
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-5",
+            "claude-haiku-4-5",
+        ] {
+            assert!(
+                matches!(super::thinking_shape(budget), super::ThinkingShape::Budget),
+                "{budget} takes a token budget"
+            );
+        }
+
+        // The API names this set itself:
+        //   output_config.effort: Input should be 'low', 'medium',
+        //   'high', 'xhigh' or 'max'
+        assert_eq!(super::adaptive_effort(1_024), "low");
+        assert_eq!(super::adaptive_effort(8_000), "medium");
+        assert_eq!(super::adaptive_effort(32_000), "high");
+        assert_eq!(super::adaptive_effort(128_000), "xhigh");
+        assert_eq!(super::adaptive_effort(500_000), "max");
+    }
     use super::*;
     use crate::types::{ContentBlock, Message};
 

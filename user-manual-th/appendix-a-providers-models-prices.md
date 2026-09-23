@@ -37,7 +37,7 @@ DB เก็บเป็น microcent ต่อ 1k token (`µ¢/kt`) สูต�
 
 context ที่มี **`?`** คือค่าที่ provider ไม่เคยประกาศ — เป็นค่า default ของ provider นั้นที่ใส่ไว้เพราะถ้าเว้นว่างจะทำให้ตัวเลือกโมเดลพัง ให้ถือเป็นขอบล่าง ไม่ใช่สเปกจริง
 
-636 โมเดล จาก 14 provider
+641 โมเดล จาก 14 provider
 
 ### Anthropic
 
@@ -197,7 +197,6 @@ context ที่มี **`?`** คือค่าที่ provider ไม่�
 | `anthropic/claude-fable-5` | 1M | $12.50 | $1.25 | $62.50 |
 | `anthropic/claude-fable-5.1` | 1M | $12.50 | — | $62.50 |
 | `anthropic/claude-haiku-4.5` | 200k | $1.25 | $0.12 | $6.25 |
-| `anthropic/claude-opus-4` | 200k | $18.75 | $1.88 | $93.75 |
 | `anthropic/claude-opus-4.1` | 200k | $18.75 | $1.88 | $93.75 |
 | `anthropic/claude-opus-4.5` | 200k | $6.25 | $0.62 | $31.25 |
 | `anthropic/claude-opus-4.6` | 1M | $6.25 | $0.62 | $31.25 |
@@ -232,12 +231,12 @@ context ที่มี **`?`** คือค่าที่ provider ไม่�
 | `deepseek/deepseek-v3.1-terminus` | 164k | $0.34 | — | $1.25 |
 | `deepseek/deepseek-v3.2` | 131k | $0.34 | — | $0.50 |
 | `deepseek/deepseek-v3.2-exp` | 164k | $0.34 | — | $0.51 |
-| `deepseek/deepseek-v4-flash` | 1.04858M | $0.11 | — | $0.22 |
-| `deepseek/deepseek-v4-flash-0731` | 1.04858M | $0.05 | — | $0.20 |
+| `deepseek/deepseek-v4-flash` | 1.04858M | $0.06 | — | $0.12 |
+| `deepseek/deepseek-v4-flash-0731` | 1.04858M | $0.05 | — | $0.80 |
 | `deepseek/deepseek-v4-flash-vision-exp` | 1.04858M | $0.28 | — | $0.83 |
-| `deepseek/deepseek-v4-pro` | 1.04858M | $1.19 | — | $2.39 |
-| `deepseek/deepseek-v4-pro-0813` | 1.04858M | $1.65 | — | $4.95 |
-| `deepseek/deepseek-v4.1-flash` | 1.04858M | $0.38 | — | $1.50 |
+| `deepseek/deepseek-v4-pro` | 1.04858M | $1.17 | — | $2.34 |
+| `deepseek/deepseek-v4-pro-0813` | 1.04858M | $0.83 | — | $2.48 |
+| `deepseek/deepseek-v4.1-flash` | 1.04858M | $0.19 | — | $0.75 |
 | `dots-studio/dots-3-note-preview:free` | 512k | free | — | free |
 | `google/gemini-2.5-flash` | 1.04858M | $0.38 | — | $3.12 |
 | `google/gemini-2.5-flash-lite` | 1.04858M | $0.12 | $0.01 | $0.50 |
@@ -266,7 +265,7 @@ context ที่มี **`?`** คือค่าที่ provider ไม่�
 | `google/gemma-4-31b-it:free` | 262k | free | — | free |
 | `gryphe/mythomax-l2-13b` | 4k | $0.10 | — | $0.14 |
 | `ibm-granite/granite-4.0-h-micro` | 131k | $0.02 | — | $0.14 |
-| `ibm-granite/granite-4.2-8b` | 131k | $0.12 | — | $0.19 |
+| `ibm-granite/granite-4.2-8b` | 131k | $0.07 | — | $0.31 |
 | `inception/mercury-2` | 128k | $0.31 | $0.03 | $0.94 |
 | `inception/mercury-2.5` | 260k | $0.05 | — | $0.19 |
 | `inclusionai/ling-3.0-flash` | 262k | $0.03 | — | $0.08 |
@@ -277,17 +276,16 @@ context ที่มี **`?`** คือค่าที่ provider ไม่�
 | `inclusionai/ling-3.0-flash-vl:free` | 262k | free | — | free |
 | `inference-net/schematron-v2-small` | 128k | $0.06 | — | $0.29 |
 | `inference-net/schematron-v2-turbo` | 128k | $0.04 | — | $0.19 |
-| `kwaipilot/kat-coder-pro-v2` | 256k | $0.38 | — | $1.50 |
 | `kwaipilot/kat-coder-pro-v2.5` | 256k | $0.93 | — | $3.70 |
 | `liquid/lfm-2.5-2.6b:free` | 66k | free | — | free |
 | `mancer/weaver` | 8k | $0.50 | — | $0.94 |
 | `meituan/longcat-2.0` | 1.04876M | $0.38 | — | $1.50 |
-| `meta-llama/llama-3.1-70b-instruct` | 131k | $0.90 | — | $0.90 |
+| `meta-llama/llama-3.1-70b-instruct` | 131k | $0.50 | — | $0.50 |
 | `meta-llama/llama-3.1-8b-instruct` | 16k | $0.06 | — | $0.10 |
 | `meta-llama/llama-3.2-1b-instruct` | 60k | $0.03 | — | $0.25 |
 | `meta-llama/llama-3.2-3b-instruct` | 80k | $0.06 | — | $0.41 |
 | `meta-llama/llama-3.3-70b-instruct` | 131k | $0.12 | — | $0.40 |
-| `meta-llama/llama-4-maverick` | 1.04858M | $0.25 | — | $1.00 |
+| `meta-llama/llama-4-maverick` | 1.04858M | $0.23 | — | $0.82 |
 | `meta-llama/llama-4-scout` | 328k | $0.12 | — | $0.38 |
 | `meta-llama/llama-guard-4-12b` | 164k | $0.22 | — | $0.22 |
 | `meta/muse-glimmer-30b` | 131k | $0.38 | — | $1.50 |
@@ -329,16 +327,18 @@ context ที่มี **`?`** คือค่าที่ provider ไม่�
 | `moonshotai/kimi-k2-thinking` | 262k | $0.75 | — | $3.12 |
 | `moonshotai/kimi-k2.5` | 262k | $0.56 | $0.12 | $2.81 |
 | `moonshotai/kimi-k2.6` | 256k | $1.19 | — | $5.00 |
-| `moonshotai/kimi-k2.7-code` | 262k | $0.88 | — | $4.01 |
-| `moonshotai/kimi-k3` | 1.04858M | $2.12 | — | $10.62 |
+| `moonshotai/kimi-k2.7-code` | 262k | $0.88 | — | $4.12 |
+| `moonshotai/kimi-k3` | 1.04858M | $3.75 | — | $18.75 |
 | `morph/morph-v3-fast` | 82k | $1.00 | — | $1.50 |
 | `morph/morph-v3-large` | 262k | $1.12 | — | $2.38 |
+| `nex-agi/nex-n2.5-mini` | 262k | $0.03 | — | $0.12 |
 | `nex-agi/nex-n2.5-mini:free` | 262k | free | — | free |
+| `nex-agi/nex-n2.5-pro` | 262k | $0.09 | — | $0.31 |
 | `nex-agi/nex-n2.5-pro:free` | 262k | free | — | free |
 | `nousresearch/hermes-3-llama-3.1-405b` | 131k | $1.25 | — | $1.25 |
 | `nousresearch/hermes-3-llama-3.1-70b` | 131k | $0.88 | — | $0.88 |
 | `nousresearch/hermes-4-405b` | 131k | $1.25 | — | $3.75 |
-| `nvidia/nemotron-3-nano-30b-a3b` | 262k | $0.07 | — | $0.30 |
+| `nvidia/nemotron-3-nano-30b-a3b` | 262k | $0.06 | — | $0.25 |
 | `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free` | 256k | free | — | free |
 | `nvidia/nemotron-3-super-120b-a12b` | 262k | $0.10 | — | $0.56 |
 | `nvidia/nemotron-3-super-120b-a12b:free` | 262k | free | — | free |
@@ -392,7 +392,7 @@ context ที่มี **`?`** คือค่าที่ provider ไม่�
 | `openai/gpt-6-astra-pro` | 1.05M | $12.50 | — | $62.50 |
 | `openai/gpt-chat-latest` | 400k | $6.25 | — | $37.50 |
 | `openai/gpt-oss-120b` | 131k | $0.19 | — | $0.75 |
-| `openai/gpt-oss-20b` | 131k | $0.04 | — | $0.16 |
+| `openai/gpt-oss-20b` | 131k | $0.02 | — | $0.11 |
 | `openai/gpt-oss-safeguard-20b` | 131k | $0.09 | — | $0.38 |
 | `openai/o1` | 200k | $18.75 | $9.38 | $75.00 |
 | `openai/o1-pro` | 200k | $187.50 | — | $750.00 |
@@ -462,7 +462,7 @@ context ที่มี **`?`** คือค่าที่ provider ไม่�
 | `qwen/qwen3.7-max` | 1M | $1.84 | — | $5.53 |
 | `qwen/qwen3.7-plus` | 1M | $0.40 | — | $1.60 |
 | `qwen/qwen3.8-2.4t-a95b` | 1.04858M | $2.50 | — | $7.50 |
-| `qwen/qwen3.8-27b` | 1M | $0.25 | — | $3.12 |
+| `qwen/qwen3.8-27b` | 1M | $0.53 | — | $3.75 |
 | `qwen/qwen3.8-27b:free` | 262k | free | — | free |
 | `qwen/qwen3.8-flash` | 1M | $0.19 | — | $0.59 |
 | `qwen/qwen3.8-max-0902` | 1M | $2.50 | — | $7.50 |
@@ -503,9 +503,13 @@ context ที่มี **`?`** คือค่าที่ provider ไม่�
 | `x-ai/grok-4.3` | 1M | $1.56 | — | $3.12 |
 | `x-ai/grok-4.5` | 500k | $2.50 | — | $7.50 |
 | `x-ai/grok-4.6` | 500k | $2.50 | — | $7.50 |
+| `x-ai/grok-4.7` | 500k | $2.00 | — | $6.00 |
 | `x-ai/grok-build-0.1` | 256k | $1.25 | — | $2.50 |
 | `xiaomi/mimo-v2.5` | 1.04858M | $0.18 | $0.10 | $0.35 |
 | `xiaomi/mimo-v2.5-pro` | 1.04858M | $0.54 | $0.25 | $1.09 |
+| `xiaomi/mimo-v2.6-flash` | 1.04858M | $0.18 | — | $0.35 |
+| `xiaomi/mimo-v2.6-pro` | 1.04858M | $0.54 | — | $1.09 |
+| `xiaomi/mimo-v2.6-pro-ultraspeed` | 1.04858M | $5.44 | — | $10.88 |
 | `z-ai/glm-4.5` | 131k | $0.75 | — | $2.75 |
 | `z-ai/glm-4.5-air` | 131k | $0.16 | — | $1.06 |
 | `z-ai/glm-4.5v` | 66k | $0.75 | — | $2.25 |
@@ -518,8 +522,8 @@ context ที่มี **`?`** คือค่าที่ provider ไม่�
 | `z-ai/glm-5.1` | 203k | $1.21 | — | $3.79 |
 | `z-ai/glm-5.2` | 1.04858M | $0.81 | — | $2.55 |
 | `z-ai/glm-5.2:free` | 33k | free | — | free |
-| `z-ai/glm-5.3` | 1.04858M | $1.14 | — | $3.57 |
-| `z-ai/glm-5.3-flash` | 1.31072M | $0.11 | — | $0.38 |
+| `z-ai/glm-5.3` | 1.04858M | $0.82 | — | $2.57 |
+| `z-ai/glm-5.3-flash` | 1.31072M | $0.19 | — | $0.62 |
 | `z-ai/glm-5.3-flashx` | 1.04858M | $0.46 | — | $1.56 |
 | `z-ai/glm-5v-turbo` | 203k | $1.50 | — | $5.00 |
 | `~anthropic/claude-fable-latest` | 1M | $12.50 | — | $62.50 |
@@ -528,7 +532,7 @@ context ที่มี **`?`** คือค่าที่ provider ไม่�
 | `~anthropic/claude-sonnet-latest` | 1M | $2.50 | — | $12.50 |
 | `~google/gemini-flash-latest` | 1.04858M | $0.94 | $0.04 | $4.69 |
 | `~google/gemini-pro-latest` | 1.04858M | $2.50 | $0.16 | $15.00 |
-| `~moonshotai/kimi-latest` | 256k | $2.12 | — | $10.62 |
+| `~moonshotai/kimi-latest` | 256k | $1.88 | — | $9.38 |
 | `~openai/gpt-mini-latest` | 400k | $0.94 | — | $5.62 |
 
 ### DashScope (Alibaba)
@@ -705,6 +709,7 @@ context ที่มี **`?`** คือค่าที่ provider ไม่�
 | `xai/grok-4.3` | 1M | $1.56 | $3.12 |
 | `xai/grok-4.5` | 500k | $2.50 | $7.50 |
 | `xai/grok-4.6` | 500k | $2.50 | $7.50 |
+| `xai/grok-4.7` | 500k | $2.50 | $7.50 |
 | `xai/grok-build-0.1` | 256k | $1.25 | $2.50 |
 
 ### Moonshot

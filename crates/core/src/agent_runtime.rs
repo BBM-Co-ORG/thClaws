@@ -128,6 +128,16 @@ pub async fn build_runtime_with_provider(
         None,
     )));
 
+    // The HTTP path honoured neither list. Applied here, after the late
+    // registrations, so `allowedTools` / `disallowedTools` mean the same
+    // thing on all four entry points (issue #221).
+    let no_keep: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    tool_registry.apply_filter(
+        config.allowed_tools.as_deref(),
+        config.disallowed_tools.as_deref(),
+        &no_keep,
+    );
+
     // Opt-in native Gemini image tools. Same gating as the
     // GUI/serve registration in shared_session.rs — settings flag
     // PLUS env key. Keeps the HTTP API in parity.

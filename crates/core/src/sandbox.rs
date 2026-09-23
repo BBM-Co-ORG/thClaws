@@ -209,26 +209,17 @@ impl Sandbox {
         // Path doesn't exist yet (e.g. Write into a deep new tree like
         // `src/api/handlers/auth.ts` where `src/api/handlers/` isn't there).
         // The Write tool will `create_dir_all` the parent — we just need to
-        // confirm the path lands inside the sandbox. Walk up to the longest
-        // existing ancestor and canonicalize THAT (catches symlinks); since
-        // the non-existing tail can't itself contain symlinks (it doesn't
-        // exist), and we already lexically resolved `..`, joining is safe.
-        let mut ancestor = resolved.parent();
-        while let Some(p) = ancestor {
-            if let Ok(canonical_anc) = p.canonicalize() {
-                if !canonical_anc.starts_with(root) {
-                    return Err(Self::denied(&canonical_anc, root));
-                }
-                let tail = resolved.strip_prefix(p).unwrap_or(Path::new(""));
-                return Ok(canonical_anc.join(tail));
-            }
-            ancestor = p.parent();
+        // confirm the path lands inside the sandbox. `resolve_landing` walks
+        // to the longest existing ancestor AND expands any symlink in the
+        // tail: this used to assume a non-existent tail could hold no
+        // symlink, which a dangling one disproves — it exists as a link, so
+        // `ws/dangling -> /outside/x.txt` passed the check and the write
+        // landed outside the workspace (issue #219).
+        let landing = resolve_landing(&resolved);
+        if landing.starts_with(root) {
+            return Ok(landing);
         }
-
-        Err(Error::Tool(format!(
-            "path not accessible: {}",
-            resolved.display()
-        )))
+        Err(Self::denied(&landing, root))
     }
 
     fn denied(path: &Path, root: &Path) -> Error {
@@ -257,6 +248,72 @@ impl Sandbox {
 /// would falsely pass containment checks because cwd itself is inside the
 /// sandbox. Shared with `subagent`'s `writePaths` scoping, which needs the
 /// same resolution before its globs see a path.
+/// A symlink chain longer than this is a loop, not a path.
+const MAX_SYMLINK_HOPS: usize = 32;
+
+/// Where a path will actually LAND on disk: `..`/`.` collapsed and every
+/// symlink followed — including a **dangling** one, whose target does not
+/// exist even though the link itself very much does.
+///
+/// `canonicalize` refuses a dangling final component, and the obvious
+/// fallback — canonicalise the longest existing ancestor and re-join the
+/// tail — rests on "the tail cannot contain a symlink, it does not exist".
+/// A dangling symlink is exactly the counter-example: `ws/dangling ->
+/// /outside/x.txt` made the tail `dangling`, the ancestor `ws`, and the
+/// answer `ws/dangling`, which is inside the sandbox while the write landed
+/// outside it (issue #219). So walk the tail a component at a time and
+/// expand any link found there.
+pub(crate) fn resolve_landing(path: &Path) -> PathBuf {
+    let lexical = lexical_normalize(path);
+    if let Ok(canonical) = lexical.canonicalize() {
+        return canonical;
+    }
+    let mut ancestor = lexical.parent();
+    let (base, tail) = loop {
+        match ancestor {
+            Some(p) => {
+                if let Ok(canonical) = p.canonicalize() {
+                    let tail = lexical
+                        .strip_prefix(p)
+                        .unwrap_or(Path::new(""))
+                        .to_path_buf();
+                    break (canonical, tail);
+                }
+                ancestor = p.parent();
+            }
+            None => return lexical,
+        }
+    };
+
+    let mut out = base;
+    let mut hops = 0usize;
+    for comp in tail.components() {
+        out.push(comp);
+        while hops < MAX_SYMLINK_HOPS {
+            let Ok(meta) = std::fs::symlink_metadata(&out) else {
+                break;
+            };
+            if !meta.file_type().is_symlink() {
+                break;
+            }
+            let Ok(target) = std::fs::read_link(&out) else {
+                break;
+            };
+            out = if target.is_absolute() {
+                target
+            } else {
+                out.parent().map(|p| p.join(&target)).unwrap_or(target)
+            };
+            out = lexical_normalize(&out);
+            if let Ok(canonical) = out.canonicalize() {
+                out = canonical;
+            }
+            hops += 1;
+        }
+    }
+    out
+}
+
 pub(crate) fn lexical_normalize(p: &Path) -> PathBuf {
     use std::path::Component;
     let mut out = PathBuf::new();
@@ -274,6 +331,59 @@ pub(crate) fn lexical_normalize(p: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+
+    /// Issue #219: a dangling symlink exists as a LINK even though
+    /// `canonicalize` refuses it, so treating the non-existent tail as
+    /// symlink-free let a write leave the workspace entirely. Reproduced
+    /// against the real binary before this fix: the file landed outside.
+    #[test]
+    fn a_dangling_symlink_cannot_carry_a_write_out_of_the_sandbox() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let ws = root.join("ws");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        // The link exists; its target does not.
+        let link = ws.join("dangling");
+        std::os::unix::fs::symlink(outside.join("escaped.txt"), &link).unwrap();
+        assert!(link.symlink_metadata().is_ok(), "the link itself exists");
+        assert!(link.canonicalize().is_err(), "but it does not canonicalise");
+
+        assert_eq!(
+            resolve_landing(&link),
+            outside.join("escaped.txt"),
+            "the write lands where the link points, not where it sits"
+        );
+        assert!(
+            Sandbox::validate_against(&ws, &ws, "dangling").is_err(),
+            "so the sandbox must refuse it"
+        );
+
+        // A dangling link that stays inside is still allowed — the rule is
+        // about where it lands, not that it dangles.
+        let inside = ws.join("inside-link");
+        std::os::unix::fs::symlink(ws.join("new.txt"), &inside).unwrap();
+        assert_eq!(resolve_landing(&inside), ws.join("new.txt"));
+        assert!(Sandbox::validate_against(&ws, &ws, "inside-link").is_ok());
+
+        // An ordinary new file in a tree that does not exist yet still
+        // resolves — that is the case the old code was written for.
+        assert_eq!(
+            resolve_landing(&ws.join("a/b/c.txt")),
+            ws.join("a/b/c.txt"),
+            "a genuinely absent tail is joined, not rejected"
+        );
+
+        // A symlink loop terminates instead of hanging.
+        let a = ws.join("loop-a");
+        let b = ws.join("loop-b");
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+        let _ = resolve_landing(&a);
+    }
+
     use super::*;
     use tempfile::tempdir;
 

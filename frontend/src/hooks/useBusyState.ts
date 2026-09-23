@@ -14,7 +14,7 @@
  * surface tracks the user-facing turn, not the engine's internals.
  */
 import { useEffect, useState } from "react";
-import { send, subscribe } from "./useIPC";
+import { send, subscribe, type IPCMessage } from "./useIPC";
 
 export type BusyState = {
   busy: boolean;
@@ -32,7 +32,7 @@ const INITIAL: BusyState = {
 
 let queryIdSeq = 7_000;
 
-function applyMsg(msg: any): BusyState {
+function applyMsg(msg: IPCMessage): BusyState {
   return {
     busy: !!msg.busy,
     sessionId: typeof msg.sessionId === "string" ? msg.sessionId : null,
@@ -46,7 +46,7 @@ export function useBusyState(): BusyState {
   const [state, setState] = useState<BusyState>(INITIAL);
 
   useEffect(() => {
-    const unsub = subscribe((msg: any) => {
+    const unsub = subscribe((msg: IPCMessage) => {
       if (
         msg?.type === "gui_busy_changed" ||
         msg?.type === "gui_busy_result"

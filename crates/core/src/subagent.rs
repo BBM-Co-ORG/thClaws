@@ -52,29 +52,12 @@ struct PathScopedWriteTool {
     patterns: Vec<String>,
 }
 
-/// Where a write will actually land: `..`/`.` collapsed, symlinks
-/// followed as far as the path exists. A file that doesn't exist yet has
-/// no canonical form of its own, so canonicalise its longest existing
-/// ancestor and re-join the tail — the tail can't hide a symlink,
-/// because it isn't there.
-///
-/// Mirrors `Sandbox::validate_against`, deliberately: the two must agree
-/// on the destination or the glob check and the write check are looking
-/// at different files.
+/// Where a write will actually land. Delegates to the sandbox's resolver so
+/// the glob check and the sandbox check cannot disagree about the
+/// destination — including for a dangling symlink, which both used to treat
+/// as an ordinary non-existent file (issue #219).
 fn resolve_destination(abs: &std::path::Path) -> std::path::PathBuf {
-    let lexical = crate::sandbox::lexical_normalize(abs);
-    if let Ok(canonical) = lexical.canonicalize() {
-        return canonical;
-    }
-    let mut ancestor = lexical.parent();
-    while let Some(p) = ancestor {
-        if let Ok(canonical) = p.canonicalize() {
-            let tail = lexical.strip_prefix(p).unwrap_or(std::path::Path::new(""));
-            return canonical.join(tail);
-        }
-        ancestor = p.parent();
-    }
-    lexical
+    crate::sandbox::resolve_landing(abs)
 }
 
 impl PathScopedWriteTool {

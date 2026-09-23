@@ -544,18 +544,77 @@ pub async fn run_with_engine(
     // function returns, the runtime unwinds, and the bot's own MCP children
     // — held with `kill_on_drop` — are reaped instead of orphaned.
     let supervised = std::env::var("THCLAWS_SUPERVISED").ok().as_deref() == Some("1");
-    let stdin_closed = async move {
-        if supervised {
-            crate::bots::supervisor::stdin_closed().await;
-        } else {
-            std::future::pending::<()>().await;
+    let shutdown = async move {
+        let stdin_closed = async move {
+            if supervised {
+                crate::bots::supervisor::stdin_closed().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+        // Flush the managed browser's cookies and close Chromium on the way
+        // out. `browser_cdp::shutdown()` was called from `gui.rs` only, and
+        // `--serve` had no signal handler at all — so a cloud pause (SIGTERM,
+        // then SIGKILL) lost every login newer than the 20 s snapshot timer,
+        // on the one path the cookie feature was written for, and orphaned
+        // Chromium (dev-plan/65 #4). Bounded so a wedged DevTools endpoint
+        // cannot eat the pod's grace period.
+        async fn close_browser() {
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                tokio::task::spawn_blocking(crate::browser_cdp::shutdown),
+            )
+            .await;
+        }
+        tokio::select! {
+            // dev-plan/59: the supervised path deliberately returns so the
+            // runtime unwinds and this child's own MCP children are reaped.
+            _ = stdin_closed => close_browser().await,
+            _ = terminate_signal() => {
+                eprintln!("\x1b[36m[serve] shutting down\x1b[0m");
+                close_browser().await;
+                // Exit rather than fall into axum's graceful shutdown, which
+                // waits for in-flight connections — and the Browser tab holds
+                // a WebSocket open, so Ctrl-C would look wedged and a pod
+                // would burn its whole grace period. A signal killed this
+                // process outright before; it still does, minus the lost
+                // cookies.
+                std::process::exit(0);
+            }
         }
     };
     axum::serve(listener, app)
-        .with_graceful_shutdown(stdin_closed)
+        .with_graceful_shutdown(shutdown)
         .await
         .map_err(|e| crate::error::Error::Tool(format!("serve: {e}")))?;
     Ok(())
+}
+
+/// Resolves on SIGTERM or SIGINT (Ctrl-C on Windows). `--serve` previously
+/// took the default disposition for both: the process died on the spot, with
+/// no chance to flush anything.
+async fn terminate_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let (mut term, mut int) = match (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::interrupt()),
+        ) {
+            (Ok(t), Ok(i)) => (t, i),
+            // Registration can only fail on a broken platform; falling back
+            // to "never" keeps today's behaviour rather than exiting early.
+            _ => return std::future::pending().await,
+        };
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = int.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 // ---- Workspace sync handlers (dev-plan/51) ----

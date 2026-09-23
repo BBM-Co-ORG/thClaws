@@ -141,7 +141,7 @@ Extract body text as markdown-ish. Pure Rust — no system dependency. State mac
 - `<w:tab/>` → tab char; `<w:br/>` → newline
 - `</w:p>` → flush with style/list prefix, blank line separator
 
-Why not shell out: PDF can use `pdftotext` (poppler — installed everywhere); for OOXML we'd need LibreOffice headless which is too heavy. quick-xml is fast enough and keeps the binary self-contained.
+Why not shell out: PDF can use `pdftotext` (poppler — a package away on macOS and Linux, though see `PdfRead` below: it is *not* everywhere, and it was missing from our own runner image until v0.135); for OOXML we'd need LibreOffice headless which is too heavy. quick-xml is fast enough and keeps the binary self-contained.
 
 ---
 
@@ -282,12 +282,14 @@ const PARAGRAPH_GAP_MM: f32 = 3.0;
 
 | | |
 |---|---|
-| Mechanism | shells out to `pdftotext` (poppler-utils) |
-| Approval | no |
+| Mechanism | shells out to `pdftotext` (poppler-utils); falls back to the public `pdf.thclaws.cloud` service when it is missing |
+| Approval | no locally — **yes** when the cloud fallback would run |
 | Schema | `{path: string, pages?: string ("all" \| "N" \| "M-N")}` |
 | Timeout | 60 seconds |
 
 Why shell out instead of pure-Rust: extraction quality across real-world PDFs (tagged structure, form fields, embedded fonts with non-standard cmaps) is dominated by poppler's twenty-plus years of corner-case handling. Rust pdf crates are good for valid PDFs but break on the long tail.
+
+**Measured, 2026-09-22** (`docs/pdf-extraction-bench.md`, harness in `scripts/pdf-extract-bench.py`): against ground truth — a Thai PDF and the HTML it was printed from — `pdftotext -layout` scores **98.3% / 97.8%** Thai 5-gram recall/precision, PDFium 89.9% / 80.5%, pdf-extract 82.7% / 83.3%. PDFium re-emits a Thai mark cluster every ~28 characters and `thai_looks_garbled` does *not* catch it (0.12% orphan marks, under the 4% trigger), so a swap would degrade Thai silently. pdf-extract returns table text character-spaced (`d e e p s e e k`). Poppler stays; the fix for "not installed" is detection and instructions, not a different engine.
 
 `pdftotext -layout [-f first] [-l last] <path> -` → reads stdout. Layout-aware extraction preserves column / table structure better than the default flow mode.
 
@@ -299,7 +301,27 @@ pdftotext not found — install poppler-utils (`brew install poppler` on macOS,
 `apt install poppler-utils` on Debian/Ubuntu)
 ```
 
-The error message includes installation instructions for the two most common platforms. Power users on other distros are expected to know their package manager.
+The error message includes installation instructions for the two most common platforms. Power users on other distros are expected to know their package manager. **Windows users get neither**: the message names brew and apt, and `doctor.rs`'s install recipes (brew / apt / npm / pip) have no winget/scoop/choco arm — open gap, see `docs/pdf-extraction-bench.md`.
+
+Hosted workspaces ship poppler in the engine image (`thclaws/Dockerfile`, from v0.135) — before that every cloud PDF read failed with the message above, which a pod running as uid 1000 cannot act on.
+
+### The no-poppler fallback (dev-plan/66)
+
+A desktop user who has not installed poppler gets one anyway: `extract_text_raw` catches `ErrorKind::NotFound` on the spawn and POSTs the file to `pdf.thclaws.cloud/extract` instead — **keyless, no account**, because the requirement is that a customer with neither works.
+
+| Piece | Where |
+|---|---|
+| Service (poppler and nothing else, non-root, read-only rootfs, no egress, tmpfs upload dir, page/size/rate caps) | `thclaws-cloud/pdf-text/` |
+| Deployment + Service + rate-limit/buffer Middleware + IngressRoute + no-egress NetworkPolicy | `thclaws-cloud/infra/k3s/base/pdf-text.yaml` |
+| Client, approval gate, result marker | `tools/pdf_read.rs` (`cloud_endpoint`, `extract_via_cloud`, `poppler_missing`) |
+
+Three properties that are load-bearing rather than decorative:
+
+- **Consent.** `requires_approval` returns true for exactly the condition that sends bytes off the machine, and the new `Tool::approval_summary` hook (default `None`, plumbed through `ApprovalRequest.summary` in `agent.rs`) makes the prompt read *"no poppler on this machine — UPLOADS contract.pdf to …"* instead of a bare `PdfRead`. Accepted text carries a `[extracted by pdf.thclaws.cloud …]` note.
+- **Off switch.** `"pdfCloudFallback": false` or `THCLAWS_PDF_CLOUD=0`; then the missing-binary error is raised, now including the Windows recipes. `THCLAWS_PDF_TEXT_API` repoints it at a self-hosted copy, which is the enterprise answer.
+- **No vision path without poppler.** Rendering pages is `pdftoppm`, same package, and the service returns text only — so a scanned PDF with no local poppler returns the (thin) text plus an explicit note saying what to install, rather than failing on a second missing binary.
+
+`normalize_thai_spacing` still runs on the result; the service uses the same `pdftotext -layout`, so the output is byte-identical to a local run.
 
 **No PdfEdit:** PDF editing is hard (the format isn't designed for it). Not in scope; the model can use Read + Create to fork-and-rewrite if needed.
 

@@ -55,7 +55,7 @@ import {
 } from "./components/ModelPickerModal";
 import { ContextWarningBanner } from "./components/ContextWarningBanner";
 import { useEditingShortcuts } from "./hooks/useEditingShortcuts";
-import { send, subscribe } from "./hooks/useIPC";
+import { send, subscribe, type IPCMessage } from "./hooks/useIPC";
 
 type Tab = "terminal" | "chat" | "files" | "team" | "ui" | "shell" | "browser";
 
@@ -507,7 +507,7 @@ export default function App() {
   // Session the worker considers current, from `sessions_list.current_id`.
   const currentSessionIdRef = useRef<string | null>(null);
   useEffect(() => {
-    const unsub = subscribe((msg: any) => {
+    const unsub = subscribe((msg: IPCMessage) => {
       if (msg?.type === "initial_state" || msg?.type === "sessions_list") {
         if (Array.isArray(msg.sessions)) setKnownSessions(msg.sessions);
         // `current_id` is "" until a session is actually current — that
@@ -537,9 +537,16 @@ export default function App() {
   // conversation on screen is ours and there is nothing to auto-resume
   // into — see the note on case 1.
   const sawOwnTurnRef = useRef(false);
+  // Deliberately derived during render: the effect below reads this on
+  // its first run, so an effect-based mirror would see `false` on the
+  // very commit the decision is made in — which is the whole question
+  // this flag answers. Left as-is rather than restructured: the
+  // auto-resume path has already cost three wrong fixes.
+  /* eslint-disable react-hooks/refs */
   if (busyState.busy && busyAtOpenRef.current === false) {
     sawOwnTurnRef.current = true;
   }
+  /* eslint-enable react-hooks/refs */
   useEffect(() => {
     if (autoLoadedRef.current) return;
     // Case 1 — agent busy. Attach ONLY to a turn that was already running
@@ -647,6 +654,28 @@ export default function App() {
       window.removeEventListener("keydown", onKeyDown, { capture: true });
   }, []);
 
+  // Declared above the ⌘⇧U effect below, which closes over these
+  // setters: reading a `const` from an effect that is declared earlier
+  // works at runtime but is a temporal-dead-zone capture on paper, and
+  // react-hooks/immutability rejects it.
+  // Default tab is chat; backend overrides via `initial_tab` on
+  // current_cwd when `guiShell.tabDefault` is set in settings.json so
+  // the workspace lands on the GUI shell instead.
+  const [activeTab, setActiveTab] = useState<Tab>("chat");
+  // Full-screen UI mode — hides tab strip, sidebar, status bar so the
+  // GUI shell fills the viewport (the cloud equivalent of running
+  // `thclaws --serve --gui-shell <id>`). Auto-enters when the backend
+  // signals an initial UI tab; toggle with ⌘⇧U / Ctrl⇧U.
+  const [fullscreen, setFullscreen] = useState(false);
+  // Set when the active GUI shell declares (via
+  // thclaws.ui.claimExitControl) that it renders its own exit control,
+  // so the host suppresses its fallback chip. Reset on leaving
+  // full-screen so a subsequent non-claiming shell gets the chip back.
+  const [exitControlClaimed, setExitControlClaimed] = useState(false);
+  useEffect(() => subscribe((msg) => {
+    if (msg.type === "session_view_selected" && msg.team_agent) setActiveTab("chat");
+  }), []);
+
   // ⌘⇧U / Ctrl⇧U — toggle full-screen UI tab. Mirrors the
   // `--serve --gui-shell <id>` experience (chrome-free, just the
   // shell) without restarting the server. Entering also forces the
@@ -707,24 +736,6 @@ export default function App() {
 
   const [started, setStarted] = useState(false);
   const [currentCwd, setCurrentCwd] = useState("");
-  // Default tab is chat; backend overrides via `initial_tab` on
-  // current_cwd when `guiShell.tabDefault` is set in settings.json so
-  // the workspace lands on the GUI shell instead.
-  const [activeTab, setActiveTab] = useState<Tab>("chat");
-  useEffect(() => subscribe((msg) => {
-    if (msg.type === "session_view_selected" && msg.team_agent) setActiveTab("chat");
-  }), []);
-
-  // Full-screen UI mode — hides tab strip, sidebar, status bar so the
-  // GUI shell fills the viewport (the cloud equivalent of running
-  // `thclaws --serve --gui-shell <id>`). Auto-enters when the backend
-  // signals an initial UI tab; toggle with ⌘⇧U / Ctrl⇧U.
-  const [fullscreen, setFullscreen] = useState(false);
-  // Set when the active GUI shell declares (via
-  // thclaws.ui.claimExitControl) that it renders its own exit control,
-  // so the host suppresses its fallback chip. Reset on leaving
-  // full-screen so a subsequent non-claiming shell gets the chip back.
-  const [exitControlClaimed, setExitControlClaimed] = useState(false);
   // Drop the claim on leaving full-screen — the next shell (or the
   // next full-screen session) must re-declare it. The reference shell
   // re-claims in its `onFullscreen(active=true)` handler.

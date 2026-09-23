@@ -1395,9 +1395,17 @@ pub fn is_path_ignored(root: &Path, changed: &Path) -> bool {
 /// the new one Spawns fresh ones). With ~10s of editor save bursts
 /// and the 30s reload tick, this is plenty.
 pub struct WatchManager {
-    /// Owned debouncers. Drop = stop watching.
-    _debouncers:
-        Vec<notify_debouncer_mini::Debouncer<notify_debouncer_mini::notify::RecommendedWatcher>>,
+    /// Closing this drops the debouncers on the watch thread, which is
+    /// what stops watching. The `Vec` used to live here; it moved one
+    /// thread over so a slow `watch()` delays that thread rather than
+    /// whoever built the manager.
+    _stop: Option<std::sync::mpsc::Sender<()>>,
+    /// Fires once every watcher has been bound. Nothing in the engine
+    /// waits on it — a schedule that starts watching a second late is
+    /// no worse than one that starts a second late for any other reason
+    /// — but a test that writes a file and expects a fire has to.
+    #[allow(dead_code)] // read only through wait_until_armed, i.e. by tests
+    armed: Option<std::sync::mpsc::Receiver<()>>,
     /// Aborted on Drop so the dispatch task doesn't leak.
     dispatch_handle: Option<tokio::task::JoinHandle<()>>,
 }
@@ -1411,6 +1419,20 @@ impl Drop for WatchManager {
 }
 
 impl WatchManager {
+    /// Block until every watcher is bound, or `timeout` passes.
+    ///
+    /// Returns whether they armed in time. Nothing in the engine needs
+    /// this — watching a moment late is harmless — but a test that
+    /// writes a file and expects a fire is racing the bind, and on a
+    /// dev binary that bind has been measured at 40-50 seconds.
+    #[allow(dead_code)] // tests only; kept out of #[cfg(test)] so it compiles in both
+    pub(crate) fn wait_until_armed(&self, timeout: std::time::Duration) -> bool {
+        match &self.armed {
+            None => true, // nothing to arm
+            Some(rx) => rx.recv_timeout(timeout).is_ok(),
+        }
+    }
+
     /// Build a watch manager from the current store. Schedules with
     /// `watch_workspace=false` (or `enabled=false`) are skipped.
     /// Schedules whose `cwd` doesn't exist log a warning and skip.
@@ -1436,11 +1458,14 @@ impl WatchManager {
         // events into this `tokio::mpsc` and one consumer task
         // dispatches the fire. Simpler than per-watcher tasks and
         // serializes the cooldown bookkeeping.
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(String, PathBuf)>();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<(String, PathBuf)>();
         let last_fire: Arc<Mutex<HashMap<String, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
         let running: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
-        let mut debouncers = Vec::new();
+        // Which directories we intend to watch. Collected before any
+        // watcher is built so the decision to start a dispatcher does
+        // not depend on work that now happens on another thread.
+        let mut targets: Vec<(String, PathBuf)> = Vec::new();
         for sched in store
             .schedules
             .iter()
@@ -1455,122 +1480,131 @@ impl WatchManager {
                 );
                 continue;
             }
-            let id_for_handler = id.clone();
-            let cwd_for_handler = cwd.clone();
-            let tx_for_handler = tx.clone();
-            let mut debouncer = match new_debouncer(WATCH_DEBOUNCE, move |result| {
-                match result {
-                    Ok(events) => {
-                        let events: Vec<notify_debouncer_mini::DebouncedEvent> = events;
-                        for ev in events {
-                            if is_path_ignored(&cwd_for_handler, &ev.path) {
+            targets.push((id, cwd));
+        }
+
+        // Binding the watchers happens on its own thread, and that is
+        // load-bearing rather than tidiness.
+        //
+        // `notify`'s macOS backend starts a CFRunLoop thread and
+        // `watch()` blocks on a channel until that thread reports
+        // itself ready; when the run loop never gets going, `watch()`
+        // neither returns nor errors. Called inline — as it was — that
+        // parks whoever is building the manager. The same shape parked
+        // the settings watcher and took the whole `--lib` suite with
+        // it; here it parked `watch_manager_fires_on_file_change` and
+        // `watch_manager_ignores_internal_thclaws_writes` forever,
+        // while `watch_manager_skips_watch_workspace_false` — the one
+        // that never reaches this code — passed in milliseconds.
+        //
+        // The thread owns the debouncers, because dropping them is what
+        // stops watching. `stop_tx` lives in the manager: when the
+        // manager is dropped the channel closes, the recv below
+        // returns, and the debouncers go with it — the same lifetime
+        // the `Vec` field used to give, moved one thread over. If
+        // `watch()` never returns, this thread is what waits instead of
+        // the caller.
+        let (stop_tx, armed_rx) = if targets.is_empty() {
+            (None, None)
+        } else {
+            let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+            // Fires once every watcher is bound. Measured 2026-09-22:
+            // binding takes 10ms in a small binary and 40-50s in this
+            // crate's unsigned 200MB macOS test binary (40.5s and 49.5s
+            // on an idle machine, re-measured after a load artefact was
+            // ruled out) — the system appears to vet the image before
+            // it will register an FSEvents stream. That is why the
+            // inline version looked like a hang: it was one, for the
+            // better part of a minute per watcher, on the caller's
+            // thread.
+            //
+            // Nothing in the engine waits on this. A schedule that
+            // starts watching a moment late is no worse than one that
+            // starts late for any other reason, and blocking startup on
+            // a system service is how the old shape earned its
+            // reputation. Tests that write a file and expect a fire do
+            // have to wait, and [`WatchManager::wait_until_armed`] is
+            // for them.
+            let (armed_tx, armed_rx) = std::sync::mpsc::channel::<()>();
+            // A clone, so the original `tx` stays here to be dropped by
+            // the no-dispatcher branch below — the compiler cannot see
+            // that the two are mutually exclusive.
+            let tx_for_thread = tx.clone();
+            let spawned = std::thread::Builder::new()
+                .name("watch-setup".into())
+                .spawn(move || {
+                    let mut debouncers = Vec::new();
+                    for (id, cwd) in targets {
+                        let id_for_handler = id.clone();
+                        let cwd_for_handler = cwd.clone();
+                        let tx_for_handler = tx_for_thread.clone();
+                        let mut debouncer = match new_debouncer(WATCH_DEBOUNCE, move |result| {
+                            match result {
+                                Ok(events) => {
+                                    let events: Vec<notify_debouncer_mini::DebouncedEvent> = events;
+                                    for ev in events {
+                                        if is_path_ignored(&cwd_for_handler, &ev.path) {
+                                            continue;
+                                        }
+                                        let _ = tx_for_handler
+                                            .send((id_for_handler.clone(), ev.path.clone()));
+                                    }
+                                }
+                                Err(e) => {
+                                    // notify-debouncer-mini 0.4's callback gives
+                                    // a single Error (not a Vec) on failure.
+                                    eprintln!("\x1b[31m[watch] '{id_for_handler}' error: {e}\x1b[0m");
+                                }
+                            }
+                        }) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                eprintln!(
+                                    "\x1b[31m[watch] '{id}': could not start watcher: {e}\x1b[0m"
+                                );
                                 continue;
                             }
-                            let _ = tx_for_handler.send((id_for_handler.clone(), ev.path.clone()));
+                        };
+                        if let Err(e) = debouncer.watcher().watch(&cwd, RecursiveMode::Recursive) {
+                            eprintln!(
+                                "\x1b[31m[watch] '{id}': watch({}) failed: {e}\x1b[0m",
+                                cwd.display()
+                            );
+                            continue;
                         }
+                        eprintln!(
+                            "\x1b[36m[watch] '{id}': watching {} (debounce {}s, cooldown {}s)\x1b[0m",
+                            cwd.display(),
+                            WATCH_DEBOUNCE.as_secs(),
+                            WATCH_COOLDOWN.as_secs(),
+                        );
+                        debouncers.push(debouncer);
                     }
-                    Err(e) => {
-                        // notify-debouncer-mini 0.4's callback gives
-                        // a single Error (not a Vec) on failure.
-                        eprintln!("\x1b[31m[watch] '{id_for_handler}' error: {e}\x1b[0m");
-                    }
-                }
-            }) {
-                Ok(d) => d,
+                    let _ = armed_tx.send(());
+                    // Hold them until the manager goes away.
+                    let _ = stop_rx.recv();
+                    drop(debouncers);
+                });
+            match spawned {
+                Ok(_) => (Some(stop_tx), Some(armed_rx)),
                 Err(e) => {
-                    eprintln!("\x1b[31m[watch] '{id}': could not start watcher: {e}\x1b[0m");
-                    continue;
+                    eprintln!("\x1b[33m[watch] could not start watch thread: {e}\x1b[0m");
+                    (None, None)
                 }
-            };
-            if let Err(e) = debouncer.watcher().watch(&cwd, RecursiveMode::Recursive) {
-                eprintln!(
-                    "\x1b[31m[watch] '{id}': watch({}) failed: {e}\x1b[0m",
-                    cwd.display()
-                );
-                continue;
             }
-            eprintln!(
-                "\x1b[36m[watch] '{id}': watching {} (debounce {}s, cooldown {}s)\x1b[0m",
-                cwd.display(),
-                WATCH_DEBOUNCE.as_secs(),
-                WATCH_COOLDOWN.as_secs(),
-            );
-            debouncers.push(debouncer);
-        }
+        };
 
         // Dispatcher task: consumes events, applies cooldown +
         // skip-overlap, and fires `run_once` on the blocking pool
         // for any event that survives both gates.
-        let binary_for_task = binary.clone();
-        let store_path_for_task = store_path.clone();
-        let dispatch_handle = if !debouncers.is_empty() {
-            Some(tokio::spawn(async move {
-                while let Some((id, path)) = rx.recv().await {
-                    // Skip if a fire of this schedule is currently
-                    // running.
-                    {
-                        let r = running.lock().expect("running lock");
-                        if r.contains(&id) {
-                            continue;
-                        }
-                    }
-                    // Skip if a fire of this schedule completed
-                    // recently (cooldown). The agent's own writes
-                    // back into cwd would otherwise trigger fires
-                    // forever.
-                    {
-                        let lf = last_fire.lock().expect("last_fire lock");
-                        if let Some(t) = lf.get(&id) {
-                            if t.elapsed() < WATCH_COOLDOWN {
-                                continue;
-                            }
-                        }
-                    }
-                    {
-                        let mut r = running.lock().expect("running lock");
-                        r.insert(id.clone());
-                    }
-                    {
-                        let mut lf = last_fire.lock().expect("last_fire lock");
-                        lf.insert(id.clone(), Instant::now());
-                    }
-                    eprintln!(
-                        "\x1b[36m[watch] '{id}': fired (changed: {})\x1b[0m",
-                        path.display()
-                    );
-                    let id_for_blocking = id.clone();
-                    let binary = binary_for_task.clone();
-                    let running_for_done = running.clone();
-                    let store_path_for_blocking = store_path_for_task.clone();
-                    tokio::task::spawn_blocking(move || {
-                        match run_once_with(
-                            &id_for_blocking,
-                            &binary,
-                            store_path_for_blocking.as_deref(),
-                        ) {
-                            Ok(o) => {
-                                let exit = o
-                                    .exit_code
-                                    .map(|c| c.to_string())
-                                    .unwrap_or_else(|| "(timeout)".into());
-                                eprintln!(
-                                    "\x1b[36m[watch] '{id_for_blocking}' done — exit={exit} duration={}.{:03}s → result={} (log={})\x1b[0m",
-                                    o.duration.as_secs(),
-                                    o.duration.subsec_millis(),
-                                    o.result_path.display(),
-                                    o.log_path.display(),
-                                );
-                            }
-                            Err(e) => {
-                                eprintln!("\x1b[31m[watch] '{id_for_blocking}' failed: {e}\x1b[0m");
-                            }
-                        }
-                        if let Ok(mut r) = running_for_done.lock() {
-                            r.remove(&id_for_blocking);
-                        }
-                    });
-                }
-            }))
+        let dispatch_handle = if stop_tx.is_some() {
+            Some(spawn_dispatcher(
+                rx,
+                binary.clone(),
+                store_path.clone(),
+                last_fire,
+                running,
+            ))
         } else {
             // Drop the unused tx so the rx side closes cleanly when
             // the manager goes away — no dispatcher task to spawn.
@@ -1579,10 +1613,95 @@ impl WatchManager {
         };
 
         Ok(Self {
-            _debouncers: debouncers,
+            _stop: stop_tx,
+            armed: armed_rx,
             dispatch_handle,
         })
     }
+}
+
+/// Consume debounced watch events and fire the schedules they name.
+///
+/// Its own function so it can be driven without a filesystem. What it
+/// decides — cooldown, skip-while-running, and that a fire actually runs
+/// the binary — is ordinary logic worth testing on every machine; that
+/// macOS will hand this process an FSEvents stream is not, and mixing
+/// the two is how the only tests of this logic came to depend on a
+/// system service that takes 46 seconds here and 10ms elsewhere.
+fn spawn_dispatcher(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<(String, PathBuf)>,
+    binary_for_task: PathBuf,
+    store_path_for_task: Option<PathBuf>,
+    last_fire: Arc<Mutex<HashMap<String, Instant>>>,
+    running: Arc<Mutex<HashSet<String>>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some((id, path)) = rx.recv().await {
+            // Skip if a fire of this schedule is currently
+            // running.
+            {
+                let r = running.lock().expect("running lock");
+                if r.contains(&id) {
+                    continue;
+                }
+            }
+            // Skip if a fire of this schedule completed
+            // recently (cooldown). The agent's own writes
+            // back into cwd would otherwise trigger fires
+            // forever.
+            {
+                let lf = last_fire.lock().expect("last_fire lock");
+                if let Some(t) = lf.get(&id) {
+                    if t.elapsed() < WATCH_COOLDOWN {
+                        continue;
+                    }
+                }
+            }
+            {
+                let mut r = running.lock().expect("running lock");
+                r.insert(id.clone());
+            }
+            {
+                let mut lf = last_fire.lock().expect("last_fire lock");
+                lf.insert(id.clone(), Instant::now());
+            }
+            eprintln!(
+                "\x1b[36m[watch] '{id}': fired (changed: {})\x1b[0m",
+                path.display()
+            );
+            let id_for_blocking = id.clone();
+            let binary = binary_for_task.clone();
+            let running_for_done = running.clone();
+            let store_path_for_blocking = store_path_for_task.clone();
+            tokio::task::spawn_blocking(move || {
+                match run_once_with(
+                    &id_for_blocking,
+                    &binary,
+                    store_path_for_blocking.as_deref(),
+                ) {
+                    Ok(o) => {
+                        let exit = o
+                            .exit_code
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "(timeout)".into());
+                        eprintln!(
+                                "\x1b[36m[watch] '{id_for_blocking}' done — exit={exit} duration={}.{:03}s → result={} (log={})\x1b[0m",
+                                o.duration.as_secs(),
+                                o.duration.subsec_millis(),
+                                o.result_path.display(),
+                                o.log_path.display(),
+                            );
+                    }
+                    Err(e) => {
+                        eprintln!("\x1b[31m[watch] '{id_for_blocking}' failed: {e}\x1b[0m");
+                    }
+                }
+                if let Ok(mut r) = running_for_done.lock() {
+                    r.remove(&id_for_blocking);
+                }
+            });
+        }
+    })
 }
 
 #[cfg(test)]
@@ -2068,8 +2187,160 @@ mod tests {
     /// Slow by necessity: WATCH_DEBOUNCE is 2s. We wait 4s after
     /// touching the file to give the debouncer + dispatcher +
     /// spawn_blocking + child process time to land.
+    /// The dispatcher fires the schedule an event names.
+    ///
+    /// No filesystem: the event is pushed straight into the channel the
+    /// watcher callback would have used. Everything this asserts — that
+    /// a fire runs the binary, records `last_run` and `last_exit`, and
+    /// saves the store — is ours, and now runs on every machine.
+    #[cfg(unix)]
+    /// Poll the store until the schedule records a run, up to `secs`.
+    /// A flat sleep is a coin toss on a loaded machine; this waits only
+    /// as long as it has to and fails loudly if the run never lands.
+    async fn wait_for_last_run(path: &Path, id: &str, secs: u64) -> Option<String> {
+        for _ in 0..(secs * 10) {
+            if let Ok(store) = ScheduleStore::load_from(path) {
+                if let Some(run) = store.get(id).and_then(|s| s.last_run.clone()) {
+                    return Some(run);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        None
+    }
+
+    #[test]
+    fn a_watch_event_fires_the_schedule() {
+        let bin_dir = tempfile::tempdir().unwrap();
+        let fake = bin_dir.path().join("fake-thclaws");
+        write_fake_executable(&fake, "#!/bin/sh\nexit 0");
+
+        let work = tempfile::tempdir().unwrap();
+        let store_dir = tempfile::tempdir().unwrap();
+        let store_path = store_dir.path().join("schedules.json");
+        let id = format!("disp-{}", uuid::Uuid::new_v4());
+
+        let mut store = ScheduleStore::default();
+        store
+            .add(Schedule {
+                id: id.clone(),
+                cron: "0 0 1 1 *".into(),
+                cwd: work.path().to_path_buf(),
+                prompt: "p".into(),
+                timeout_secs: Some(5),
+                enabled: true,
+                watch_workspace: true,
+                ..Default::default()
+            })
+            .unwrap();
+        store.save_to(&store_path).unwrap();
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<(String, PathBuf)>();
+            let _h = spawn_dispatcher(
+                rx,
+                fake.clone(),
+                Some(store_path.clone()),
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(HashSet::new())),
+            );
+            tx.send((id.clone(), work.path().join("notes/hello.txt")))
+                .unwrap();
+            assert!(
+                wait_for_last_run(&store_path, &id, 30).await.is_some(),
+                "the event should have fired the schedule"
+            );
+        });
+
+        let after = ScheduleStore::load_from(&store_path).unwrap();
+        let s = after.get(&id).expect("schedule present");
+        assert!(s.last_run.is_some(), "the event should have fired it");
+        assert_eq!(s.last_exit, Some(0), "fake binary exits 0");
+        if let Ok(d) = log_dir_for(&id) {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// A second event inside the cooldown does not fire again.
+    ///
+    /// The agent's own writes back into `cwd` are what this protects
+    /// against: without it a fire triggers the next one forever.
     #[cfg(unix)]
     #[test]
+    fn a_second_event_inside_the_cooldown_is_dropped() {
+        let bin_dir = tempfile::tempdir().unwrap();
+        let fake = bin_dir.path().join("fake-thclaws");
+        write_fake_executable(&fake, "#!/bin/sh\nexit 0");
+
+        let work = tempfile::tempdir().unwrap();
+        let store_dir = tempfile::tempdir().unwrap();
+        let store_path = store_dir.path().join("schedules.json");
+        let id = format!("cool-{}", uuid::Uuid::new_v4());
+
+        let mut store = ScheduleStore::default();
+        store
+            .add(Schedule {
+                id: id.clone(),
+                cron: "0 0 1 1 *".into(),
+                cwd: work.path().to_path_buf(),
+                prompt: "p".into(),
+                timeout_secs: Some(5),
+                enabled: true,
+                watch_workspace: true,
+                ..Default::default()
+            })
+            .unwrap();
+        store.save_to(&store_path).unwrap();
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let after_first = rt.block_on(async {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<(String, PathBuf)>();
+            let _h = spawn_dispatcher(
+                rx,
+                fake.clone(),
+                Some(store_path.clone()),
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(HashSet::new())),
+            );
+            tx.send((id.clone(), work.path().join("a.txt"))).unwrap();
+            // Read it BEFORE the second event. Comparing the final
+            // value with itself is always true and proves nothing.
+            let seen = wait_for_last_run(&store_path, &id, 30).await;
+            tx.send((id.clone(), work.path().join("b.txt"))).unwrap();
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            seen
+        });
+
+        assert!(after_first.is_some(), "the first event should have fired");
+        let after = ScheduleStore::load_from(&store_path).unwrap();
+        let s = after.get(&id).expect("schedule present");
+        assert_eq!(
+            s.last_run, after_first,
+            "a second event inside the cooldown must not fire again"
+        );
+        if let Ok(d) = log_dir_for(&id) {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// Real FSEvents/inotify, end to end. `#[ignore]` because
+    /// registering a stream is instant on Linux and measured at 46
+    /// SECONDS in this crate's unsigned macOS dev binary — the
+    /// system appears to vet the image first — which made this the
+    /// test that hung the suite for ten days. What it covers that
+    /// the deterministic tests cannot is only that the OS delivers
+    /// the event at all. Run it deliberately:
+    ///   cargo test --lib -- --ignored watch_manager_fires_on_file_change
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "real FSEvents: ~45s to bind in this binary; run with --ignored"]
     fn watch_manager_fires_on_file_change() {
         // Fake binary: a shell script that exits 0 fast.
         let bin_dir = tempfile::tempdir().unwrap();
@@ -2106,8 +2377,21 @@ mod tests {
                 WatchManager::from_store_with_path(&store, fake.clone(), Some(store_path.clone()))
                     .expect("manager build");
 
-            // Give the watcher a beat to bind before mutating.
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            // Wait for the bind rather than assume it. The old fixed
+            // 300ms was a coin flip this binary always lost — the write
+            // landed before anything was watching. Registering an
+            // FSEvents stream is instant on Linux (CI, inotify) and
+            // slow enough here to be the reason this test is
+            // `#[ignore]`d; the elapsed time is printed because it is
+            // the one number anyone re-running this wants.
+            let t0 = Instant::now();
+            let armed =
+                tokio::task::block_in_place(|| _manager.wait_until_armed(Duration::from_secs(180)));
+            eprintln!(
+                "[test] watcher bind: armed={armed} after {:.1}s",
+                t0.elapsed().as_secs_f32()
+            );
+            assert!(armed, "the watcher never bound; nothing below can pass");
 
             // Touch a file inside a subdirectory, not at the root.
             // macOS FSEvents may coalesce a single root-level write
@@ -2145,8 +2429,17 @@ mod tests {
     /// Files under ignored segments (e.g. `.thclaws/`) inside the
     /// watched workspace must NOT trigger fires. Otherwise the
     /// schedule's own session JSONL writes would re-fire forever.
+    /// Real FSEvents/inotify, end to end. `#[ignore]` because
+    /// registering a stream is instant on Linux and measured at 46
+    /// SECONDS in this crate's unsigned macOS dev binary — the
+    /// system appears to vet the image first — which made this the
+    /// test that hung the suite for ten days. What it covers that
+    /// the deterministic tests cannot is only that the OS delivers
+    /// the event at all. Run it deliberately:
+    ///   cargo test --lib -- --ignored watch_manager_ignores_internal_thclaws_writes
     #[cfg(unix)]
     #[test]
+    #[ignore = "real FSEvents: ~45s to bind in this binary; run with --ignored"]
     fn watch_manager_ignores_internal_thclaws_writes() {
         let bin_dir = tempfile::tempdir().unwrap();
         let fake = bin_dir.path().join("fake-thclaws");
@@ -2186,7 +2479,17 @@ mod tests {
             let _manager =
                 WatchManager::from_store_with_path(&store, fake.clone(), Some(store_path.clone()))
                     .expect("manager build");
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            // Registering an FSEvents stream is instant on Linux (CI,
+            // inotify) and slow enough here to be the reason this test
+            // is `#[ignore]`d.
+            let t0 = Instant::now();
+            let armed =
+                tokio::task::block_in_place(|| _manager.wait_until_armed(Duration::from_secs(180)));
+            eprintln!(
+                "[test] watcher bind: armed={armed} after {:.1}s",
+                t0.elapsed().as_secs_f32()
+            );
+            assert!(armed, "the watcher never bound; nothing below can pass");
 
             // Write only into ignored directories: .thclaws and .git.
             std::fs::write(thclaws_dir.join("noise.jsonl"), b"x").unwrap();
@@ -2666,8 +2969,27 @@ mod tests {
             run_at: None,
         };
         let outcome = spawn_job(&schedule, &fake).unwrap();
-        assert!(outcome.timed_out);
-        assert_eq!(outcome.exit_code, None);
+        // Say why, if this ever fails. It was reported failing once
+        // inside a loaded full-suite run and could not be reproduced
+        // afterwards — 24 runs, idle and under a load average of ten on
+        // eight cores, all passed. A bare `assert!` told us nothing
+        // about which of the two plausible causes it was, so these carry
+        // the outcome: a `timed_out: false` with an exit code means the
+        // child could not be started (the script is `sleep 10` against a
+        // one-second deadline, so it cannot have finished in time),
+        // while a slow deadline would show up in the duration.
+        assert!(
+            outcome.timed_out,
+            "expected the deadline to fire; got exit_code={:?} after {:?} \
+             — a non-None exit code here means the child could not be started, \
+             not that the timeout was too tight",
+            outcome.exit_code, outcome.duration
+        );
+        assert_eq!(
+            outcome.exit_code, None,
+            "a killed child reports no exit code; duration was {:?}",
+            outcome.duration
+        );
 
         if let Ok(d) = log_dir_for(&schedule.id) {
             let _ = std::fs::remove_dir_all(d);

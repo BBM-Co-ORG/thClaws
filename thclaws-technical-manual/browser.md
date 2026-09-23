@@ -30,9 +30,16 @@ for canvas/chart/visual-only pages the a11y tree can't describe).
 `crates/core/src/config.rs`:
 
 - `AppConfig.browser_enabled` — `#[serde(default = "default_browser_enabled")]`,
-  **defaults `true`** (v0.49.2). `browser_headless: Option<bool>` —
-  `None` means "platform default" (headed on desktop, headless on
-  cloud/serve).
+  compiled default **`true`** (v0.49.2), but two things override it in
+  practice: `THCLAWS_BROWSER_ENABLED=0` flips the *default* off for a whole
+  fleet (every cloud runner sets it — headless Chromium OOM-killed 1 Gi
+  runners that never asked for a browser), and the new-workspace settings
+  template writes `"browserEnabled": false`. An explicit setting always
+  wins over the env. Anything reporting this to a user must report the
+  **resolved** `AppConfig` value, not the project file's — the Settings
+  toggle read the latter and disagreed with the engine on cloud
+  (dev-plan/65 §2.6). `browser_headless: Option<bool>` — `None` means
+  "platform default" (headed on desktop, headless on cloud/serve).
 - `AppConfig::load()` injects a synthetic MCP server into the config's
   `mcp_servers` map under the key `"browser"` by calling
   `browser_mcp_config(headless_override)`. The injection is **skipped**
@@ -83,22 +90,36 @@ serde-skipped and the command is engine-chosen. Test
 
 ## CDP module — the human channel
 
-`crates/core/src/browser_cdp.rs` (~700 lines, **not** `gui`-gated — it's
+`crates/core/src/browser_cdp.rs` (~1,200 lines, **not** `gui`-gated — it's
 referenced unconditionally by `mcp.rs`/`config.rs`; ungating it was the
 v0.51.0 `make install` fix, commit `66cc9c14`):
 
 - `arm()` — registers the CDP machinery onto the shared session;
   cheap, no process spawn.
 - `ensure_up()` — **lazy launch**. Finds Chromium (`find_chromium()`),
-  launches it with `--remote-debugging-port`, persists the resolved
-  `devtools-endpoint` to a file under the profile dir, and hands
-  playwright-mcp the matching `--cdp-endpoint` so both attach to the
-  same browser. Idempotent: re-entry probes the persisted endpoint
-  first.
-- **Re-attach** across engine restarts: reads the persisted
-  `devtools-endpoint` file and probes it with an **HTTP/1.1 + `Connection:
-  close`** request. (HTTP/1.0 was the original bug — Chromium's DevTools
-  HTTP server silently ignores HTTP/1.0 probes; verified empirically.)
+  launches it with `--remote-debugging-port`, `--user-data-dir` and
+  `--window-size`, persists the resolved `devtools-endpoint` to a file
+  under the profile dir, and hands playwright-mcp the matching
+  `--cdp-endpoint` so both attach to the same browser.
+- **Liveness, not a flag** (v0.134, dev-plan/65 #3): re-entry probes the
+  endpoint (cached 2 s) instead of trusting `launched`, and relaunches on
+  the **same port** when Chromium has gone — a closed window or an OOM kill
+  used to break every browser tool call and the live view for the rest of
+  the session with nothing ever clearing the flag.
+- **`--window-size` is what sizes a page in CDP mode** (dev-plan/65 #1):
+  playwright-mcp ignores its own `--viewport-size` when handed
+  `--cdp-endpoint`, because it adopts the page the engine already opened.
+  Both come from `AppConfig::browser_viewport()`
+  (`THCLAWS_BROWSER_VIEWPORT`, default 1920×1080) so they cannot drift.
+- **Orphan handling is reap, not re-attach** (v0.53): a previous engine's
+  Chromium is closed (`Browser.close` → SIGKILL by saved pid → clear
+  `Singleton*` locks) and a fresh one launched, because a new
+  playwright-mcp connecting over CDP into a browser the *previous* run's
+  playwright-mcp drove fails every time with "Browser context management
+  is not supported". Cookies live in the persistent `--user-data-dir`, so
+  nothing is lost by relaunching. The endpoint probe is **HTTP/1.1 +
+  `Connection: close`** (HTTP/1.0 was the original bug — Chromium's
+  DevTools HTTP server silently ignores HTTP/1.0 probes).
 - `find_chromium()` — discovery across the playwright browser cache and
   system installs. On cloud the runner image pins
   `PLAYWRIGHT_BROWSERS_PATH=/ms-playwright` and `--browser chromium`
@@ -111,15 +132,33 @@ v0.51.0 `make install` fix, commit `66cc9c14`):
   via `notify()` — a **fire-and-forget** `Page.screencastFrameAck` that
   does **not** await a reply. (The original reply-awaiting ack inside the
   reader task deadlocked it: 1 frame per ~15 s. `notify()` is the fix.)
+  Frames are capped at 1366×900, so Chromium **scales** them: each
+  `browser_frame` envelope therefore carries `w`/`h` from
+  `metadata.deviceWidth/deviceHeight` — the page's own CSS-pixel size, which
+  is the space `Input.*` works in — and the tab maps clicks through that,
+  not through the image's pixels (dev-plan/65 #1). Measured cost: 57.5 KB per
+  frame, ~212 KB/s per viewer under continuous scrolling.
 - **Input:** `input(kind, args)` dispatches synthetic events —
   `Input.dispatchMouseEvent` (click/move/drag/down/up/wheel),
   `Input.dispatchKeyEvent` (press_key), and `Input.insertText` (the
   synthetic `type_text`). This is the takeover remote control.
+- **Diagnostics:** `doctor_summary()` (the `browser:` line in `/doctor`) and
+  `chromium_alive()`. Before v0.134 the subsystem had no health check at
+  all, so a live view that had silently fallen back to screenshots — the
+  no-Chromium case — looked like a missing feature (dev-plan/65 #8). The
+  same facts reach the Browser tab via `browser_status_get`
+  (`chromium`, `chromium_found`, `viewport`).
 - **Cookies:** `snapshot_cookies()` / `restore_cookies()` /
   `flush_cookies()` use `Storage.getCookies` / `setCookies`,
   **independent of Chromium's ~30 s SQLite flush timer** — an abrupt
   `SIGKILL` (cloud pod stop) otherwise loses recent logins. Snapshot on
-  pause/stop, restore on launch (v0.52.0).
+  pause/stop, restore on launch (v0.52.0). Two v0.134 corrections
+  (dev-plan/65 #4): `--serve` now installs a SIGTERM/SIGINT handler that
+  flushes and closes before exiting — the shutdown path existed only in
+  `gui.rs`, so the cloud, the environment it was written for, never ran it;
+  and an **empty** cookie jar is written when a snapshot already exists
+  (it means the user logged out) instead of being skipped, which used to
+  leave the stale snapshot in place and restore the session on next launch.
 - `profile_dir_for(container)` — resolves the on-disk profile location
   (outside the workspace folder).
 - `PageSession` — the per-page CDP wrapper; `notify()` is its
@@ -148,7 +187,7 @@ by the wry desktop GUI and the `--serve` WebSocket bridge — see
 
 | Handler | Purpose |
 |---|---|
-| `browser_status_get` | on/headed/headless, launch cmd, binary-found, CDP-active |
+| `browser_status_get` | on/headed/headless, launch cmd, binary-found, CDP-active, Chromium path + found, resolved viewport |
 | `browser_screenshot_get` | one-shot `browser_take_screenshot` via `call_tool_raw` |
 | `browser_input_call` | takeover input — **allowlisted** verbs only |
 | `browser_screencast_start` / `_stop` | toggle the live frame stream |
@@ -218,20 +257,31 @@ pack/strip rules.
 |---|---|
 | `THCLAWS_BROWSER_MCP_CMD` | Override the playwright-mcp launch command (default `npx -y @playwright/mcp@latest`) |
 | `THCLAWS_BROWSER_CDP=0` | Disable the CDP/human channel; agent MCP tools still work |
+| `THCLAWS_BROWSER_VIEWPORT="W,H"` | Page size for the engine's `--window-size` **and** playwright-mcp's `--viewport-size` (default `1920,1080`) |
+| `THCLAWS_BROWSER_ALLOW_BRANDED=1` | Allow driving Chrome/Edge over CDP (unreliable — see `find_chromium()`) |
 | `PLAYWRIGHT_BROWSERS_PATH` | Chromium cache location (`find_chromium()` searches it) |
 | `browserEnabled` / `browserHeadless` (settings.json) | Opt out / force headless |
 
 ## Known gaps / notes
 
-- Vision images capped at 5 MB per `browser_take_screenshot` result.
-- Re-attach relies on the persisted `devtools-endpoint` file + an
-  HTTP/1.1 probe; a stale endpoint after a hard crash forces a fresh
-  launch.
+- Vision images capped at 5 MB per `browser_take_screenshot` result; text
+  at `MAX_MCP_TEXT_BYTES` (256 KB), which one Wikipedia `browser_snapshot`
+  (889 KB measured) blows straight through.
 - The `browser` MCP key is reserved — a user MCP server named `browser`
   would collide with the injected one.
+- Open, tracked in `dev-plan/65`: the live view attaches to the first
+  `page` in `/json/list`, which is not necessarily the tab the agent is
+  driving (#5); one viewer at a time (one `page_slot`, one dispatch) (#9);
+  no `everyNthFrame`, so the wire pays for frames the client throttles away
+  (#9); takeover accepts 9 named keys and no modifiers (#10); multiuser
+  shares one cookie jar across tenants (#6).
 
 ## See also
 
+- `docs/browser/README.md` — the design document the code's
+  "docs/browser Phase N" comments refer to, plus the gotcha list.
+- `dev-plan/65-browser-one-browser-you-can-trust.md` — the 2026-09-22 audit
+  and repair plan; code cites its findings as `dev-plan/65 #N`.
 - [`mcp.md`](mcp.md) — MCP client subsystem, allowlist, `call_multimodal`.
 - [`agentic-loop.md`](agentic-loop.md) — approval gate, tool dispatch.
 - [`serve-mode.md`](serve-mode.md) — the IPC bridge the Browser tab rides on `--serve`.

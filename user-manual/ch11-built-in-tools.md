@@ -104,7 +104,7 @@ so Thai content renders correctly without a system-font dependency.
 | Tool | Approval | Summary |
 |---|---|---|
 | `PdfCreate` | prompt | Markdown → PDF (printpdf + embedded Thai font, A4/Letter/Legal) |
-| `PdfRead` | auto | Extract text via `pdftotext` (poppler-utils — `brew install poppler` / `apt install poppler-utils`) |
+| `PdfRead` | auto¹ | Extract text via `pdftotext` (poppler-utils — `brew install poppler` / `apt install poppler-utils`) |
 | `DocxCreate` | prompt | Markdown → Word (.docx) via `docx-rs` — headings, lists, code blocks |
 | `DocxRead` | auto | Extract text from a Word doc (pure Rust XML walk) |
 | `DocxEdit` | prompt | `find_replace` / `append_paragraph` in place |
@@ -114,6 +114,27 @@ so Thai content renders correctly without a system-font dependency.
 | `PptxCreate` | prompt | Markdown outline → PowerPoint (.pptx); `# Heading` = new slide |
 | `PptxRead` | auto | Extract text per slide (numeric ordering — slide10 doesn't sort before slide2) |
 | `PptxEdit` | prompt | `find_replace` across all slides — designed for `{{placeholder}}` template fill |
+
+**¹ Reading a PDF without installing poppler.** `PdfRead` prefers
+`pdftotext` on your machine: it is the best extractor there is for Thai and
+the file never leaves your computer. If poppler is not installed, rather than
+failing, thClaws offers to extract the text through a public thClaws
+service — **no account and no key needed** — and asks you first, naming the
+file and where it is going. The text comes back marked so you can see which
+path produced it.
+
+Three things worth knowing:
+
+- Install poppler and the question stops being asked
+  (`brew install poppler`, `apt install poppler-utils`,
+  `winget install oschwartz10612.Poppler` or `scoop install poppler`).
+- Set `"pdfCloudFallback": false` in `.thclaws/settings.json` and nothing is
+  ever uploaded — you get the install instructions instead. Do this if your
+  PDFs are confidential by default.
+- **Scanned PDFs still need poppler.** When a PDF has no text layer, thClaws
+  reads it by rendering the pages as images for the model to look at, and that
+  rendering is `pdftoppm` — from the same package. The public service returns
+  text only.
 
 **Thai rendering across formats:**
 

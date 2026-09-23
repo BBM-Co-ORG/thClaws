@@ -1053,6 +1053,7 @@ mod tests {
             summary: "".into(),
             kind: "concept".into(),
             updated: None,
+            has_children: false,
         }];
         let raw = r#"[
           {"slug":"Overtime Pay","kind":"concept","title":"Overtime pay","action":"update","claim_ids":["s1c1","s2c1","bogus"],"related":["thai-labour-law"]},
@@ -1119,6 +1120,7 @@ mod tests {
                 summary: String::new(),
                 kind: "concept".into(),
                 updated: None,
+                has_children: false,
             },
             KnownNote {
                 slug: "theory-of-constraints".into(),
@@ -1126,6 +1128,7 @@ mod tests {
                 summary: String::new(),
                 kind: "concept".into(),
                 updated: None,
+                has_children: false,
             },
         ];
         // The model ignores the instruction and plans a small encyclopedia.
@@ -1219,6 +1222,7 @@ mod tests {
             summary: String::new(),
             kind: "entity".into(),
             updated: None,
+            has_children: false,
         }];
         let raw = r#"[
           {"slug":"topic","kind":"moc","title":"Topic","action":"create","related":["deep-seek"]},
@@ -1421,6 +1425,7 @@ mod tests {
             summary: "".into(),
             kind: "concept".into(),
             updated: Some("2026-01-01".into()),
+            has_children: false,
         }];
         let raw = r#"[{"slug":"overtime-pay","kind":"concept","title":"Overtime pay","action":"update","claim_ids":["s1c1"],"related":[]},
                       {"slug":"topic-moc","kind":"moc","title":"x","action":"create","claim_ids":["s1c2"],"related":[]}]"#;

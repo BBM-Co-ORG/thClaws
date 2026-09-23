@@ -23,7 +23,21 @@
 //! across real-world PDFs (tagged structure, form fields, embedded fonts
 //! with non-standard cmaps) is dominated by poppler's twenty-plus years
 //! of corner-case handling. The Rust crates that exist are good for
-//! valid PDFs but break on the long tail.
+//! valid PDFs but break on the long tail. Measured against ground truth
+//! (`docs/pdf-extraction-bench.md`): poppler 98.3% / 97.8% Thai 5-gram
+//! recall / precision, PDFium 89.9% / 80.5% — and PDFium's damage is a
+//! duplicated Thai cluster every ~28 characters that `thai_looks_garbled`
+//! does NOT catch, so it would degrade Thai silently.
+//!
+//! The cost of that choice is that poppler has to be installed, which a
+//! desktop user has not done and a Windows user has no instructions for.
+//! So when `pdftotext` is missing, extraction falls back to the public
+//! `pdf.thclaws.cloud` service — no account, no key (dev-plan/66). The
+//! file leaves the machine, so that path is approval-gated, names the
+//! destination in the prompt, marks its output, and is switched off by
+//! `"pdfCloudFallback": false` or `THCLAWS_PDF_CLOUD=0`. It is a stopgap
+//! for the install problem, not a change of extractor: when poppler is
+//! present nothing here reaches the network.
 
 use super::{req_str, Tool};
 use crate::error::{Error, Result};
@@ -77,6 +91,21 @@ mod fallback {
     pub const MIN_THAI_FOR_GARBLE_CHECK: usize = 40;
     pub const GARBLE_ORPHAN_MARKS: usize = 6;
     pub const GARBLE_ORPHAN_RATIO: f32 = 0.04;
+
+    /// Below this many Thai characters there is not enough text to judge how
+    /// the extractor is treating the script.
+    pub const MIN_THAI_FOR_MODE_CHOICE: usize = 200;
+    /// "Mark, space, consonant" per 1000 Thai characters, above which
+    /// `-layout` is breaking words rather than preserving columns. Measured
+    /// over 24 Thai PDFs: the documents above it gain 1.33x-3.70x average Thai
+    /// run length from `-raw`, the ones at 2.6 and below gain exactly 1.00x,
+    /// and budget tables sit at 0.0-0.8 so their columns are never traded away.
+    pub const SHRED_PER_1K_RETRY: f32 = 10.0;
+    /// Mean length of a contiguous Thai run, below which the text layer holds
+    /// no words at all — every character stands alone. One PDF in that corpus
+    /// reads 1.0 in both modes, and no spacing rule can help it; it belongs on
+    /// the vision path.
+    pub const MIN_THAI_RUN: f32 = 2.0;
 }
 
 pub struct PdfReadTool;
@@ -94,9 +123,12 @@ impl Tool for PdfReadTool {
          text. **Scanned / image-based PDFs** (no embedded text layer) \
          fall through to a vision-OCR path that renders each requested \
          page as PNG via `pdftoppm` so the model sees the pages directly \
-         — no separate OCR step needed. Requires poppler-utils installed \
-         (`brew install poppler` on macOS, `apt install poppler-utils` \
-         on Debian/Ubuntu)."
+         — no separate OCR step needed. poppler-utils gives the best results \
+         and keeps the file local (`brew install poppler` on macOS, \
+         `apt install poppler-utils` on Debian/Ubuntu); without it, text \
+         extraction falls back to a public thClaws service that needs no \
+         account — the user approves that upload, and the scanned-PDF vision \
+         path is unavailable until poppler is installed."
     }
 
     fn input_schema(&self) -> Value {
@@ -109,6 +141,25 @@ impl Tool for PdfReadTool {
             },
             "required": ["path"]
         })
+    }
+
+    /// Reading a local file needs no approval — but with no poppler the file
+    /// is about to be uploaded to the public extraction service, and that
+    /// does (dev-plan/66). Nothing else about the call changes, so the gate
+    /// tracks exactly the condition that sends bytes off the machine.
+    fn requires_approval(&self, _input: &Value) -> bool {
+        poppler_missing() && cloud_endpoint().is_some()
+    }
+
+    fn approval_summary(&self, input: &Value) -> Option<String> {
+        if !self.requires_approval(input) {
+            return None;
+        }
+        let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+        let url = cloud_endpoint()?;
+        Some(format!(
+            "no poppler on this machine — UPLOADS {path} to {url} to extract its text"
+        ))
     }
 
     async fn call(&self, input: Value) -> Result<String> {
@@ -143,7 +194,7 @@ impl Tool for PdfReadTool {
                 .map(ToolResultContent::Blocks);
         }
 
-        let raw = extract_text_raw(&validated, first, last).await?;
+        let raw = extract_text_raw(&validated, first, last, CloudFallback::Allowed).await?;
 
         // Take the text layer when it's both present (not scanned) and
         // trustworthy (not a garbled Thai font). "Looks scanned" splits on
@@ -151,7 +202,27 @@ impl Tool for PdfReadTool {
         // Thai combining marks orphaned behind spaces. Either one routes to
         // vision-OCR, which reads the rendered glyphs directly.
         if !text_is_too_sparse(&raw) && !thai_looks_garbled(&raw) {
-            return Ok(ToolResultContent::Text(normalize_thai_spacing(&raw)));
+            let mut text = normalize_thai_spacing(&raw);
+            if poppler_missing() {
+                text.push_str(CLOUD_NOTE);
+            }
+            return Ok(ToolResultContent::Text(text));
+        }
+
+        // The text layer is unusable — but rendering needs `pdftoppm`, which
+        // is the same package as `pdftotext`. With no poppler at all there is
+        // no vision path to fall through TO (the service returns text only),
+        // so say that rather than failing on a missing binary the user was
+        // never told about.
+        if poppler_missing() {
+            return Ok(ToolResultContent::Text(format!(
+                "{}\n\n[this PDF's text layer is empty or unreliable — it is probably a \
+                 scan. Reading it needs the vision path, which renders pages with \
+                 `pdftoppm`: install poppler-utils (`brew install poppler`, \
+                 `apt install poppler-utils`, `winget install oschwartz10612.Poppler`). \
+                 The no-install extraction service returns text only.]",
+                normalize_thai_spacing(&raw)
+            )));
         }
 
         // Fall through to vision-OCR (scanned, or a text layer too garbled
@@ -185,6 +256,58 @@ fn text_is_too_sparse(text: &str) -> bool {
 /// thanthakhat + nikhahit + yamakkan).
 fn is_thai_trailing_mark(c: char) -> bool {
     matches!(c, '\u{0E30}'..='\u{0E3A}' | '\u{0E47}'..='\u{0E4E}')
+}
+
+/// "Mark, space, consonant" per 1000 Thai characters — the shape `-layout`
+/// leaves when it pads a glyph gap inside a Thai word.
+fn shred_per_1k(text: &str) -> f32 {
+    let chars: Vec<char> = text.chars().collect();
+    let thai = chars.iter().filter(|c| is_thai(**c)).count();
+    if thai == 0 {
+        return 0.0;
+    }
+    let breaks = chars
+        .windows(3)
+        .filter(|w| w[1] == ' ' && is_thai_trailing_mark(w[0]) && is_thai_consonant(w[2]))
+        .count();
+    1000.0 * breaks as f32 / thai as f32
+}
+
+/// Mean length of a contiguous run of Thai characters. Thai writes without
+/// spaces between words, so a healthy run is many characters long; extraction
+/// damage is what cuts it down. No dictionary needed, which matters — the
+/// bundled word list is a 229-word placeholder.
+fn mean_thai_run(text: &str) -> f32 {
+    let (mut runs, mut total, mut cur) = (0usize, 0usize, 0usize);
+    for c in text.chars() {
+        if is_thai(c) {
+            cur += 1;
+        } else if cur > 0 {
+            runs += 1;
+            total += cur;
+            cur = 0;
+        }
+    }
+    if cur > 0 {
+        runs += 1;
+        total += cur;
+    }
+    if runs == 0 {
+        0.0
+    } else {
+        total as f32 / runs as f32
+    }
+}
+
+/// Is `-layout` breaking this Thai text apart rather than laying it out?
+fn thai_is_shredded(text: &str) -> bool {
+    let thai = text.chars().filter(|c| is_thai(*c)).count();
+    thai >= fallback::MIN_THAI_FOR_MODE_CHOICE && shred_per_1k(text) > fallback::SHRED_PER_1K_RETRY
+}
+
+/// Thai consonants — the class a stray `-layout` space lands in front of.
+fn is_thai_consonant(c: char) -> bool {
+    ('\u{0E01}'..='\u{0E2E}').contains(&c)
 }
 
 /// Any character in the Thai block.
@@ -285,21 +408,208 @@ fn thai_looks_garbled(text: &str) -> bool {
         .windows(3)
         .filter(|w| w[1] == ' ' && is_thai(w[0]) && is_thai_trailing_mark(w[2]))
         .count();
-    orphan_marks >= fallback::GARBLE_ORPHAN_MARKS
+    if orphan_marks >= fallback::GARBLE_ORPHAN_MARKS
         && (orphan_marks as f32) / (thai_total as f32) > fallback::GARBLE_ORPHAN_RATIO
+    {
+        return true;
+    }
+    // Second signal: a text layer that holds no words. Thai runs together, so
+    // a mean run near one character means every character came out isolated —
+    // no spacing rule can reassemble that, and one PDF in the survey corpus
+    // reads 1.0 in BOTH extraction modes while orphan marks stay at zero, so
+    // the check above never saw it.
+    mean_thai_run(text) < fallback::MIN_THAI_RUN
 }
 
 /// Text-first extraction with Thai post-processing applied. Used by the
 /// direct `call` path. The multimodal path calls `extract_text_raw`
 /// itself so its garble check can see the unrepaired output, then
 /// normalizes only when it keeps the text.
-async fn extract_text(
+/// Extracted text with the Thai marks put back together.
+///
+/// `pub(crate)` so callers outside the tool can ask for a whole
+/// document with `(path, None, None)`. `kms::ingest_pdf` grew its own
+/// `pdftotext` call instead and did not carry the normalisation with
+/// it, which is how an ingested Thai paper kept the vowel/tone
+/// fragmentation `-layout` introduces while the same PDF read through
+/// this tool came out clean.
+pub(crate) async fn extract_text(
     validated: &std::path::Path,
     first: Option<u32>,
     last: Option<u32>,
 ) -> Result<String> {
-    let raw = extract_text_raw(validated, first, last).await?;
-    Ok(normalize_thai_spacing(&raw))
+    extract_text_inner(validated, first, last, CloudFallback::Allowed).await
+}
+
+/// Same, but the public service is never used — for callers that cannot ask
+/// the user first. The Files tab's one-click "Convert to markdown" runs as an
+/// IPC arm, which does not pass through `Tool::requires_approval`, so it must
+/// not be able to put a file on the network (dev-plan/66).
+pub(crate) async fn extract_text_local(
+    validated: &std::path::Path,
+    first: Option<u32>,
+    last: Option<u32>,
+) -> Result<String> {
+    extract_text_inner(validated, first, last, CloudFallback::Refused).await
+}
+
+async fn extract_text_inner(
+    validated: &std::path::Path,
+    first: Option<u32>,
+    last: Option<u32>,
+    cloud: CloudFallback,
+) -> Result<String> {
+    let raw = extract_text_raw(validated, first, last, cloud).await?;
+    let mut out = normalize_thai_spacing(&raw);
+    if poppler_missing() {
+        out.push_str(CLOUD_NOTE);
+    }
+    Ok(out)
+}
+
+// ── No-poppler fallback: the public extraction service (dev-plan/66) ──
+
+/// The public, keyless endpoint. Overridable, so an enterprise can run
+/// `thclaws-cloud/pdf-text/` inside its own network and keep the files there.
+const DEFAULT_PDF_TEXT_API: &str = "https://pdf.thclaws.cloud/extract";
+
+/// Matches the service's own body cap: refuse locally rather than upload
+/// 30 MB to be told no.
+const CLOUD_MAX_BYTES: u64 = 25 * 1024 * 1024;
+
+/// Appended to text the service produced. The approval prompt is the consent;
+/// this is so the result itself says where it came from — and how to stop it.
+const CLOUD_NOTE: &str = "\n\n[extracted by pdf.thclaws.cloud: poppler is not installed \
+     on this machine, so this file was uploaded to the public thClaws extraction service. \
+     Install poppler-utils to keep PDFs local, or set \"pdfCloudFallback\": false to \
+     disable the fallback.]";
+
+/// `Some(url)` when the fallback may be used, `None` when it is switched off.
+fn cloud_endpoint() -> Option<String> {
+    let enabled = crate::config::AppConfig::load()
+        .map(|c| c.pdf_cloud_fallback)
+        .unwrap_or(true);
+    if !enabled {
+        return None;
+    }
+    Some(
+        std::env::var("THCLAWS_PDF_TEXT_API")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| DEFAULT_PDF_TEXT_API.to_string()),
+    )
+}
+
+/// Is poppler absent? Then any text that came back came from the service, and
+/// neither the vision path nor a page render is available at all. Checked at
+/// the call sites instead of threading a "came from the cloud" flag through
+/// every signature.
+fn poppler_missing() -> bool {
+    !crate::config::command_on_path("pdftotext")
+}
+
+/// What to do when `pdftotext` is not installed: use the public service, or
+/// name every way to install it. Split out from `extract_text_raw` so both
+/// branches are reachable in a test without emptying `PATH` — doing that in a
+/// parallel test run breaks the sibling test that spawns the real binary.
+/// Whether a caller is in a position to send the file off the machine: the
+/// tool path is approval-gated and may, a UI-initiated IPC arm is not and
+/// may not.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum CloudFallback {
+    Allowed,
+    Refused,
+}
+
+async fn without_poppler(
+    validated: &std::path::Path,
+    first: Option<u32>,
+    last: Option<u32>,
+    cloud: CloudFallback,
+) -> Result<String> {
+    if cloud == CloudFallback::Refused {
+        return Err(Error::Tool(
+            "pdftotext not found — install poppler-utils: `brew install poppler` (macOS), `apt install poppler-utils` (Debian/Ubuntu), `winget install oschwartz10612.Poppler` or `scoop install poppler` (Windows). Or ask the agent to read the PDF — that path can extract it through the public thClaws service, with your approval and no account"
+                .into(),
+        ));
+    }
+    match cloud_endpoint() {
+        Some(url) => extract_via_cloud(&url, validated, first, last).await,
+        None => Err(Error::Tool(
+            "pdftotext not found — install poppler-utils (`brew install poppler` on \
+             macOS, `apt install poppler-utils` on Debian/Ubuntu, `winget install \
+             oschwartz10612.Poppler` or `scoop install poppler` on Windows). The \
+             no-install fallback to pdf.thclaws.cloud is switched off here \
+             (`pdfCloudFallback` / THCLAWS_PDF_CLOUD)"
+                .into(),
+        )),
+    }
+}
+
+/// POST the file to the extraction service and return its text.
+async fn extract_via_cloud(
+    url: &str,
+    validated: &std::path::Path,
+    first: Option<u32>,
+    last: Option<u32>,
+) -> Result<String> {
+    let size = tokio::fs::metadata(validated)
+        .await
+        .map_err(|e| Error::Tool(format!("read {}: {e}", validated.display())))?
+        .len();
+    if size > CLOUD_MAX_BYTES {
+        return Err(Error::Tool(format!(
+            "{} is {:.1} MB; the no-install extraction service caps uploads at 25 MB. \
+             Install poppler-utils to read it locally with no limit.",
+            validated.display(),
+            size as f64 / (1024.0 * 1024.0)
+        )));
+    }
+    let bytes = tokio::fs::read(validated)
+        .await
+        .map_err(|e| Error::Tool(format!("read {}: {e}", validated.display())))?;
+    let name = validated
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "input.pdf".into());
+
+    let part = reqwest::multipart::Part::bytes(bytes)
+        .file_name(name)
+        .mime_str("application/pdf")
+        .map_err(|e| Error::Tool(format!("multipart: {e}")))?;
+    let mut form = reqwest::multipart::Form::new().part("file", part);
+    if let Some(f) = first {
+        form = form.text("first", f.to_string());
+    }
+    if let Some(l) = last {
+        form = form.text("last", l.to_string());
+    }
+
+    // Generous: the service's own budget is 30 s and the upload is on top.
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .map_err(|e| Error::Tool(format!("http client: {e}")))?;
+    let resp = client.post(url).multipart(form).send().await.map_err(|e| {
+        Error::Tool(format!(
+            "no poppler locally and the extraction service at {url} is unreachable: {e}. \
+                 Install poppler-utils to read PDFs offline."
+        ))
+    })?;
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| Error::Tool(format!("read response: {e}")))?;
+    if !status.is_success() {
+        let detail = serde_json::from_str::<Value>(&body)
+            .ok()
+            .and_then(|v| v.get("error").and_then(Value::as_str).map(String::from))
+            .unwrap_or_else(|| body.chars().take(300).collect());
+        return Err(Error::Tool(format!("pdf extraction service: {detail}")));
+    }
+    Ok(body)
 }
 
 /// Run pdftotext and return the raw extracted text. Shared between
@@ -308,9 +618,42 @@ async fn extract_text_raw(
     validated: &std::path::Path,
     first: Option<u32>,
     last: Option<u32>,
+    cloud: CloudFallback,
+) -> Result<String> {
+    let laid_out = run_pdftotext(validated, first, last, "-layout", cloud).await?;
+    // `-layout` reproduces the page by padding with spaces, and it puts one at
+    // every glyph gap. Thai does not space its words, so those land INSIDE
+    // them: `บริษัท` comes out as `บริ ษ ทั`. Measured over 24 Thai PDFs, the
+    // density of "mark, space, consonant" separates the shredded documents
+    // from the intact ones cleanly, and re-reading a shredded one with `-raw`
+    // lengthens the average Thai run by 1.3x-3.7x while changing the Thai
+    // character count by 0.00% (docs/pdf-thai-extraction-modes.md).
+    if !thai_is_shredded(&laid_out) {
+        return Ok(laid_out);
+    }
+    match run_pdftotext(validated, first, last, "-raw", cloud).await {
+        Ok(raw) => {
+            eprintln!(
+                "\x1b[2m[pdf] -layout shredded this Thai text ({:.0} breaks per 1k) — re-read with -raw\x1b[0m",
+                shred_per_1k(&laid_out)
+            );
+            Ok(raw)
+        }
+        // The second read is an improvement, never a requirement.
+        Err(_) => Ok(laid_out),
+    }
+}
+
+/// One `pdftotext` run in the given mode.
+async fn run_pdftotext(
+    validated: &std::path::Path,
+    first: Option<u32>,
+    last: Option<u32>,
+    mode: &str,
+    cloud: CloudFallback,
 ) -> Result<String> {
     let mut cmd = Command::new("pdftotext");
-    cmd.arg("-layout");
+    cmd.arg(mode);
     if let Some(f) = first {
         cmd.arg("-f").arg(f.to_string());
     }
@@ -320,18 +663,16 @@ async fn extract_text_raw(
     cmd.arg(validated.as_os_str()).arg("-"); // stdout
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-    let mut child = cmd.spawn().map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            Error::Tool(
-                "pdftotext not found — install poppler-utils \
-                 (`brew install poppler` on macOS, \
-                 `apt install poppler-utils` on Debian/Ubuntu)"
-                    .into(),
-            )
-        } else {
-            Error::Tool(format!("spawn pdftotext: {e}"))
+    let spawned = cmd.spawn();
+    let mut child = match spawned {
+        Ok(c) => c,
+        // No poppler: borrow one from the public service, or say exactly what
+        // to install — never both, and never silently.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return without_poppler(validated, first, last, cloud).await;
         }
-    })?;
+        Err(e) => return Err(Error::Tool(format!("spawn pdftotext: {e}"))),
+    };
 
     let mut stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
@@ -783,5 +1124,170 @@ mod tests {
         let garbled = "บริ ษ ัท ผู ้ ปฏิบ ัติ หน้ า ค่ าจ้าง ก ำหนด ท ำงาน จ ำเป็น \
                        สิ ทธิ พนักงานทุกคนในองค์กร";
         assert!(thai_looks_garbled(garbled));
+    }
+
+    /// The numbers behind SHRED_PER_1K_RETRY, taken from the survey corpus
+    /// (docs/pdf-thai-extraction-modes.md): the worst document reads 36.3
+    /// breaks per 1k Thai characters under `-layout`, budget tables read
+    /// 0.0-0.8, and Samkok reads 2.3-2.6 with nothing to gain from `-raw`.
+    #[test]
+    fn shredded_thai_is_told_from_merely_spaced_thai() {
+        // Real `-layout` output: the spaces fall inside the words.
+        let shredded = "บริ ษทั ฯ จาแนกประเภทของพนักงานไว้ดงั นี้ พนักงานที่บริ ษทั ฯ                         ตกลงจ้างโดยกำหนดค่าจ้างเป็ นรายเดือน ปฏิบตัิงานเป็ นระยะเวลา                         โดยผูบ้ งั คับบัญชาจะประเมินการทดลองงานจาก ผลการปฏิบตัิงาน                         หากผลการประเมินไม่ผา่ นตามมาตรฐาน บริ ษทั ฯ จะเลิ กจ้าง"
+            .repeat(2);
+        assert!(shred_per_1k(&shredded) > fallback::SHRED_PER_1K_RETRY);
+        assert!(
+            thai_is_shredded(&shredded),
+            "this is the document that needs -raw"
+        );
+
+        // The same prose intact: Thai spaces between phrases, never inside a
+        // word. Must NOT trigger a second extraction.
+        let clean = "พนักงานทุกคนมีสิทธิได้รับค่าจ้างตามที่กฎหมายกำหนดไว้อย่างเป็นธรรม                      บริษัทจำแนกประเภทของพนักงานไว้ดังนี้ พนักงานรายเดือนและพนักงานรายวัน                      ผู้บังคับบัญชาจะประเมินผลการปฏิบัติงานตามมาตรฐานที่บริษัทกำหนด"
+            .repeat(2);
+        assert!(
+            shred_per_1k(&clean) <= fallback::SHRED_PER_1K_RETRY,
+            "{}",
+            shred_per_1k(&clean)
+        );
+        assert!(!thai_is_shredded(&clean));
+
+        // Too little Thai to judge — never spend a second extraction on it.
+        assert!(!thai_is_shredded("บริ ษทั ฯ"));
+    }
+
+    /// A text layer with no words in it reaches the vision path. The orphan-
+    /// mark check cannot see this case: the characters are isolated, so no
+    /// mark ever sits behind a space.
+    #[test]
+    fn a_text_layer_of_isolated_characters_is_garbled() {
+        let isolated: String = "ข้อบังคับเกี่ยวกับการทำงานของพนักงานบริษัท"
+            .chars()
+            .map(|c| format!("{c} "))
+            .collect::<Vec<_>>()
+            .join("")
+            .repeat(3);
+        assert!(mean_thai_run(&isolated) < fallback::MIN_THAI_RUN);
+        assert!(
+            thai_looks_garbled(&isolated),
+            "isolated characters must route to vision"
+        );
+
+        // Ordinary Thai prose runs long and stays on the text path.
+        let prose = "พนักงานทุกคนมีสิทธิได้รับค่าจ้างตามที่กฎหมายกำหนดไว้อย่างเป็นธรรมเสมอ".repeat(2);
+        assert!(mean_thai_run(&prose) > 10.0, "{}", mean_thai_run(&prose));
+        assert!(!thai_looks_garbled(&prose));
+    }
+
+    /// dev-plan/66: the no-poppler fallback, end to end against a stand-in
+    /// for `thclaws-cloud/pdf-text/` — multipart out, page range carried,
+    /// text back, and a service error surfaced as the service worded it
+    /// rather than as a status code.
+    #[tokio::test]
+    async fn cloud_fallback_posts_the_file_and_returns_its_text() {
+        use axum::extract::Multipart;
+        use axum::routing::post;
+
+        async fn extract(mut mp: Multipart) -> (axum::http::StatusCode, String) {
+            let (mut name, mut bytes, mut first) = (String::new(), 0usize, String::new());
+            while let Ok(Some(field)) = mp.next_field().await {
+                match field.name().unwrap_or("").to_string().as_str() {
+                    "file" => {
+                        name = field.file_name().unwrap_or("").to_string();
+                        bytes = field.bytes().await.map(|b| b.len()).unwrap_or(0);
+                    }
+                    "first" => first = field.text().await.unwrap_or_default(),
+                    _ => {}
+                }
+            }
+            if name.ends_with(".bad") {
+                return (
+                    axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                    r#"{"error":"not a readable PDF"}"#.to_string(),
+                );
+            }
+            (
+                axum::http::StatusCode::OK,
+                format!("ได้รับ {name} ({bytes} bytes) first={first}"),
+            )
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let app = axum::Router::new().route("/extract", post(extract));
+            let _ = axum::serve(listener, app).await;
+        });
+        let url = format!("http://{addr}/extract");
+
+        let dir = tempfile::tempdir().unwrap();
+        let pdf = dir.path().join("สัญญา.pdf");
+        std::fs::write(&pdf, vec![b'x'; 1234]).unwrap();
+        let got = extract_via_cloud(&url, &pdf, Some(2), None).await.unwrap();
+        assert!(got.contains("สัญญา.pdf"), "filename carried: {got}");
+        assert!(got.contains("1234 bytes"), "body carried: {got}");
+        assert!(got.contains("first=2"), "page range carried: {got}");
+
+        // A refusal must reach the user as the service's own sentence.
+        let bad = dir.path().join("x.bad");
+        std::fs::write(&bad, b"nope").unwrap();
+        let err = extract_via_cloud(&url, &bad, None, None)
+            .await
+            .expect_err("422 must be an error");
+        assert!(
+            err.to_string().contains("not a readable PDF"),
+            "service wording must survive: {err}"
+        );
+    }
+
+    /// The switch has to actually switch: with it off there is no endpoint,
+    /// so `extract_text_raw` reports what to install instead of uploading.
+    #[test]
+    fn cloud_fallback_can_be_switched_off() {
+        // Cargo runs lib tests in parallel and these are process-global.
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("THCLAWS_PDF_CLOUD", "0");
+        assert!(
+            cloud_endpoint().is_none(),
+            "THCLAWS_PDF_CLOUD=0 disables it"
+        );
+        std::env::set_var("THCLAWS_PDF_CLOUD", "1");
+        std::env::set_var("THCLAWS_PDF_TEXT_API", "https://example.invalid/x");
+        assert_eq!(
+            cloud_endpoint().as_deref(),
+            Some("https://example.invalid/x"),
+            "the endpoint is overridable for a self-hosted copy"
+        );
+        std::env::remove_var("THCLAWS_PDF_TEXT_API");
+        std::env::remove_var("THCLAWS_PDF_CLOUD");
+    }
+
+    /// With the fallback off, a machine without poppler must be told how to
+    /// install it — on every platform, including the one the old message left
+    /// out entirely.
+    #[tokio::test]
+    async fn no_poppler_and_no_fallback_names_every_install_route() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("THCLAWS_PDF_CLOUD", "0");
+        let err = without_poppler(
+            std::path::Path::new("/tmp/none.pdf"),
+            None,
+            None,
+            CloudFallback::Allowed,
+        )
+        .await
+        .expect_err("no local binary and no fallback is an error");
+        std::env::remove_var("THCLAWS_PDF_CLOUD");
+        let msg = err.to_string();
+        for hint in [
+            "brew install poppler",
+            "apt install poppler-utils",
+            "winget",
+            "scoop",
+        ] {
+            assert!(msg.contains(hint), "missing {hint} in: {msg}");
+        }
     }
 }

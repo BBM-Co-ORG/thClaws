@@ -5,11 +5,8 @@ import "@xterm/xterm/css/xterm.css";
 import { send, subscribe } from "../hooks/useIPC";
 import { promptHistory, recordPrompt } from "../hooks/promptHistory";
 import { useTheme } from "../hooks/useTheme";
-import {
-  SlashCommandPopup,
-  filterCommands,
-  type SlashCommandInfo,
-} from "./SlashCommandPopup";
+import { SlashCommandPopup } from "./SlashCommandPopup";
+import { filterCommands, type SlashCommandInfo } from "./slashCommands";
 import bannerText from "../../../banner.txt?raw";
 
 type SlashView = {

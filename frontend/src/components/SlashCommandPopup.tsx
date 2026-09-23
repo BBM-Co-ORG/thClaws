@@ -1,12 +1,9 @@
 import { useEffect, useMemo, useRef } from "react";
-
-export type SlashCommandInfo = {
-  name: string;
-  description: string;
-  category: string;
-  usage: string;
-  source: "builtin" | "user" | "skill";
-};
+import {
+  filterCommands,
+  groupByCategory,
+  type SlashCommandInfo,
+} from "./slashCommands";
 
 type Props = {
   query: string;
@@ -40,7 +37,14 @@ export function SlashCommandPopup({
   if (filtered.length === 0) return null;
 
   const grouped = groupByCategory(filtered);
-  let runningIndex = -1;
+  // Flat index of each group's first row. The parent owns
+  // `selectedIndex` against the flattened list, so a row needs its
+  // global position; deriving it from the group offset keeps that a
+  // pure function of where the row sits, where the old counter was
+  // reassigned from inside a render callback.
+  const offsets = grouped.map((_, g) =>
+    grouped.slice(0, g).reduce((n, [, items]) => n + items.length, 0),
+  );
 
   return (
     <div
@@ -52,7 +56,7 @@ export function SlashCommandPopup({
       }}
       onMouseDown={(e) => e.preventDefault()}
     >
-      {grouped.map(([category, items]) => (
+      {grouped.map(([category, items], g) => (
         <div key={category}>
           <div
             className="px-3 pt-2 pb-1 text-[10px] uppercase tracking-wider"
@@ -60,9 +64,8 @@ export function SlashCommandPopup({
           >
             {category}
           </div>
-          {items.map((cmd) => {
-            runningIndex += 1;
-            const idx = runningIndex;
+          {items.map((cmd, j) => {
+            const idx = offsets[g] + j;
             const active = idx === selectedIndex;
             return (
               <button
@@ -111,28 +114,4 @@ export function SlashCommandPopup({
       ))}
     </div>
   );
-}
-
-/// Filter commands by case-insensitive prefix match against `query`.
-/// `query` is the text after the leading slash (may be empty when the
-/// user has typed only "/").
-export function filterCommands(
-  commands: SlashCommandInfo[],
-  query: string,
-): SlashCommandInfo[] {
-  const q = query.trim().toLowerCase();
-  if (!q) return commands;
-  return commands.filter((c) => c.name.toLowerCase().startsWith(q));
-}
-
-function groupByCategory(
-  items: SlashCommandInfo[],
-): Array<[string, SlashCommandInfo[]]> {
-  const map = new Map<string, SlashCommandInfo[]>();
-  for (const item of items) {
-    const list = map.get(item.category);
-    if (list) list.push(item);
-    else map.set(item.category, [item]);
-  }
-  return Array.from(map.entries());
 }

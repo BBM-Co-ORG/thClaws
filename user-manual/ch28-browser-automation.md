@@ -105,6 +105,19 @@ launch command, and a warning if the browser binary can't be found.
   content (canvases, charts) shows here even when the accessibility
   tree can't describe it.
 
+**If the status card says "No Playwright Chromium found"** — the tab still
+works, but on ~1 frame a second instead of a real live stream, because the
+live view needs Playwright's own Chromium and the engine won't drive your
+everyday Chrome (doing that breaks browsing outright). Install it once:
+
+```
+npx playwright install chromium
+```
+
+Then restart thClaws. Hosted workspaces already have it. `/doctor` prints a
+`browser:` line with what was found, the resolved viewport, and whether
+Chromium is up.
+
 **Activity feed** — every `browser_*` tool call and result streams in
 with timestamps, plus live **console errors and page navigations** (so
 you can see what the agent — or the page — is doing).

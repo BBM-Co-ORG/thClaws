@@ -318,6 +318,13 @@ fn seed_def_into(src: &std::path::Path, dst: &std::path::Path, read_only: bool) 
         const PREFIXES: &[&str] = &[
             ".users/",
             ".thclaws/users/",
+            // Workspace v2 moved every runtime-state entry under `state/`.
+            // The three legacy prefixes below stopped matching anything the
+            // moment that landed, so seeding a member's workspace copied the
+            // owner's cookie jar, sessions and KMS into it. `cloud/pack.rs`
+            // was updated for the move; this list was not (dev-plan/65 #7).
+            // Kept alongside for a workspace not yet opened since the move.
+            ".thclaws/state/",
             ".thclaws/sessions/",
             ".thclaws/browser-profile/",
             ".thclaws/cache/",
@@ -507,6 +514,38 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o444, "seeded def file is read-only");
+    }
+
+    /// The test above pins the PRE-v2 paths, which is how the exclusion list
+    /// went stale unnoticed: once runtime state moved under
+    /// `.thclaws/state/`, `.thclaws/browser-profile/` and friends matched
+    /// nothing and the owner's cookie jar, sessions and KMS were seeded into
+    /// every member's workspace (dev-plan/65 #7). Pin the CURRENT layout.
+    #[test]
+    fn seed_def_into_excludes_the_current_state_layout() {
+        let src = tempfile::tempdir().unwrap();
+        let s = src.path();
+        std::fs::write(s.join("AGENTS.md"), b"# agent def").unwrap();
+        for rel in [
+            ".thclaws/state/browser-profile/Default/Cookies",
+            ".thclaws/state/sessions/sess.jsonl",
+            ".thclaws/state/kms/Vault/page.md",
+            ".thclaws/state/usage.jsonl",
+        ] {
+            let p = s.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"private").unwrap();
+        }
+
+        let dst = tempfile::tempdir().unwrap();
+        let d = dst.path();
+        seed_def_into(s, d, true);
+
+        assert!(d.join("AGENTS.md").is_file(), "def still seeded");
+        assert!(
+            !d.join(".thclaws/state").exists(),
+            "nothing under .thclaws/state/ may be seeded into a member's workspace"
+        );
     }
 
     // dev-plan/42 Phase 5: the owner seeds with read_only=false so they

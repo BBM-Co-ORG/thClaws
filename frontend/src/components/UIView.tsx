@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { botQuery, send, subscribe } from "../hooks/useIPC";
+import { botQuery, send, subscribe, type IPCMessage } from "../hooks/useIPC";
 import { useTheme } from "../hooks/useTheme";
 
 // dev-plan/33 Tier 1: render a GUI Shell inside a sandboxed iframe.
@@ -134,7 +134,7 @@ export function UIView({ active, shellId, fullscreen = false }: UIViewProps) {
 
   useEffect(() => {
     // backend -> iframe: forward gui_shell_event dispatches.
-    const unsub = subscribe((msg) => {
+    const unsub = subscribe((msg: IPCMessage) => {
       const target = iframeRef.current?.contentWindow;
       if (!target) return;
       if (msg?.type === "gui_shell_event") {

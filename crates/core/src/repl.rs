@@ -5069,6 +5069,23 @@ pub fn build_provider(config: &AppConfig) -> Result<Arc<dyn Provider>> {
                     .with_strip_model_prefix("atlascloud/"),
             ))
         }
+        ProviderKind::Unifically => {
+            // Unifically exposes an OpenAI-compatible API for its text models.
+            // Ids use the `unifically/<id>` routing prefix locally, stripped
+            // before the upstream request.
+            let (key, url) = compat_endpoint(
+                config,
+                kind,
+                "UNIFICALLY_BASE_URL",
+                "https://api.unifically.com/v1",
+                api_key,
+            );
+            Ok(Arc::new(
+                OpenAIProvider::new(key)
+                    .with_base_url(url)
+                    .with_strip_model_prefix("unifically/"),
+            ))
+        }
         ProviderKind::MetaAi => {
             // Meta AI (api.meta.ai) — OpenAI-compatible chat/completions.
             // BYOK only: there is no gateway segment for it, so a hosted
@@ -5866,25 +5883,12 @@ pub async fn run_print_mode_with(
     // Tool filtering MUST run before the Task factory snapshots the
     // registry (same M6.33 SUB3 ordering as the REPL) — otherwise a
     // parent forbidden from Bash could spawn a subagent that has it.
-    if let Some(ref allowed) = config.allowed_tools {
-        let allowed_set: std::collections::HashSet<&str> =
-            allowed.iter().map(|s| s.as_str()).collect();
-        let all_names: Vec<String> = tool_registry
-            .names()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        for name in all_names {
-            if !allowed_set.contains(name.as_str()) {
-                tool_registry.remove(&name);
-            }
-        }
-    }
-    if let Some(ref disallowed) = config.disallowed_tools {
-        for name in disallowed {
-            tool_registry.remove(name);
-        }
-    }
+    let no_keep: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    tool_registry.apply_filter(
+        config.allowed_tools.as_deref(),
+        config.disallowed_tools.as_deref(),
+        &no_keep,
+    );
 
     // dev-plan/heartbeat: `-p` now registers the subagent Task tool —
     // same headless pattern as run_agent_workflow (AutoApprover sink;
@@ -5931,6 +5935,14 @@ pub async fn run_print_mode_with(
         config.model.clone(),
         Some(subagent_arc),
     )));
+    // Again, now that Task and WorkflowRun exist. The first pass has to run
+    // before the Task factory snapshots the registry; this one is what keeps
+    // those two from escaping both lists (issue #221).
+    tool_registry.apply_filter(
+        config.allowed_tools.as_deref(),
+        config.disallowed_tools.as_deref(),
+        &no_keep,
+    );
 
     // Diagnostic run header → STDERR (the scheduler captures stderr into
     // the run log; interactive `-p` shows it in the terminal). Records the
@@ -6598,38 +6610,15 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
     .into_iter()
     .collect();
 
-    if let Some(ref allowed) = config.allowed_tools {
-        let mut allowed_set: std::collections::HashSet<&str> =
-            allowed.iter().map(|s| s.as_str()).collect();
-        // M6.34 TEAM4: keep team-essential tools whenever the team
-        // feature is on, not just for teammate processes. Pre-fix the
-        // lead's `--allowed-tools Read` would silently strip
-        // SendMessage/TeamStatus/CheckInbox/etc — coordination broken
-        // without a clear error. Asymmetric with the disallowed_tools
-        // handling below, which already protects team_essential
-        // unconditionally.
-        if team_enabled {
-            allowed_set.extend(&team_essential_tools);
-        }
-        let all_names: Vec<String> = tool_registry
-            .names()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        for name in all_names {
-            if !allowed_set.contains(name.as_str()) {
-                tool_registry.remove(&name);
-            }
-        }
-    }
-    if let Some(ref disallowed) = config.disallowed_tools {
-        for name in disallowed {
-            // Never remove team-essential tools.
-            if !team_essential_tools.contains(name.as_str()) {
-                tool_registry.remove(name);
-            }
-        }
-    }
+    // Team-essential tools survive both lists: pre-fix, a lead's
+    // `--allowed-tools Read` silently stripped SendMessage/TeamStatus/… and
+    // coordination broke with no error.
+    let keep = team_essential_tools;
+    tool_registry.apply_filter(
+        config.allowed_tools.as_deref(),
+        config.disallowed_tools.as_deref(),
+        &keep,
+    );
 
     // M6.35 HOOK1: snapshot HooksConfig early so the factory + the
     // top-level agent share one Arc. Subagent inherits via factory
@@ -6695,6 +6684,13 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
             config.model.clone(),
             Some(subagent_arc),
         )));
+        // See the print-mode note: the filter runs once before the Task
+        // factory snapshot and once here, or these two escape it (#221).
+        tool_registry.apply_filter(
+            config.allowed_tools.as_deref(),
+            config.disallowed_tools.as_deref(),
+            &keep,
+        );
     }
 
     // Task and WorkflowRun are registered AFTER the filter above — which
@@ -9762,6 +9758,10 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                         } else {
                             "not found"
                         }
+                    );
+                    println!(
+                        "{COLOR_DIM}browser:    {}{COLOR_RESET}",
+                        crate::browser_cdp::doctor_summary()
                     );
                     println!(
                         "{COLOR_DIM}tools:      {} registered{COLOR_RESET}",

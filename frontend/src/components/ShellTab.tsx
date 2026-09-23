@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
-import { send, subscribe } from "../hooks/useIPC";
+import { send, subscribe, type IPCMessage } from "../hooks/useIPC";
 import { useTheme } from "../hooks/useTheme";
 
 // PTY-backed Shell tab — spawns `$SHELL` (or fallback) under a real
@@ -115,7 +115,7 @@ export function ShellTab({ active }: Props) {
     });
     ro.observe(ref.current);
 
-    const unsub = subscribe((msg: any) => {
+    const unsub = subscribe((msg: IPCMessage) => {
       if (msg?.type === "pty_open_result") {
         if (msg.ok) {
           setStatus("ready");

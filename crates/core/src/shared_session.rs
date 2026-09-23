@@ -1933,14 +1933,29 @@ async fn run_worker(context: WorkerContext) {
     // but ignored — only `subagent.rs` honored it. The user's
     // `disallowedTools: ["AskUserQuestion"]` setting now actually
     // takes effect on the main loop too.
+    // Runs AFTER Task + WorkflowRun are registered above, so both are in
+    // scope here. `allowed_tools` was never applied on this surface at all —
+    // the GUI and `--serve` honoured only the denylist, so an allowlist in
+    // settings.json did nothing (found while fixing issue #221).
+    let no_keep: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    tools.apply_filter(
+        config.allowed_tools.as_deref(),
+        config.disallowed_tools.as_deref(),
+        &no_keep,
+    );
     if let Some(denied) = &config.disallowed_tools {
-        for name in denied {
-            tools.remove(name);
-        }
         if !denied.is_empty() {
             eprintln!(
                 "[config] main agent disallowed_tools applied: {}",
                 denied.join(", ")
+            );
+        }
+    }
+    if let Some(allowed) = &config.allowed_tools {
+        if !allowed.is_empty() {
+            eprintln!(
+                "[config] main agent allowed_tools applied: {}",
+                allowed.join(", ")
             );
         }
     }

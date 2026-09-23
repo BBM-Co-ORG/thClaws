@@ -136,6 +136,8 @@ export function ScheduleAddModal() {
   // Cheap on the backend (pure parser call), no spam during typing.
   useEffect(() => {
     if (!form) {
+      // A closed form must not keep the last cron's projection on screen.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setPreview({ kind: "idle" });
       return;
     }

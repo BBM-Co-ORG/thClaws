@@ -179,7 +179,12 @@ export function KmsBrowserSidebar({
   // yank the reader off whatever they are reading.
   const autoOpened = useRef(false);
   const selectedRef = useRef(selected);
-  selectedRef.current = selected;
+  // Mirrored in an effect rather than written during render: the only
+  // reader is the `kms_browse_result` handler below, which runs long
+  // after commit, so post-commit freshness is all it needs.
+  useEffect(() => {
+    selectedRef.current = selected;
+  }, [selected]);
   const [pages, setPages] = useState<BrowseFile[] | null>(null);
   const [sources, setSources] = useState<BrowseFile[]>([]);
   /// The provenance ledger. Collapsed by default: it is what you open
@@ -298,6 +303,10 @@ export function KmsBrowserSidebar({
   } | null>(null);
 
   useEffect(() => {
+    // Clearing every pane the moment the vault changes is the point:
+    // showing the previous vault's pages under the new vault's name is
+    // worse than one extra render.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setPages(null);
     setSources([]);
     setRuns([]);
@@ -433,6 +442,9 @@ export function KmsBrowserSidebar({
   useEffect(() => {
     const query = filter.trim();
     if ([...query].length < 2) {
+      // Below the floor there is nothing to show; stale hits under a
+      // shortened query would read as results for it.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setHits(null);
       setSearching(false);
       setSearchNote(null);

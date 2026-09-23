@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { send, subscribe } from "../hooks/useIPC";
+import { send, subscribe, type IPCMessage } from "../hooks/useIPC";
 import { ChatMarkdown } from "./ChatMarkdown";
 
 // docs/browser Phase 1 — the Browser tab for the engine-managed
@@ -26,6 +26,9 @@ type BrowserStatus = {
   command: string;
   command_found: boolean;
   cdp: boolean;
+  chromium: string;
+  chromium_found: boolean;
+  viewport: string;
 };
 
 type ActivityEntry = {
@@ -83,6 +86,8 @@ export function BrowserView({ active }: { active: boolean }) {
   const activeRef = useRef(active);
   const shotTimer = useRef<number | null>(null);
   const lastFrameAt = useRef(0);
+  // Page size in CSS pixels, reported with each screencast frame.
+  const frameSize = useRef<{ w: number; h: number } | null>(null);
   // Proof that Chromium is already running, so the screencast can attach
   // without being the thing that launches it.
   const [browserUp, setBrowserUp] = useState(false);
@@ -109,8 +114,16 @@ export function BrowserView({ active }: { active: boolean }) {
   function imgClickCoords(e: React.MouseEvent<HTMLImageElement>) {
     const img = e.currentTarget;
     const rect = img.getBoundingClientRect();
-    const natW = img.naturalWidth || 1;
-    const natH = img.naturalHeight || 1;
+    // In live mode the frame is a SCALED picture of the page (Chromium fits it
+    // to the engine's startScreencast cap), so the image's natural size is not
+    // the coordinate space CDP input wants — the page's CSS-pixel size that
+    // arrives with each frame is. The two agreed only while the viewport was
+    // smaller than the cap, which is why this looked correct before the
+    // viewport was fixed (dev-plan/65 #1). Screenshot mode still maps through
+    // the image: playwright-mcp returns it at viewport size, unscaled.
+    const page = live ? frameSize.current : null;
+    const natW = page?.w || img.naturalWidth || 1;
+    const natH = page?.h || img.naturalHeight || 1;
     const scale = Math.min(rect.width / natW, rect.height / natH);
     const drawnW = natW * scale;
     const drawnH = natH * scale;
@@ -279,7 +292,7 @@ export function BrowserView({ active }: { active: boolean }) {
   }
 
   useEffect(() => {
-    const unsub = subscribe((msg: any) => {
+    const unsub = subscribe((msg: IPCMessage) => {
       if (msg.type === "browser_status") {
         setStatus({
           enabled: Boolean(msg.enabled),
@@ -287,6 +300,9 @@ export function BrowserView({ active }: { active: boolean }) {
           command: typeof msg.command === "string" ? msg.command : "",
           command_found: Boolean(msg.command_found),
           cdp: Boolean(msg.cdp),
+          chromium: typeof msg.chromium === "string" ? msg.chromium : "",
+          chromium_found: Boolean(msg.chromium_found),
+          viewport: typeof msg.viewport === "string" ? msg.viewport : "",
         });
         return;
       }
@@ -306,6 +322,13 @@ export function BrowserView({ active }: { active: boolean }) {
         return;
       }
       if (msg.type === "browser_frame" && typeof msg.data === "string") {
+        // The page's own size in CSS pixels, which is the space CDP input
+        // works in. Chromium scales the JPEG down to the engine's frame cap,
+        // so the image's pixels are a different space — recorded on every
+        // frame (not just the first) because the page can be resized.
+        if (typeof msg.w === "number" && typeof msg.h === "number" && msg.w > 0 && msg.h > 0) {
+          frameSize.current = { w: msg.w, h: msg.h };
+        }
         // Drop frames that arrive inside the interval rather than queueing
         // them — a stale frame has no value once a newer one exists.
         const now = Date.now();
@@ -483,7 +506,6 @@ export function BrowserView({ active }: { active: boolean }) {
   // Catch up on a screenshot missed while the tab was hidden.
   useEffect(() => {
     if (active && staleShot.current) requestShot();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active]);
 
   // Screencast lifecycle. It used to require takeover, which reserved the
@@ -601,6 +623,33 @@ export function BrowserView({ active }: { active: boolean }) {
                   ⚠ the browser server&apos;s command isn&apos;t on PATH — it can&apos;t start.
                   On desktop, install Node.js (e.g. <code>brew install node</code>) and
                   restart thClaws.
+                </p>
+              )}
+              {/* Why the live view is missing, rather than leaving the user to
+                  conclude it doesn't exist: with no Playwright Chromium the
+                  engine can't own the browser, so takeover falls back to ~1 fps
+                  screenshots and nothing said so. */}
+              {status.command_found && !status.cdp && (
+                <p className="text-xs mt-1 leading-relaxed" style={{ color: "var(--text-secondary)" }}>
+                  {status.chromium_found ? (
+                    <>
+                      ⓘ Live view off — the engine isn&apos;t driving this browser.
+                      Screenshots and takeover still work, at about one frame a second.
+                    </>
+                  ) : (
+                    <>
+                      ⓘ No Playwright Chromium found, so the <strong>live view and
+                      takeover run on ~1 fps screenshots</strong>. Install it once for a
+                      real live stream: <code>npx playwright install chromium</code>,
+                      then restart thClaws.
+                    </>
+                  )}
+                </p>
+              )}
+              {status.cdp && status.viewport && (
+                <p className="text-[10px] mt-1" style={{ color: "var(--text-secondary)" }}>
+                  live view ready · viewport {status.viewport}
+                  {status.chromium ? ` · ${status.chromium}` : ""}
                 </p>
               )}
             </>

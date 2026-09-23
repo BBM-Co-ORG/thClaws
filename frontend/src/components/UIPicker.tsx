@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { RefreshCw, Sparkles } from "lucide-react";
-import { botQuery, send, subscribe } from "../hooks/useIPC";
+import { botQuery, send, subscribe, type IPCMessage } from "../hooks/useIPC";
 
 // dev-plan/33 Tier 2 — picker modal listing every installed shell:
 // built-ins (embedded), user (~/.config/thclaws/gui-shell/), and
@@ -68,7 +68,7 @@ export function UIPicker({ onSelect, honourDefault = true }: UIPickerProps) {
   };
 
   useEffect(() => {
-    const unsub = subscribe((msg: any) => {
+    const unsub = subscribe((msg: IPCMessage) => {
       if (msg?.type !== "gui_shell_list_result") return;
       if (!Array.isArray(msg.shells)) return;
       setShells(msg.shells as ShellInfo[]);

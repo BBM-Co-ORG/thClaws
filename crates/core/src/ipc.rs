@@ -5171,6 +5171,12 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
             // when THCLAWS_BROWSER_MCP_CMD is set (cloud runners). Same
             // resolution the injection guard uses.
             let command_found = crate::config::command_on_path(&server.command);
+            // Why the live view is off, not just that it is: with no
+            // Playwright Chromium installed `arm()` returns None and the tab
+            // fell back to ~1 fps screenshots with nothing on screen to say
+            // so (dev-plan/65 #8).
+            let chromium = crate::browser_cdp::find_chromium();
+            let (vw, vh) = crate::config::AppConfig::browser_viewport();
             let payload = serde_json::json!({
                 "type": "browser_status",
                 "enabled": enabled,
@@ -5180,6 +5186,12 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                 // slice 3: engine owns the chromium → live screencast
                 // + native CDP input are available.
                 "cdp": crate::browser_cdp::cdp_active(),
+                "chromium": chromium
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+                "chromium_found": chromium.is_some(),
+                "viewport": format!("{vw}×{vh}"),
             });
             (ctx.dispatch)(payload.to_string());
         }
@@ -5567,8 +5579,14 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
         // the Settings menu can flip it; the Playwright MCP is injected at
         // startup, so a change needs a restart to add/remove its tools.
         "browser_enabled_get" => {
-            let enabled = crate::config::ProjectConfig::load()
-                .and_then(|c| c.browser_enabled)
+            // The RESOLVED value, not the project file's. Reading only
+            // `.thclaws/settings.json` and defaulting to true put the
+            // Settings toggle and the engine on different answers wherever
+            // the default is flipped by env — a cloud runner sets
+            // THCLAWS_BROWSER_ENABLED=0, so a workspace with no key had the
+            // browser off while the switch read ON (dev-plan/65 §2.6).
+            let enabled = crate::config::AppConfig::load()
+                .map(|c| c.browser_enabled)
                 .unwrap_or(true);
             let payload = serde_json::json!({
                 "type": "browser_enabled",
@@ -7362,6 +7380,69 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                 "error": error,
             });
             (ctx.dispatch)(payload.to_string());
+        }
+
+        // A PDF as a markdown sibling, from the Files tab's context
+        // menu. Deliberately NOT an agent prompt the way Translate and
+        // Summarize are: this conversion is a pure function of the file
+        // — poppler's layout extraction plus the Thai mark repair — so
+        // routing it through a model would cost money, take seconds,
+        // and give a different answer each time for no gain.
+        //
+        // Refuses to clobber: the reader who converts twice wants the
+        // second one named, not the first one gone.
+        "pdf_to_markdown" => {
+            let raw_path = msg.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let out_raw = match raw_path.rsplit_once('.') {
+                Some((stem, _)) => format!("{stem}.md"),
+                None => format!("{raw_path}.md"),
+            };
+            let dispatch = ctx.dispatch.clone();
+            let (src, dst) = (raw_path.to_string(), out_raw.clone());
+            tokio::spawn(async move {
+                let (ok, error): (bool, Option<String>) = match (
+                    crate::sandbox::Sandbox::check(&src),
+                    crate::sandbox::Sandbox::check(&dst),
+                ) {
+                    (Ok(src_path), Ok(dst_path)) => {
+                        if dst_path.exists() {
+                            (false, Some(format!("{dst} already exists")))
+                        } else {
+                            // `extract_text_local`, not `extract_text`: with no
+                            // poppler the latter now falls back to the public
+                            // extraction service, and the consent for that
+                            // lives in `Tool::requires_approval` — which an
+                            // IPC arm never passes through. One click in a
+                            // context menu must not be able to put the user's
+                            // PDF on the network (dev-plan/66).
+                            match crate::tools::pdf_read::extract_text_local(&src_path, None, None)
+                                .await
+                            {
+                                Err(e) => (false, Some(e.to_string())),
+                                Ok(text) if text.trim().is_empty() => (
+                                    false,
+                                    Some(
+                                        "no text layer in this PDF — it is probably scanned images"
+                                            .to_string(),
+                                    ),
+                                ),
+                                Ok(text) => match std::fs::write(&dst_path, text.as_bytes()) {
+                                    Ok(()) => (true, None),
+                                    Err(e) => (false, Some(format!("write: {e}"))),
+                                },
+                            }
+                        }
+                    }
+                    (Err(e), _) | (_, Err(e)) => (false, Some(format!("access denied: {e}"))),
+                };
+                dispatch(
+                    serde_json::json!({
+                        "type": "pdf_to_markdown_result",
+                        "path": src, "out": dst, "ok": ok, "error": error,
+                    })
+                    .to_string(),
+                );
+            });
         }
 
         // Upload a dropped file (Files-tab drag-and-drop). Content arrives
