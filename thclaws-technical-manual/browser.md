@@ -90,7 +90,7 @@ serde-skipped and the command is engine-chosen. Test
 
 ## CDP module — the human channel
 
-`crates/core/src/browser_cdp.rs` (~1,200 lines, **not** `gui`-gated — it's
+`crates/core/src/browser_cdp.rs` (~2,250 lines, **not** `gui`-gated — it's
 referenced unconditionally by `mcp.rs`/`config.rs`; ungating it was the
 v0.51.0 `make install` fix, commit `66cc9c14`):
 
@@ -190,8 +190,14 @@ by the wry desktop GUI and the `--serve` WebSocket bridge — see
 | `browser_status_get` | on/headed/headless, launch cmd, binary-found, CDP-active, Chromium path + found, resolved viewport |
 | `browser_screenshot_get` | one-shot `browser_take_screenshot` via `call_tool_raw` |
 | `browser_input_call` | takeover input — **allowlisted** verbs only |
-| `browser_screencast_start` / `_stop` | toggle the live frame stream |
-| `browser_cdp_input` | raw CDP input dispatch for takeover |
+| `browser_screencast_start` / `_stop` | join / leave the live stream. Ref-counted per `IpcContext::viewer_id`: the stream stops when the LAST viewer leaves, and a closing socket releases its own |
+| `browser_cdp_input` | raw CDP input dispatch for takeover — `click`/`down`/`up`/`move`/`wheel`/`text`/`key`/`keydown`/`keyup`, all carrying the modifier bitmask |
+| `browser_tab_select` | pin the live view to one page target (`target: <id>`), or `null` to follow the agent again |
+
+Engine → tab envelopes: `browser_frame` (JPEG + the page's own CSS size),
+`browser_console`, `browser_nav`, `browser_tabs` (the strip + which one is
+active) and `browser_view` (`attaching` / `live` / `detached` / `error` — the
+state of the VIEW, not the page).
 
 `browser_input_call`'s allowlist: `mouse_click_xy`, `mouse_move_xy`,
 `mouse_drag_xy`, `mouse_down`, `mouse_up`, `mouse_wheel`, `press_key`,
@@ -259,29 +265,158 @@ pack/strip rules.
 | `THCLAWS_BROWSER_CDP=0` | Disable the CDP/human channel; agent MCP tools still work |
 | `THCLAWS_BROWSER_VIEWPORT="W,H"` | Page size for the engine's `--window-size` **and** playwright-mcp's `--viewport-size` (default `1920,1080`) |
 | `THCLAWS_BROWSER_ALLOW_BRANDED=1` | Allow driving Chrome/Edge over CDP (unreliable — see `find_chromium()`) |
+| `THCLAWS_BROWSER_FRAME_MS` | Engine-side floor between screencast frames (default `80`; `0` sends every paint) |
+| `THCLAWS_MCP_MAX_TEXT_BYTES` | Text cap on ANY MCP tool result; wins over the per-tool floor (`browser_snapshot` 48 KB, everything else 256 KB). `0` disables capping |
 | `PLAYWRIGHT_BROWSERS_PATH` | Chromium cache location (`find_chromium()` searches it) |
 | `browserEnabled` / `browserHeadless` (settings.json) | Opt out / force headless |
 
+## Token economy (dev-plan/65 P2)
+
+Two standing costs, paid on every request the browser is on for whether or
+not the turn touches a page: **21 visible tool schemas** (~15 KB — 31 are
+offered, 10 hidden by `BROWSER_MODEL_HIDDEN_TOOLS`) and the **browser prompt
+section** (~3 KB, `prompts.rs::services_prompt_section`). ~4,500 tokens
+together. A test fails the build if the section passes 3,200 bytes.
+
+Per call the distribution is one-sided: one `browser_snapshot` of an
+encyclopaedia article measures **889 KB**; the `browser_find` that answers the
+same question, **57 bytes**.
+
+- **Per-tool result caps** (`mcp.rs::tool_text_budget`). `browser_snapshot`
+  gets **48 KB** — the measured size of the Hacker News front page, i.e. what
+  "a whole real page" costs. Every other tool keeps the 256 KB blanket.
+  `THCLAWS_MCP_MAX_TEXT_BYTES` overrides both, including the floor (`0`
+  disables capping).
+- **The truncation notice is per tool** (`mcp.rs::narrowing_hint`): a cut
+  snapshot names `depth` / `target` / `filename`, a cut network or console
+  list names `filter` / `filename`, everything else points at `browser_find`.
+  The old generic "narrow the result" told the model nothing it could act on.
+- **The prompt names the cheap parameters.** `browser_snapshot(depth: 3)` to
+  orient, `target: <ref>` for one subtree, `filename:` + `Grep` for anything
+  large, `browser_find(text:|regex:)` by its real argument names, and
+  `browser_console_messages` / `browser_network_requests(filter:)` under
+  "when a page misbehaves, read what it did, do not screenshot the error".
+
+Measured in the field (v0.136.0, a 12-minute shopping session): **zero**
+`browser_snapshot` calls, 32 `browser_evaluate`, 15 `browser_navigate`, 3
+`browser_tabs`, 3 `browser_click`, 2 `browser_find` — **118 KB of tool result
+across 55 browser calls**, largest single result 17 KB.
+
+## Which tab the live view is on (dev-plan/65 P3)
+
+`/json/list` is polled every 750 ms while anyone is watching
+(`browser_cdp::start_watcher` → `reconcile`). Polling rather than a second
+websocket running `Target.setDiscoverTargets`: one localhost GET a tick, no
+second reader task to deadlock against the first, and nobody watching a video
+stream can see 750 ms.
+
+`choose_target(current, pinned, seen, tabs)` decides, in order: a pin the
+human set from the tab strip while that tab exists → a target id never seen
+before (that is the agent opening a tab, and the view follows it) → where we
+already are → whatever is left. The old rule was "the first `page` in
+`/json/list`, once, at attach", so the moment the agent opened a second tab
+the human watched a page nobody was on.
+
+- **`Page.bringToFront` on attach.** Chromium neither paints nor delivers
+  input to a background tab: attaching to one gives a black view and a
+  takeover whose every keystroke times out, with no error anywhere. The cost
+  is that pinning the view makes the agent's own tab `hidden`, which pauses
+  some pages' timers.
+- **Multi-viewer.** Frames, console, navigation and tab state broadcast to a
+  registry keyed by `IpcContext::viewer_id` — one id per connection, minted in
+  `ipc::next_viewer_id`. The desktop window and a phone on thClaws Remote can
+  both watch; the stream stops when the LAST viewer leaves. A `dispatch` `Arc`
+  is **not** a client identity: `server.rs` builds one per socket but `gui.rs`
+  rebuilds it on every IPC message. `handle_socket` releases its viewer on
+  teardown, since a browser that closed its tab never sends a stop.
+- **`browser_view` carries the state of the VIEW** — `attaching` / `live` /
+  `detached` / `error` — as distinct from the page, and the Browser tab renders
+  it. A dead target used to leave the last frame up, which reads as a hung page.
+- **The frame floor is engine-side**: `THCLAWS_BROWSER_FRAME_MS`, default 80 ms,
+  applied before the frame goes on the wire (the client cap stays as a
+  backstop). A frame dropped in the browser tab has already been paid for.
+
+## Takeover as a remote control (dev-plan/65 P4)
+
+- **Real keyboard passthrough.** The frame is focusable and forwards the
+  human's own `keydown`/`keyup` with `ctrlKey`/`metaKey`/`shiftKey`/`altKey`
+  through `Input.dispatchKeyEvent` with Chromium's modifier bitmask
+  (Alt=1, Ctrl=2, Meta=4, Shift=8). `key_descriptor` takes named keys,
+  F1–F12 and any single character — it used to take nine named keys and
+  reject everything else. Escape with nothing held releases the frame.
+- **A chord carries no `text`.** A key struck with Ctrl or Meta held is a
+  command: Ctrl-A selects, it does not also type an "a". macOS Chromium
+  suppresses Meta chords itself, so a live test of this passes even with the
+  rule removed — it is asserted on the event payload
+  (`key_events`), which is where removing it fails.
+- **Paste** is forwarded as `Input.insertText`: one round trip for any length.
+  Three routes, because the obvious one does not work on macOS: the focused
+  textarea's native `paste` event, `Ctrl-V` caught in `onFrameKey` falling
+  back to `navigator.clipboard.readText()` (a flag stops both firing), and a
+  **Paste** button using the same clipboard call. **⌘V does not arrive** —
+  not as a DOM keydown and not as a paste event — although it pastes normally
+  into this same app's chat input. Tried and rejected: `opacity: 0` on the
+  target (WebKit will not paste into it; transparent ink on a transparent
+  background is used instead, which fixed nothing for ⌘V but is still the
+  correct element), and a native Edit menu (the chat input proves WKWebView
+  handles the key equivalent without one, so that would have been a
+  dependency for a problem that is not there). Left as a documented gap.
+- **Mouse events carry modifiers too**, so shift-click and cmd-click work.
+- **`console_arg_text`** renders a `RemoteObject` preview. `value` is present
+  only for primitives, so object logs used to arrive blank.
+- The legacy MCP `type_text` (one `browser_press_key` per character, capped at
+  500) is **kept**: with no Playwright Chromium the engine cannot own the
+  browser and that path is the whole of takeover for that user.
+
+## Isolation: refused under multiuser (dev-plan/65 P5)
+
+`browser_enabled` resolves to **false** whenever `workdir::is_multiuser()`.
+Multiuser isolates each member's *files* into their own folder; the browser is
+not a file — one Chromium, one profile, one cookie jar for the whole pod, so a
+login by any member is a login for every member and any of them can read it
+back. Cleared on the **resolved** `AppConfig`, not at the MCP injection site,
+so the Settings toggle and `/doctor` cannot read ON while the engine has it
+off; `server::run` says why once, in chat. Partitioning means one Chromium per
+active member (~150 MB resident each), which the standard runner is not sized
+for: refuse now, partition if a customer asks
+(`docs/enterprise/03-admin-guide.md`).
+
+**playwright-mcp's automatic output** is redirected too. It writes an
+accessibility snapshot (`page-*.yml`) and a console log on EVERY navigation,
+whether or not anyone passed `filename:` — one real session produced 36 files
+/ 704 KB, and a `page-*.yml` is the full text of a page the user was on.
+`browser_mcp_config` passes `--output-dir .thclaws/state/browser-output` (a
+stripped prefix) and `--output-max-size` (64 MiB, evicted oldest-first), both
+skipped when `THCLAWS_BROWSER_MCP_CMD` pins its own; `.playwright-mcp/` is in
+`cloud/pack.rs::STRIP_PREFIXES` and `seed_def_into` as the backstop. An
+EXPLICIT `filename:` still resolves against the workspace root, so the
+snapshot-to-a-file trick the prompt teaches is unaffected.
+
 ## Known gaps / notes
 
-- Vision images capped at 5 MB per `browser_take_screenshot` result; text
-  at `MAX_MCP_TEXT_BYTES` (256 KB), which one Wikipedia `browser_snapshot`
-  (889 KB measured) blows straight through.
+- Vision images capped at 5 MB per `browser_take_screenshot` result; text at
+  48 KB for `browser_snapshot` and 256 KB for everything else.
 - The `browser` MCP key is reserved — a user MCP server named `browser`
   would collide with the injected one.
-- Open, tracked in `dev-plan/65`: the live view attaches to the first
-  `page` in `/json/list`, which is not necessarily the tab the agent is
-  driving (#5); one viewer at a time (one `page_slot`, one dispatch) (#9);
-  no `everyNthFrame`, so the wire pays for frames the client throttles away
-  (#9); takeover accepts 9 named keys and no modifiers (#10); multiuser
-  shares one cookie jar across tenants (#6).
+- **⌘V does not reach the takeover frame on macOS** — Ctrl-V and the Paste
+  button do. Diagnosed to the element, not the key, but not closed; owner
+  accepted it 2026-09-24.
+- **Unverified**: two viewers at once against a live engine (the registry is
+  unit-tested, nobody has yet had the desktop and a phone on one stream); the
+  takeover frame's focus behaviour inside the wry webview, and paste there,
+  where clipboard access can differ from a browser.
+- **Out of scope, deliberately**: partitioning the browser per member;
+  `everyNthFrame` on the CDP side (the engine-side interval covers it);
+  replacing playwright-mcp with native Rust.
 
 ## See also
 
-- `docs/browser/README.md` — the design document the code's
-  "docs/browser Phase N" comments refer to, plus the gotcha list.
+- [`docs/browser/README.md`](../docs/browser/README.md) — the design document
+  the code's "docs/browser Phase N" comments refer to, plus the gotcha list.
+  Published alongside the source (workspace path: `thclaws/docs/browser/`).
 - `dev-plan/65-browser-one-browser-you-can-trust.md` — the 2026-09-22 audit
-  and repair plan; code cites its findings as `dev-plan/65 #N`.
+  and repair plan; code cites its findings as `dev-plan/65 #N`. **Internal**,
+  not part of the public mirror: the findings it names are summarised here.
 - [`mcp.md`](mcp.md) — MCP client subsystem, allowlist, `call_multimodal`.
 - [`agentic-loop.md`](agentic-loop.md) — approval gate, tool dispatch.
 - [`serve-mode.md`](serve-mode.md) — the IPC bridge the Browser tab rides on `--serve`.

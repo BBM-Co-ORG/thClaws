@@ -394,6 +394,13 @@ pub async fn run_with_engine(
     // the task-local working dir, not process-global state.
     let mut permission_notice: Option<String> = None;
     if config.multi_tenant.is_some() {
+        // Read BEFORE the flag flips: `AppConfig::load` resolves
+        // `browser_enabled` to false once the process is multiuser, so
+        // afterwards there is no way to tell "the user asked for it and we
+        // refused" from "nobody asked".
+        let browser_was_asked_for = crate::config::AppConfig::load()
+            .map(|c| c.browser_enabled)
+            .unwrap_or(false);
         crate::workdir::set_multiuser(true);
         // MULTIUSER approval safety net. One shared worker processes every
         // user's turns and ShellInput carries no user_id, so an approval
@@ -420,6 +427,33 @@ pub async fn run_with_engine(
         } else {
             eprintln!(
                 "\x1b[36m[serve] multiuser: auto-approve (folder-isolated; approvals aren't per-user routable)\x1b[0m"
+            );
+        }
+
+        // dev-plan/65 P5 — the managed browser is REFUSED in a shared
+        // workspace. Multiuser isolates each user's FILES into their own
+        // folder, but the browser is not a file: one Chromium, one profile,
+        // one cookie jar for the whole pod. Whoever logs into a site there
+        // has logged the pod in — every other member's agent inherits that
+        // session, and any of them can read it back. Partitioning means one
+        // Chromium per active member, which a 2 Gi runner cannot pay for, so
+        // this is refuse-now / partition-if-asked (docs/enterprise).
+        //
+        // `AppConfig::load` is what actually clears the flag — on the
+        // RESOLVED config, so the Settings toggle and `/doctor` agree with
+        // the engine. This is only the explanation.
+        if browser_was_asked_for {
+            let msg = "Browser tools are off in shared (multiuser) workspaces. The managed \
+                       browser is one Chromium with one cookie jar for the whole workspace, \
+                       so a login by any member would be a login for everyone — unlike your \
+                       files, it cannot be isolated per user. Run a personal workspace if you \
+                       need the browser.";
+            permission_notice = Some(match permission_notice {
+                Some(prev) => format!("{prev}\n\n{msg}"),
+                None => msg.to_string(),
+            });
+            eprintln!(
+                "\x1b[33m[serve] multiuser: browserEnabled overridden to false (one shared cookie jar; not per-user isolatable)\x1b[0m"
             );
         }
     }
@@ -2699,6 +2733,9 @@ async fn handle_socket(socket: WebSocket, state: ServeState, shared: Arc<SharedS
     // initial-state snapshot closure below.
     let initial_session_roots = shared.session_roots.clone();
     let ctx = IpcContext {
+        // One id per socket: this connection is one viewer of the live
+        // browser view, and closing the socket releases exactly it.
+        viewer_id: crate::ipc::next_viewer_id(),
         is_serve_mode: true,
         // dev-plan/35 Tier 1: `shared` here is the RESOLVED handle
         // (per-user in multi-tenant mode; the default in single-
@@ -2905,6 +2942,12 @@ async fn handle_socket(socket: WebSocket, state: ServeState, shared: Arc<SharedS
     event_forwarder.abort();
     ask_forwarder.abort();
     writer.abort();
+    // A browser that closed its tab never sent `browser_screencast_stop`, and
+    // the live view is ref-counted now — an un-released viewer would keep
+    // Chromium screencasting into a channel nobody drains. Cheap no-op when
+    // this connection was not watching.
+    let viewer = ctx.viewer_id;
+    tokio::task::spawn_blocking(move || crate::browser_cdp::screencast_stop(viewer));
 }
 
 /// Build the `initial_state` JSON envelope ported from gui.rs's
