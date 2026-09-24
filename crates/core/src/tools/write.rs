@@ -4,6 +4,36 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::path::Path;
 
+/// Write `content` to `path`, refusing to follow a symlink at the final
+/// component.
+///
+/// The backstop is [PR #222](https://github.com/thClaws/thClaws/pull/222) by
+/// @mikemikimike: `Sandbox::check_write` resolves and validates the
+/// destination, but between that check and `open(2)` the last component can
+/// be replaced with a link pointing anywhere. `O_NOFOLLOW` closes that window
+/// in the kernel, where no amount of checking can be raced.
+///
+/// **`path` must already be the RESOLVED landing**, not the path the caller
+/// typed. `O_NOFOLLOW` refuses every final symlink, legitimate ones included
+/// — `CLAUDE.md -> AGENTS.md` is a pattern this product actively supports —
+/// so applying it to the typed path turns a normal write into
+/// `Too many levels of symbolic links (os error 62)`. Measured: the PR as
+/// submitted failed `writes_through_a_symlink_that_stays_inside`. Resolving
+/// first and opening the landing keeps both properties: links the sandbox
+/// already approved still work, and a link swapped in AFTER the check is
+/// refused by the kernel.
+fn write_no_follow(path: &Path, content: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path)?.write_all(content.as_bytes())
+}
+
 pub struct WriteTool;
 
 #[async_trait]
@@ -64,7 +94,11 @@ impl Tool for WriteTool {
                     .map_err(|e| Error::Tool(format!("mkdir {}: {}", parent.display(), e)))?;
             }
         }
-        std::fs::write(p, content).map_err(|e| Error::Tool(format!("write {path}: {e}")))?;
+        // The landing the sandbox validated, not the path as typed — see
+        // `write_no_follow`.
+        let landing = crate::sandbox::resolve_landing(p);
+        write_no_follow(&landing, content)
+            .map_err(|e| Error::Tool(format!("write {path}: {e}")))?;
         Ok(format!("Wrote {} bytes to {}", content.len(), path))
     }
 }
@@ -118,6 +152,61 @@ mod tests {
             .unwrap();
         assert!(path.exists());
     }
+
+    /// A symlink that stays INSIDE the sandbox is a legitimate path — the
+    /// `CLAUDE.md -> AGENTS.md` pattern is common — and the sandbox resolves
+    /// it and allows the landing. Writing through it must keep working.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn writes_through_a_symlink_that_stays_inside() {
+        let dir = tempdir().unwrap();
+        let real = dir.path().join("AGENTS.md");
+        std::fs::write(&real, "old").unwrap();
+        let link = dir.path().join("CLAUDE.md");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        WriteTool
+            .call(json!({ "path": link.to_string_lossy(), "content": "new" }))
+            .await
+            .expect("an in-sandbox symlink is a legitimate write target");
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "new");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "and the link must still be a link, not replaced by a file"
+        );
+    }
+
+    /// PR #222's case: a link swapped in after the check must not be
+    /// followed. Asserted on the filesystem primitive, because the race it
+    /// closes cannot be staged from the tool's own call path.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlink_swapped_in_after_the_check_is_refused_by_the_kernel() {
+        let dir = tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let link = dir.path().join("artifact.txt");
+        std::os::unix::fs::symlink(outside.join("artifact.txt"), &link).unwrap();
+
+        let err = write_no_follow(&link, "must not follow").unwrap_err();
+        let message = format!("{err}");
+        assert!(
+            message.contains("symbolic link") || message.contains("Too many levels"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            !outside.join("artifact.txt").exists(),
+            "nothing may have been written through the link"
+        );
+    }
+
+    // The tool-level half of this — a dangling link whose landing is outside
+    // the workspace — is covered by `sandbox::tests::
+    // a_dangling_symlink_cannot_carry_a_write_out_of_the_sandbox`, which can
+    // scope a workspace without a process-global fixture.
 
     #[tokio::test]
     async fn missing_content_errors() {

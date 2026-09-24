@@ -34,6 +34,14 @@ pub const STRIP_PREFIXES: &[&str] = &[
     // user credentials (gui-shell tokens, provider config), never agent
     // content. Harmless on desktop, where nothing writes it.
     ".home/",
+    // playwright-mcp's automatic output: an accessibility snapshot and a
+    // console log per navigation, i.e. the full text of pages the user was
+    // on. `browser_mcp_config` now points `--output-dir` inside
+    // `.thclaws/state/`, which the first rule already covers — this is the
+    // backstop for a workspace that still has the old directory, and for a
+    // `THCLAWS_BROWSER_MCP_CMD` override that pins its own. `.log` is caught
+    // by the suffix rule; `page-*.yml` was caught by nothing.
+    ".playwright-mcp/",
     ".git/",
     "node_modules/",
     "target/",
@@ -544,6 +552,13 @@ mod strip_tests {
             // publisher's credentials, not agent content.
             ".home/.config/thclaws/gui-shell-tokens.json",
             ".home/.config/thclaws/schedules.json",
+            // playwright-mcp writes one of these per navigation, unasked:
+            // `page-*.yml` is the full text of a page the user was on, and
+            // NOTHING caught it — `.log` matched the suffix rule, `.yml` did
+            // not. Found by auditing a real browsing session, where 12
+            // minutes produced 36 files.
+            ".playwright-mcp/page-2026-09-23T14-47-54-631Z.yml",
+            ".playwright-mcp/console-2026-09-23T14-46-06-421Z.log",
         ] {
             assert!(is_strippable(Path::new(p)), "should strip {p}");
         }

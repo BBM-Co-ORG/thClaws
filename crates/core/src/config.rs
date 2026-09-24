@@ -2312,6 +2312,14 @@ impl AppConfig {
         //   the Browser tab's setup hint, not a spawn error per session)
         // - never under `cfg(test)` (the unit-test suite must not spawn
         //   npx / hit the npm registry)
+        // dev-plan/65 P5: one Chromium, one cookie jar, every member — the
+        // managed browser is refused in a shared workspace. Cleared on the
+        // RESOLVED config, not just at the injection site below, so the
+        // Settings toggle and `/doctor` cannot read ON while the engine has
+        // it off. `server::run` says why, once, in chat.
+        if crate::workdir::is_multiuser() {
+            config.browser_enabled = false;
+        }
         if config.browser_enabled
             && !cfg!(test)
             && !crate::policy::external_mcp_disallowed()
@@ -2480,6 +2488,14 @@ impl AppConfig {
             .collect();
 
         // Engine-managed browser MCP — same conditions as the normal path.
+        // dev-plan/65 P5: one Chromium, one cookie jar, every member — the
+        // managed browser is refused in a shared workspace. Cleared on the
+        // RESOLVED config, not just at the injection site below, so the
+        // Settings toggle and `/doctor` cannot read ON while the engine has
+        // it off. `server::run` says why, once, in chat.
+        if crate::workdir::is_multiuser() {
+            config.browser_enabled = false;
+        }
         if config.browser_enabled
             && !cfg!(test)
             && !crate::policy::external_mcp_disallowed()
@@ -2534,6 +2550,11 @@ impl AppConfig {
     /// desktop default is `npx -y @playwright/mcp@latest`.
     /// `--headless` is appended when resolved headless and not
     /// already present.
+    /// Ceiling on playwright-mcp's automatic output directory. It evicts the
+    /// oldest files past this. 64 MiB is ~3000 of the page snapshots measured
+    /// in a real session — days of browsing, and nothing on a 1Gi runner.
+    pub const BROWSER_OUTPUT_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
     pub fn browser_mcp_config(headless_override: Option<bool>) -> crate::mcp::McpServerConfig {
         let headless = headless_override.unwrap_or_else(|| {
             std::env::var("THCLAWS_USES_GATEWAY").ok().as_deref() == Some("1")
@@ -2586,6 +2607,28 @@ impl AppConfig {
             let (w, h) = Self::browser_viewport();
             args.push("--viewport-size".into());
             args.push(format!("{w},{h}"));
+        }
+        // playwright-mcp writes an accessibility snapshot and a console log
+        // for every navigation into `<cwd>/.playwright-mcp/` — nobody asks for
+        // them and nothing cleans them up. One 12-minute shopping session
+        // produced 36 files / 704 KB, and a `page-*.yml` is the full text of a
+        // page the user was on, logged in or not. Point them at the runtime
+        // state dir, which `cloud/pack.rs` strips from a published agent and
+        // `seed_def_into` keeps out of a member's workspace, and cap the
+        // directory so it cannot grow without bound on a runner's PVC.
+        //
+        // This does NOT affect `filename:` — playwright-mcp resolves an
+        // EXPLICIT name against the workspace root, so the snapshot-to-a-file
+        // trick the system prompt teaches still lands where `Grep` can read
+        // it. Relative on purpose: it resolves against whatever cwd the MCP
+        // server is given, which is where `.playwright-mcp/` was landing.
+        if !args.iter().any(|a| a.starts_with("--output-dir")) {
+            args.push("--output-dir".into());
+            args.push(".thclaws/state/browser-output".into());
+        }
+        if !args.iter().any(|a| a.starts_with("--output-max-size")) {
+            args.push("--output-max-size".into());
+            args.push(Self::BROWSER_OUTPUT_MAX_BYTES.to_string());
         }
         crate::mcp::McpServerConfig {
             name: "browser".into(),
@@ -2771,6 +2814,93 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// dev-plan/65 P5. Multiuser isolates each user's FILES into their own
+    /// folder — but the managed browser is one Chromium with one cookie jar
+    /// for the whole pod, so a login by any member is a login for every
+    /// member, and any of them can read it back. Refused rather than
+    /// partitioned: partitioning means one Chromium per active member, which
+    /// a 2 Gi runner cannot pay for.
+    ///
+    /// Asserted on the RESOLVED config, because the Settings toggle and
+    /// `/doctor` read that — not the injection site — and a toggle that reads
+    /// ON while the engine has it off is the exact bug P0 closed.
+    #[test]
+    fn a_shared_workspace_refuses_the_browser() {
+        let _g = crate::kms::test_env_lock();
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"browserEnabled": true}"#).expect("write settings");
+        std::env::set_var("THCLAWS_CONFIG", &path);
+
+        let was = crate::workdir::is_multiuser();
+        crate::workdir::set_multiuser(false);
+        let personal = AppConfig::load().expect("load");
+        assert!(
+            personal.browser_enabled,
+            "a personal workspace keeps the browser the user asked for"
+        );
+
+        crate::workdir::set_multiuser(true);
+        let shared = AppConfig::load().expect("load");
+        assert!(
+            !shared.browser_enabled,
+            "the SAME settings.json must resolve to OFF in a shared workspace"
+        );
+
+        crate::workdir::set_multiuser(was);
+        std::env::remove_var("THCLAWS_CONFIG");
+    }
+
+    /// playwright-mcp's automatic per-navigation output landed in
+    /// `<cwd>/.playwright-mcp/`, which nothing strips and nothing prunes: a
+    /// real 12-minute session left 36 files / 704 KB, each `page-*.yml` the
+    /// full text of a page the user was on. Redirected into the runtime
+    /// state dir (stripped on publish, kept out of a seeded member
+    /// workspace) and capped.
+    #[test]
+    fn browser_mcp_output_goes_to_state_and_is_capped() {
+        let cfg = AppConfig::browser_mcp_config(Some(true));
+        let at = |flag: &str| {
+            cfg.args
+                .iter()
+                .position(|a| a == flag)
+                .map(|i| cfg.args[i + 1].clone())
+                .unwrap_or_else(|| panic!("{flag} must be passed: {:?}", cfg.args))
+        };
+        let dir = at("--output-dir");
+        assert!(
+            dir.starts_with(".thclaws/state/"),
+            "output must land under the stripped state dir, got {dir}"
+        );
+        assert!(crate::cloud::pack::is_strippable(std::path::Path::new(
+            &format!("{dir}/page-x.yml")
+        )));
+        assert_eq!(
+            at("--output-max-size"),
+            AppConfig::BROWSER_OUTPUT_MAX_BYTES.to_string()
+        );
+    }
+
+    /// A `THCLAWS_BROWSER_MCP_CMD` that pins its own output directory is the
+    /// operator's choice — the default must not be appended on top of it,
+    /// which would leave two `--output-dir` flags on the command line.
+    #[test]
+    fn a_pinned_output_dir_is_left_alone() {
+        let _g = crate::kms::test_env_lock();
+        std::env::set_var(
+            "THCLAWS_BROWSER_MCP_CMD",
+            "playwright-mcp --output-dir /var/tmp/pw",
+        );
+        let cfg = AppConfig::browser_mcp_config(Some(true));
+        std::env::remove_var("THCLAWS_BROWSER_MCP_CMD");
+        assert_eq!(
+            cfg.args.iter().filter(|a| *a == "--output-dir").count(),
+            1,
+            "exactly one --output-dir: {:?}",
+            cfg.args
+        );
+        assert!(cfg.args.contains(&"/var/tmp/pw".to_string()));
+    }
 
     #[test]
     fn apply_runtime_policy_is_a_noop_without_a_policy() {

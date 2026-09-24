@@ -329,6 +329,9 @@ fn seed_def_into(src: &std::path::Path, dst: &std::path::Path, read_only: bool) 
             ".thclaws/browser-profile/",
             ".thclaws/cache/",
             ".thclaws/kms/data/",
+            // Same reason as `cloud/pack.rs`: playwright-mcp's per-navigation
+            // page dumps are the owner's browsing, not agent content.
+            ".playwright-mcp/",
             "output/users/",
             ".git/",
             "node_modules/",

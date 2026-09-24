@@ -71,6 +71,15 @@ That is a real setting layered on top of the default, so it wins. The
 env var only moves the default; it can't override a workspace that has
 asked for a browser.
 
+**Except in a shared (multiuser) workspace, where it stays off and can't
+be turned on.** Your *files* are isolated there — each member gets their
+own folder — but a browser isn't a file. It's one Chromium with one
+cookie jar for the whole workspace, so if one member logged into a site,
+everybody's agent would be logged in as them, and any of them could read
+it back. thClaws refuses rather than letting that happen quietly, and
+says so once in the chat. If you need the browser, use a personal
+workspace.
+
 ### Other knobs
 
 These are environment variables, for people packaging thClaws rather
@@ -80,7 +89,8 @@ than using it day to day:
 |---|---|
 | `THCLAWS_BROWSER_ENABLED=0` | Turn the default off fleet-wide (as above) |
 | `THCLAWS_BROWSER_MCP_CMD` | Replace the whole launch command. The cloud runner image sets `mcp-server-playwright --no-sandbox` — the preinstalled server — so a pod cold start never hits the npm registry. Desktop default is `npx -y @playwright/mcp@latest` |
-| `THCLAWS_BROWSER_VIEWPORT="W,H"` | Viewport size. thClaws defaults to a wide desktop viewport because Playwright's own 1280×720 makes many sites render mobile-ish |
+| `THCLAWS_BROWSER_VIEWPORT="W,H"` | Page size, **1920×1080 by default**, because Playwright's own 1280×720 makes many sites render mobile-ish. `/doctor` prints the size actually in force |
+| `THCLAWS_BROWSER_FRAME_MS` | How often the live view sends a frame, in milliseconds (default `80`, i.e. ~12 fps). Raise it on a slow link |
 
 > **No Node?** On a machine without `npx`, the Browser tab shows a
 > setup hint instead of erroring, and the agent simply runs without
@@ -132,11 +142,34 @@ commands too (`/clear`, etc.) and stays in sync with the other tabs.
 Some sites you have to log into personally (your bank, LinkedIn). Click
 **🖱 Take over** and the live view becomes a remote control:
 
-- **Click** anywhere on the page,
+- **Click** anywhere on the page — including **shift-click** and
+  **⌘/Ctrl-click**,
 - **Scroll** with your mouse wheel,
-- **Type** into the focused field (with quick **Enter / Tab / Esc / ⌫**
-  keys), and
+- **Type** with your real keyboard: click the page once to give it focus
+  (it gets a solid outline), and every key goes straight to the site,
+  modifiers and all — ⌘A, Ctrl-L, a held arrow key. **Esc gives the
+  keyboard back** to thClaws.
+- **Paste**: use the **Paste** button, or **Ctrl-V** — both ask the system
+  for the clipboard once (macOS shows a small "Paste" confirmation you
+  click), then put the whole string in at once rather than a character at a
+  time. **⌘V does not reach the page** here, even though it works everywhere
+  else in thClaws: macOS delivers it as a native paste command to the
+  element under focus, and the takeover frame is not one the system will
+  paste into. Ctrl-V and the button both go the other route.
+- The text box below is still there for long strings — over a slow link
+  it beats typing,
+- the quick **Enter / Tab / Esc / ⌫** buttons, and
 - a **URL bar + back button** to navigate.
+
+**If the agent opens a new tab, the view follows it**, and a tab strip
+appears above the page. Click a tab to pin the view there — useful when
+you're reading something and don't want to be yanked away — and click it
+again (or **follow agent**) to let it follow along again.
+
+If the page the view was on closes, you get **"view detached —
+reattaching…"** rather than a frozen last frame. And more than one person
+can watch at once: the desktop window and a phone on thClaws Remote see
+the same stream, and one of you closing it doesn't blank the other.
 
 Do your login, then tell the agent in the sidebar to continue. On
 desktop you can also just use the headed Chromium window directly — the
@@ -177,6 +210,11 @@ agent you share on the catalog.
 | Agent "can't see" a chart / canvas | Ask it to take a screenshot — it reads pixels via vision, not just the accessibility tree |
 | Want zero windows on desktop | Set `"browserHeadless": true` |
 | Logged out after a cloud pod restart | Fixed in v0.52.0 — update if you're older |
+| Live view greyed out / "one frame a second" | No Playwright Chromium on this machine. Run `npx playwright install chromium`, then restart thClaws. `/doctor` says which of the two it is |
+| Live view is black | The view is on a tab that isn't in front. Click that tab in the strip — thClaws brings it forward |
+| Typing does nothing in takeover | Click the page first; the frame needs focus (solid outline, not dashed) |
+| ⌘V does nothing in takeover (macOS) | Expected — use the **Paste** button or **Ctrl-V**. ⌘V still works everywhere else in thClaws |
+| Browser tools missing in a shared workspace | Expected — see above. Use a personal workspace |
 
 ## Under the hood
 

@@ -827,6 +827,10 @@ fn run_gui_inner(
         .expect("window build");
 
     let proxy_for_ipc = proxy.clone();
+    // The desktop window is one client for the life of the process — the
+    // `dispatch` closure below is rebuilt per message, so it cannot stand in
+    // for one. The live browser view is ref-counted per viewer.
+    let gui_viewer_id = crate::ipc::next_viewer_id();
 
     // Single shared session backing both Terminal + Chat tabs. The
     // worker owns one Agent + Session + AppConfig and broadcasts every
@@ -1548,6 +1552,10 @@ fn run_gui_inner(
                 // the shared dispatch path today.
                 let on_zoom: crate::ipc::ZoomFn = Arc::new(|_scale: f64| {});
                 let ipc_ctx = crate::ipc::IpcContext {
+                    // The window is ONE viewer for the life of the app. It
+                    // cannot be derived from `dispatch`, which is rebuilt
+                    // above on every message.
+                    viewer_id: gui_viewer_id,
                     is_serve_mode: false,
                     shared: shared_for_ipc.clone(),
                     approver: approver_for_ipc.clone(),

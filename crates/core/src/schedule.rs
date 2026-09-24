@@ -2197,6 +2197,21 @@ mod tests {
     /// Poll the store until the schedule records a run, up to `secs`.
     /// A flat sleep is a coin toss on a loaded machine; this waits only
     /// as long as it has to and fails loudly if the run never lands.
+    /// Poll a closure until it yields a value. Bounded so a genuine failure
+    /// still ends the test, but the bound is a backstop, not the mechanism —
+    /// what is being waited on is an observable the dispatcher itself sets,
+    /// not a side effect that has to travel through a spawned process and the
+    /// filesystem first.
+    async fn wait_for<T>(mut probe: impl FnMut() -> Option<T>) -> Option<T> {
+        for _ in 0..600 {
+            if let Some(v) = probe() {
+                return Some(v);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        None
+    }
+
     async fn wait_for_last_run(path: &Path, id: &str, secs: u64) -> Option<String> {
         for _ in 0..(secs * 10) {
             if let Ok(store) = ScheduleStore::load_from(path) {
@@ -2280,53 +2295,78 @@ mod tests {
         let store_dir = tempfile::tempdir().unwrap();
         let store_path = store_dir.path().join("schedules.json");
         let id = format!("cool-{}", uuid::Uuid::new_v4());
+        // A second schedule used only as a marker. The channel is FIFO and the
+        // dispatcher is one loop, so once the marker has been stamped, the
+        // event before it has certainly been through the cooldown decision —
+        // a happens-before, where the old test used a sleep.
+        let marker = format!("mark-{}", uuid::Uuid::new_v4());
 
         let mut store = ScheduleStore::default();
-        store
-            .add(Schedule {
-                id: id.clone(),
-                cron: "0 0 1 1 *".into(),
-                cwd: work.path().to_path_buf(),
-                prompt: "p".into(),
-                timeout_secs: Some(5),
-                enabled: true,
-                watch_workspace: true,
-                ..Default::default()
-            })
-            .unwrap();
+        for sid in [&id, &marker] {
+            store
+                .add(Schedule {
+                    id: sid.clone(),
+                    cron: "0 0 1 1 *".into(),
+                    cwd: work.path().to_path_buf(),
+                    prompt: "p".into(),
+                    timeout_secs: Some(5),
+                    enabled: true,
+                    watch_workspace: true,
+                    ..Default::default()
+                })
+                .unwrap();
+        }
         store.save_to(&store_path).unwrap();
+
+        // The cooldown lives in this map, so assert on it rather than on
+        // `last_run` in the store — that only appears after a spawned child
+        // has run and written the file, and waiting for it lost the race on a
+        // loaded CI runner and failed the whole suite on the v0.135.0 commit.
+        // Nothing about "a second event inside the cooldown is dropped" needs
+        // the child to finish; `a_watch_event_fires_the_schedule` covers that.
+        let last_fire: Arc<Mutex<HashMap<String, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
+        let stamp = |who: &str| -> Option<Instant> {
+            last_fire.lock().expect("last_fire lock").get(who).copied()
+        };
 
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap();
-        let after_first = rt.block_on(async {
+        rt.block_on(async {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<(String, PathBuf)>();
             let _h = spawn_dispatcher(
                 rx,
                 fake.clone(),
                 Some(store_path.clone()),
-                Arc::new(Mutex::new(HashMap::new())),
+                last_fire.clone(),
                 Arc::new(Mutex::new(HashSet::new())),
             );
+
             tx.send((id.clone(), work.path().join("a.txt"))).unwrap();
-            // Read it BEFORE the second event. Comparing the final
-            // value with itself is always true and proves nothing.
-            let seen = wait_for_last_run(&store_path, &id, 30).await;
+            let first = wait_for(|| stamp(&id))
+                .await
+                .expect("the first event should have fired");
+
+            // The second event, then the marker behind it.
             tx.send((id.clone(), work.path().join("b.txt"))).unwrap();
-            tokio::time::sleep(Duration::from_secs(3)).await;
-            seen
+            tx.send((marker.clone(), work.path().join("m.txt")))
+                .unwrap();
+            wait_for(|| stamp(&marker))
+                .await
+                .expect("the marker event should have fired");
+
+            assert_eq!(
+                stamp(&id),
+                Some(first),
+                "a second event inside the cooldown must not re-arm it"
+            );
         });
 
-        assert!(after_first.is_some(), "the first event should have fired");
-        let after = ScheduleStore::load_from(&store_path).unwrap();
-        let s = after.get(&id).expect("schedule present");
-        assert_eq!(
-            s.last_run, after_first,
-            "a second event inside the cooldown must not fire again"
-        );
-        if let Ok(d) = log_dir_for(&id) {
-            let _ = std::fs::remove_dir_all(d);
+        for sid in [&id, &marker] {
+            if let Ok(d) = log_dir_for(sid) {
+                let _ = std::fs::remove_dir_all(d);
+            }
         }
     }
 

@@ -46,6 +46,12 @@ pub type PendingAsks = Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Strin
 /// the transport.
 pub type DispatchFn = Arc<dyn Fn(String) + Send + Sync>;
 
+/// One id per connection. Monotonic, never reused within a process.
+pub fn next_viewer_id() -> u64 {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Transport-specific bridge fired when the frontend requests a quit
 /// (`{"type": "app_close"}`). Wry sets `ControlFlow::Exit`; the WS
 /// layer drops the connection / shuts down the server.
@@ -142,6 +148,12 @@ fn ipc_memory_store(ctx: &IpcContext) -> Option<crate::memory::MemoryStore> {
 /// [`handle_ipc`] for each inbound message.
 #[derive(Clone)]
 pub struct IpcContext {
+    /// Identity of the client on the other end of this context, minted once
+    /// per connection (one WebSocket, or the one desktop window). The live
+    /// browser view is ref-counted per viewer, and the desktop rebuilds its
+    /// `dispatch` `Arc` on every message — so the closure's address is NOT a
+    /// client identity, and keying viewers on it would leak one per start.
+    pub viewer_id: u64,
     /// `true` for cloud `--serve` mode (no desktop wry window). Used
     /// by `get_cwd` to skip the workspace-folder modal — the cloud
     /// engine's cwd is fixed at `/workspace` by the runner template;
@@ -5203,8 +5215,9 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
         // takeover recovers from closed tabs.
         "browser_screencast_start" => {
             let dispatch = ctx.dispatch.clone();
+            let viewer = ctx.viewer_id;
             std::thread::spawn(move || {
-                let result = crate::browser_cdp::screencast_start(dispatch.clone());
+                let result = crate::browser_cdp::screencast_start(viewer, dispatch.clone());
                 let reply = match result {
                     Ok(()) => serde_json::json!({
                         "type": "browser_screencast", "ok": true, "active": true,
@@ -5219,8 +5232,9 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
 
         "browser_screencast_stop" => {
             let dispatch = ctx.dispatch.clone();
+            let viewer = ctx.viewer_id;
             std::thread::spawn(move || {
-                crate::browser_cdp::screencast_stop();
+                crate::browser_cdp::screencast_stop(viewer);
                 dispatch(
                     serde_json::json!({
                         "type": "browser_screencast", "ok": true, "active": false,
@@ -5228,6 +5242,17 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                     .to_string(),
                 );
             });
+        }
+
+        // dev-plan/65 P3 — the tab strip. `target` names a page target from
+        // the `browser_tabs` envelope; absent (or null) puts the view back on
+        // "follow whatever tab the agent just opened".
+        "browser_tab_select" => {
+            let target = msg
+                .get("target")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            crate::browser_cdp::select_tab(target);
         }
 
         // Native input on the live page (mouse/keyboard via the CDP
@@ -5246,7 +5271,10 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
             // a stream of moves and a release, and they must land in that
             // order. A move's success is not worth a frame back to the
             // page — dozens arrive a second — its failure is.
-            let quiet_ok = kind == "move";
+            // A move's success is not worth a frame back to the page, and
+            // neither is a keystroke's: a held key autorepeats and typing a
+            // sentence is a burst. Their FAILURES still come back.
+            let quiet_ok = matches!(kind.as_str(), "move" | "keydown" | "keyup");
             crate::browser_cdp::input_queued(kind.clone(), args, move |result| {
                 let reply = match result {
                     Ok(()) if quiet_ok => return,
@@ -5335,6 +5363,15 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
         // filesystem-shaped (no file_upload). The synthetic
         // `type_text` expands to per-character press_key calls so the
         // frontend can send a whole field's text in one round trip.
+        //
+        // dev-plan/65 P4 proposed deleting `type_text` "once CDP input is the
+        // only supported takeover". It is not: with no Playwright Chromium
+        // the engine cannot own the browser, and this MCP path is the whole
+        // of takeover for that user (the Browser tab says so, P0). playwright
+        // -mcp has no "type into whatever is focused" tool — `browser_type`
+        // needs an element ref — so per-character is the only shape available
+        // here. Kept, capped at 500. The CDP path (`Input.insertText`) is one
+        // round trip for any length and is what a user with Chromium gets.
         "browser_input_call" => {
             const ALLOWED: &[&str] = &[
                 "browser_mouse_click_xy",
@@ -7918,6 +7955,7 @@ mod tests {
         let replies = Arc::new(Mutex::new(Vec::<Value>::new()));
         let captured = replies.clone();
         let ctx = IpcContext {
+            viewer_id: next_viewer_id(),
             is_serve_mode: true,
             shared: shared.clone(),
             approver,
@@ -8022,6 +8060,7 @@ mod tests {
         let on_zoom: ZoomFn = Arc::new(|_scale: f64| {});
 
         let ctx = IpcContext {
+            viewer_id: next_viewer_id(),
             is_serve_mode: false,
             shared,
             approver,
@@ -8098,6 +8137,7 @@ mod tests {
         let (approver, _rx) = crate::permissions::GuiApprover::new();
         let pending_asks: PendingAsks = Arc::new(Mutex::new(HashMap::new()));
         let ctx = IpcContext {
+            viewer_id: next_viewer_id(),
             is_serve_mode: true,
             shared,
             approver,
@@ -8128,6 +8168,7 @@ mod tests {
         let shared = Arc::new(crate::shared_session::spawn());
         let (approver, _rx) = crate::permissions::GuiApprover::new();
         let ctx = IpcContext {
+            viewer_id: next_viewer_id(),
             is_serve_mode: true,
             shared,
             approver,
@@ -8164,6 +8205,7 @@ mod tests {
         let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let captured_clone = captured.clone();
         let ctx = IpcContext {
+            viewer_id: next_viewer_id(),
             is_serve_mode: false,
             shared,
             approver,
@@ -8211,6 +8253,7 @@ mod tests {
             let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
             let captured_clone = captured.clone();
             let ctx = IpcContext {
+                viewer_id: next_viewer_id(),
                 is_serve_mode: false,
                 shared,
                 approver,
@@ -8260,6 +8303,7 @@ mod tests {
             let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
             let captured_clone = captured.clone();
             let ctx = IpcContext {
+                viewer_id: next_viewer_id(),
                 is_serve_mode: false,
                 shared,
                 approver,
@@ -8305,6 +8349,7 @@ mod tests {
         let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let captured_clone = captured.clone();
         let ctx = IpcContext {
+            viewer_id: next_viewer_id(),
             is_serve_mode: false,
             shared,
             approver,
@@ -8363,6 +8408,7 @@ mod tests {
         let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let captured_clone = captured.clone();
         let ctx = IpcContext {
+            viewer_id: next_viewer_id(),
             is_serve_mode: false,
             shared,
             approver,
@@ -8400,6 +8446,7 @@ mod tests {
         let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let captured_clone = captured.clone();
         let ctx = IpcContext {
+            viewer_id: next_viewer_id(),
             is_serve_mode: false,
             shared,
             approver,
@@ -8434,6 +8481,7 @@ mod tests {
         let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let captured_clone = captured.clone();
         let ctx = IpcContext {
+            viewer_id: next_viewer_id(),
             is_serve_mode: false,
             shared,
             approver,
@@ -8476,6 +8524,7 @@ mod tests {
         let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let captured_clone = captured.clone();
         let ctx = IpcContext {
+            viewer_id: next_viewer_id(),
             is_serve_mode: false,
             shared,
             approver,
@@ -8530,6 +8579,7 @@ mod tests {
         let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let captured_clone = captured.clone();
         let ctx = IpcContext {
+            viewer_id: next_viewer_id(),
             is_serve_mode: false,
             shared,
             approver,
@@ -8564,6 +8614,7 @@ mod tests {
         let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let captured_clone = captured.clone();
         let ctx = IpcContext {
+            viewer_id: next_viewer_id(),
             is_serve_mode: false,
             shared,
             approver,
@@ -8600,6 +8651,7 @@ mod tests {
         let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let captured_clone = captured.clone();
         let ctx = IpcContext {
+            viewer_id: next_viewer_id(),
             is_serve_mode: false,
             shared,
             approver,
@@ -8641,6 +8693,7 @@ mod tests {
         let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let captured_clone = captured.clone();
         let ctx = IpcContext {
+            viewer_id: next_viewer_id(),
             is_serve_mode: false,
             shared,
             approver,
@@ -8678,6 +8731,7 @@ mod tests {
         let (approver, _rx) = crate::permissions::GuiApprover::new();
         let pending_asks: PendingAsks = Arc::new(Mutex::new(HashMap::new()));
         let ctx = IpcContext {
+            viewer_id: next_viewer_id(),
             is_serve_mode: false,
             shared,
             approver,

@@ -1301,7 +1301,7 @@ impl McpClient {
             .get("isError")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let text = extract_text(&result);
+        let text = extract_text(&result, name);
         if is_error {
             Err(Error::Tool(format!("mcp tool {name} error: {text}")))
         } else {
@@ -1329,7 +1329,7 @@ impl McpClient {
         if is_error {
             Err(Error::Tool(format!(
                 "mcp tool {name} error: {}",
-                extract_text(&result)
+                extract_text(&result, name)
             )))
         } else {
             Ok(result)
@@ -1376,43 +1376,87 @@ fn handle_incoming(msg: Value, pending: &Pending) {
 /// Override with `THCLAWS_MCP_MAX_TEXT_BYTES` (0 disables the cap).
 const MAX_MCP_TEXT_BYTES: usize = 256 * 1024;
 
-fn mcp_text_budget() -> usize {
+/// Tighter budget for the one tool that routinely blows the blanket cap.
+/// Measured (docs/pdf-extraction-bench.md's sibling survey in dev-plan/65):
+/// one `browser_snapshot` of an encyclopaedia article is 889 KB — 65,000
+/// tokens in a single tool result after the 256 KB cap, with 71% dropped. The
+/// Hacker News front page is 48 KB, which is what "a real page, whole" costs,
+/// so that is the ceiling. Past it the model is told which parameter narrows
+/// the call rather than being left to retry blind.
+const SNAPSHOT_TEXT_BYTES: usize = 48 * 1024;
+
+/// Per-tool text budget. The blanket cap bounds the blast radius of any one
+/// result; this bounds the tool that reaches it every time.
+///
+/// An explicit `THCLAWS_MCP_MAX_TEXT_BYTES` wins outright, including over the
+/// snapshot floor — someone who raises the cap to read one enormous tree
+/// should get it, and someone who sets `0` should get no cap at all.
+fn tool_text_budget(tool: &str) -> usize {
+    if let Some(explicit) = mcp_text_budget_override() {
+        return explicit;
+    }
+    match tool {
+        "browser_snapshot" => SNAPSHOT_TEXT_BYTES,
+        _ => MAX_MCP_TEXT_BYTES,
+    }
+}
+
+/// What to do about a result that had to be cut, in the words of the tool
+/// that produced it. A generic "narrow the result" is not actionable; naming
+/// the parameter is.
+fn narrowing_hint(tool: &str) -> &'static str {
+    match tool {
+        "browser_snapshot" => {
+            "Narrow it: `depth` limits the tree, `target` snapshots one element, \
+             and `filename` writes the whole snapshot to a file you can Grep for \
+             a fraction of the tokens"
+        }
+        "browser_network_requests" | "browser_console_messages" => {
+            "Narrow it: `filter` matches a URL pattern, `filename` writes the \
+             full list to a file"
+        }
+        _ => {
+            "Narrow the result — `browser_find` searches the page and returns \
+             only matches, where `browser_snapshot` returns all of it"
+        }
+    }
+}
+
+fn mcp_text_budget_override() -> Option<usize> {
     std::env::var("THCLAWS_MCP_MAX_TEXT_BYTES")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(MAX_MCP_TEXT_BYTES)
 }
 
 /// Truncate on a UTF-8 boundary, saying what was dropped so the model can
 /// narrow its next call instead of assuming it saw the whole page.
-fn cap_mcp_text(text: String) -> String {
-    let budget = mcp_text_budget();
+fn cap_mcp_text(text: String, tool: &str) -> String {
+    let budget = tool_text_budget(tool);
     if budget == 0 || text.len() <= budget {
         return text;
     }
-    cap_mcp_text_to(&text, budget)
+    cap_mcp_text_to(&text, budget, tool)
 }
 
 /// `cap_mcp_text` with the budget supplied by the caller, for the multimodal
 /// path where several blocks share one allowance.
-fn cap_mcp_text_to(text: &str, budget: usize) -> String {
+fn cap_mcp_text_to(text: &str, budget: usize, tool: &str) -> String {
     let mut end = budget;
     while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
     }
     format!(
-        "{}\n\n... [truncated at {} KB of {} KB. Narrow the result — `browser_find` \
-         searches the page and returns only matches, where `browser_snapshot` returns \
-         all of it]",
+        "{}\n\n... [truncated at {} KB of {} KB. {}]",
         &text[..end],
         budget / 1024,
-        text.len() / 1024
+        text.len() / 1024,
+        narrowing_hint(tool)
     )
 }
 
 /// Pull text out of a `tools/call` result. MCP tool results are an array of
 /// content blocks; we concatenate all `{type: "text"}` parts.
-fn extract_text(result: &Value) -> String {
+fn extract_text(result: &Value, tool: &str) -> String {
     let Some(content) = result.get("content").and_then(Value::as_array) else {
         return String::new();
     };
@@ -1422,6 +1466,7 @@ fn extract_text(result: &Value) -> String {
             .filter_map(|c| c.get("text").and_then(Value::as_str).map(String::from))
             .collect::<Vec<_>>()
             .join("\n"),
+        tool,
     )
 }
 
@@ -1436,7 +1481,7 @@ const MAX_MCP_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 /// the plain `extract_text` path so text-only tools behave exactly as
 /// before. Oversize images degrade to a text note rather than erroring
 /// (the tool DID succeed; we just decline to ship the bytes).
-fn mcp_content_to_blocks(result: &Value) -> Option<crate::types::ToolResultContent> {
+fn mcp_content_to_blocks(result: &Value, tool: &str) -> Option<crate::types::ToolResultContent> {
     use crate::types::{ImageSource, ToolResultBlock, ToolResultContent};
     let content = result.get("content").and_then(Value::as_array)?;
     if !content
@@ -1450,7 +1495,7 @@ fn mcp_content_to_blocks(result: &Value) -> Option<crate::types::ToolResultConte
     // Text is budgeted across the whole result, not per block — otherwise a
     // screenshot with a full snapshot stapled to it slips the cap that
     // `extract_text` applies on the text-only path.
-    let mut text_budget = mcp_text_budget();
+    let mut text_budget = tool_text_budget(tool);
     for b in content {
         match b.get("type").and_then(Value::as_str) {
             Some("text") => {
@@ -1461,7 +1506,7 @@ fn mcp_content_to_blocks(result: &Value) -> Option<crate::types::ToolResultConte
                         text_budget -= t.len();
                         t.to_string()
                     } else {
-                        let capped = cap_mcp_text_to(t, text_budget);
+                        let capped = cap_mcp_text_to(t, text_budget, tool);
                         text_budget = 0;
                         capped
                     };
@@ -1685,9 +1730,12 @@ impl Tool for McpTool {
     async fn call_multimodal(&self, input: Value) -> Result<crate::types::ToolResultContent> {
         self.lazy_browser_up().await;
         let result = self.client.call_tool_raw(self.bare_name(), input).await?;
-        match mcp_content_to_blocks(&result) {
+        match mcp_content_to_blocks(&result, self.bare_name()) {
             Some(blocks) => Ok(blocks),
-            None => Ok(crate::types::ToolResultContent::Text(extract_text(&result))),
+            None => Ok(crate::types::ToolResultContent::Text(extract_text(
+                &result,
+                self.bare_name(),
+            ))),
         }
     }
 
@@ -2243,14 +2291,14 @@ mod tests {
         use crate::types::{ToolResultBlock, ToolResultContent};
         // text-only → None (caller keeps the plain-text path)
         let text_only = serde_json::json!({"content":[{"type":"text","text":"hi"}]});
-        assert!(mcp_content_to_blocks(&text_only).is_none());
+        assert!(mcp_content_to_blocks(&text_only, "t").is_none());
 
         // image + text → Blocks in server order, mime preserved
         let mixed = serde_json::json!({"content":[
             {"type":"image","data":"aGVsbG8=","mimeType":"image/jpeg"},
             {"type":"text","text":"viewport screenshot"},
         ]});
-        let Some(ToolResultContent::Blocks(blocks)) = mcp_content_to_blocks(&mixed) else {
+        let Some(ToolResultContent::Blocks(blocks)) = mcp_content_to_blocks(&mixed, "t") else {
             panic!("expected blocks");
         };
         assert_eq!(blocks.len(), 2);
@@ -2267,7 +2315,7 @@ mod tests {
         let big = "A".repeat((5 * 1024 * 1024 / 3 * 4) + 8);
         let oversize =
             serde_json::json!({"content":[{"type":"image","data": big,"mimeType":"image/png"}]});
-        let Some(ToolResultContent::Blocks(blocks)) = mcp_content_to_blocks(&oversize) else {
+        let Some(ToolResultContent::Blocks(blocks)) = mcp_content_to_blocks(&oversize, "t") else {
             panic!("expected blocks");
         };
         assert!(blocks
@@ -2406,7 +2454,7 @@ mod tests {
         // Multi-byte on purpose: a naive slice at 64 would split the Thai
         // characters and panic.
         let big = "ก".repeat(200);
-        let out = cap_mcp_text(big.clone());
+        let out = cap_mcp_text(big.clone(), "t");
         std::env::remove_var("THCLAWS_MCP_MAX_TEXT_BYTES");
 
         assert!(out.len() < big.len(), "oversize text must shrink");
@@ -2425,7 +2473,55 @@ mod tests {
         let _g = crate::kms::test_env_lock();
         std::env::remove_var("THCLAWS_MCP_MAX_TEXT_BYTES");
         let text = "a short tool result".to_string();
-        assert_eq!(cap_mcp_text(text.clone()), text);
+        assert_eq!(cap_mcp_text(text.clone(), "t"), text);
+    }
+
+    /// One 889 KB snapshot cost 65,000 tokens under the blanket cap and still
+    /// dropped 71% of the page. The tool that reaches the cap every time gets
+    /// its own, tighter one — and a truncation notice that names the parameter
+    /// that would have made the call cheap.
+    #[test]
+    fn a_snapshot_is_capped_tighter_than_the_blanket_and_says_how_to_narrow() {
+        let _g = crate::kms::test_env_lock();
+        std::env::remove_var("THCLAWS_MCP_MAX_TEXT_BYTES");
+
+        assert_eq!(tool_text_budget("browser_snapshot"), SNAPSHOT_TEXT_BYTES);
+        assert_eq!(tool_text_budget("browser_click"), MAX_MCP_TEXT_BYTES);
+        assert!(SNAPSHOT_TEXT_BYTES < MAX_MCP_TEXT_BYTES);
+
+        // Over the snapshot budget but under the blanket one: cut here,
+        // untouched for any other tool.
+        let page = "x".repeat(SNAPSHOT_TEXT_BYTES * 2);
+        let out = cap_mcp_text(page.clone(), "browser_snapshot");
+        assert!(out.len() < page.len(), "a big snapshot must shrink");
+        for param in ["depth", "target", "filename"] {
+            assert!(out.contains(param), "the notice must name `{param}`: {out}");
+        }
+        assert_eq!(cap_mcp_text(page.clone(), "browser_click"), page);
+    }
+
+    /// The override is the escape hatch; a per-tool floor that ignored it
+    /// would make raising the cap do nothing for the one tool it exists for.
+    #[test]
+    fn an_explicit_override_beats_the_per_tool_floor() {
+        let _g = crate::kms::test_env_lock();
+        std::env::set_var("THCLAWS_MCP_MAX_TEXT_BYTES", "999999");
+        assert_eq!(tool_text_budget("browser_snapshot"), 999_999);
+        std::env::set_var("THCLAWS_MCP_MAX_TEXT_BYTES", "0");
+        assert_eq!(tool_text_budget("browser_snapshot"), 0);
+        let page = "x".repeat(SNAPSHOT_TEXT_BYTES * 2);
+        assert_eq!(cap_mcp_text(page.clone(), "browser_snapshot"), page);
+        std::env::remove_var("THCLAWS_MCP_MAX_TEXT_BYTES");
+    }
+
+    /// A page that misbehaves is read through the network and console lists,
+    /// and those have their own narrowing parameter.
+    #[test]
+    fn the_network_list_is_told_about_filter_not_browser_find() {
+        let hint = narrowing_hint("browser_network_requests");
+        assert!(hint.contains("filter"), "{hint}");
+        assert!(!hint.contains("browser_find"), "{hint}");
+        assert!(narrowing_hint("anything_else").contains("browser_find"));
     }
 
     #[test]

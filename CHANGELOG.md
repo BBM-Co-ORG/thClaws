@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.137.0] — 2026-09-24
+
+**A release about the takeover browser, and about the workspace actually being the boundary.** The takeover grows a keyboard and a live view that follows the agent, and a symlink swapped in mid-flight can no longer carry a write out of the workspace.
+
+### Added
+- **The takeover browser has a real keyboard.** Typed input now reaches the takeover session as real key events instead of being lost on the way in.
+- **The live view follows the agent, and more than one person can watch.** The browser's live view now tracks whatever the agent is doing, and more than one viewer can watch the same session at once.
+
+### Fixed
+- **Paste reaches the takeover browser — with Ctrl-V or the new Paste button.** Paste needs an editable, visibly-rendered target, and the takeover frame was neither, so it evaporated. **On macOS ⌘V still does not arrive**, although it pastes normally elsewhere in thClaws; the manuals say which to use.
+- **The browser is refused in a shared workspace.** A shared workspace can no longer hand the browser over to a second user.
+- **The browser's page dumps are contained.** playwright-mcp saved an accessibility snapshot and a console log on every navigation, unasked — the full text of pages you had open, growing without bound and with nothing pruning it. They now go to the runtime-state directory, which is stripped from a published agent and capped in size. Nothing had escaped; this closes the path before it could.
+- **A symlink swapped in after the sandbox check no longer carries a write out of the workspace.** The link was checked, then its target could be swapped before the write landed; the write now refuses the swapped link.
+
+### Changed
+- **The cheap browser parameters are named, and the expensive tool is capped.** The browser tool's inexpensive reads now have named arguments, and the expensive read is limited.
+
 ## [0.136.0] — 2026-09-23
 
 **A release about reading Thai, and about limits meaning what they say.** Thai PDFs come out as words instead of fragments, two settings that were quietly ignored are enforced, and a symlink can no longer carry a write out of the workspace.

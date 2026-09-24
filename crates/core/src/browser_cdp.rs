@@ -65,6 +65,46 @@ fn page_slot() -> &'static Mutex<Option<Arc<PageSession>>> {
     PAGE.get_or_init(|| Mutex::new(None))
 }
 
+/// Everyone currently watching the live view, keyed by `IpcContext::viewer_id`
+/// — one id per connection. The desktop window and a phone on thClaws
+/// Remote are two entries and neither one's stop ends the other's stream —
+/// before this a single slot held one dispatch and every `screencast_start`
+/// replaced it wholesale (dev-plan/65 #5).
+static VIEWERS: OnceLock<Mutex<HashMap<u64, Dispatch>>> = OnceLock::new();
+/// The page target the view is attached to, and the one a human pinned from
+/// the tab strip (`None` = follow the agent).
+static ATTACHED: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static PINNED: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static LAST_TABS: OnceLock<Mutex<String>> = OnceLock::new();
+static WATCHER_ON: AtomicBool = AtomicBool::new(false);
+
+fn viewers() -> &'static Mutex<HashMap<u64, Dispatch>> {
+    VIEWERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn attached() -> &'static Mutex<Option<String>> {
+    ATTACHED.get_or_init(|| Mutex::new(None))
+}
+
+fn pinned() -> &'static Mutex<Option<String>> {
+    PINNED.get_or_init(|| Mutex::new(None))
+}
+
+/// The last `browser_tabs` envelope broadcast, so a viewer joining a running
+/// stream gets the strip immediately instead of waiting for the next change.
+fn last_tabs() -> &'static Mutex<String> {
+    LAST_TABS.get_or_init(|| Mutex::new(String::new()))
+}
+
+/// One envelope to every viewer. Cloned per viewer because each one owns its
+/// own outbound channel; the string is a frame of JPEG base64 at worst.
+fn broadcast(payload: String) {
+    let list: Vec<Dispatch> = viewers().lock().unwrap().values().cloned().collect();
+    for d in list {
+        d(payload.clone());
+    }
+}
+
 fn rt() -> &'static tokio::runtime::Runtime {
     static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RT.get_or_init(|| {
@@ -782,6 +822,9 @@ pub fn shutdown() {
         }
     }
     *page_slot().lock().unwrap() = None;
+    viewers().lock().unwrap().clear();
+    *attached().lock().unwrap() = None;
+    last_tabs().lock().unwrap().clear();
 }
 
 // ── CDP page session ─────────────────────────────────────────────────
@@ -802,6 +845,8 @@ struct PageSession {
     next_id: AtomicU64,
     screencast_on: AtomicBool,
     alive: AtomicBool,
+    /// When the last frame went on the wire, for the server-side rate cap.
+    last_frame_ms: AtomicU64,
 }
 
 impl PageSession {
@@ -874,31 +919,84 @@ fn frame_envelope(params: &Value) -> String {
     out.to_string()
 }
 
-/// Pick the most recently opened page target from `/json/list`.
-async fn page_ws_url(endpoint: &str) -> Result<String, String> {
-    let body = reqwest::get(format!("{endpoint}/json/list"))
-        .await
-        .map_err(|e| format!("cdp /json/list: {e}"))?
-        .text()
-        .await
-        .map_err(|e| format!("cdp /json/list body: {e}"))?;
-    let targets: Vec<Value> =
-        serde_json::from_str(&body).map_err(|e| format!("cdp /json/list parse: {e}"))?;
-    targets
-        .iter()
-        .find(|t| t.get("type").and_then(Value::as_str) == Some("page"))
-        .and_then(|t| t.get("webSocketDebuggerUrl").and_then(Value::as_str))
-        .map(String::from)
-        .ok_or_else(|| "no page target".to_string())
+/// One console argument, as text.
+///
+/// A CDP `RemoteObject` carries `value` only for primitives, and the old arm
+/// read nothing else — so `console.log("count", {a: 1})` arrived as "count"
+/// and an object-only log arrived blank, which looks exactly like a console
+/// that is not being forwarded. Fall back to the preview Chromium already
+/// sends, then to `description`, then to the class name.
+fn console_arg_text(arg: &Value) -> String {
+    if let Some(v) = arg.get("value") {
+        return match v.as_str() {
+            Some(s) => s.to_string(),
+            None => v.to_string(),
+        };
+    }
+    if let Some(preview) = arg.get("preview") {
+        let props: Vec<String> = preview
+            .get("properties")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .map(|p| {
+                        let name = p.get("name").and_then(Value::as_str).unwrap_or("");
+                        let val = p.get("value").and_then(Value::as_str).unwrap_or("…");
+                        (name.to_string(), val.to_string())
+                    })
+                    .map(|(n, v)| {
+                        if preview.get("subtype").and_then(Value::as_str) == Some("array") {
+                            v
+                        } else {
+                            format!("{n}: {v}")
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let more = if preview.get("overflow").and_then(Value::as_bool) == Some(true) {
+            ", …"
+        } else {
+            ""
+        };
+        if !props.is_empty() {
+            return if preview.get("subtype").and_then(Value::as_str) == Some("array") {
+                format!("[{}{more}]", props.join(", "))
+            } else {
+                format!("{{{}{more}}}", props.join(", "))
+            };
+        }
+    }
+    for key in ["description", "className"] {
+        if let Some(d) = arg.get(key).and_then(Value::as_str) {
+            return d.to_string();
+        }
+    }
+    arg.get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("?")
+        .to_string()
 }
 
-/// Attach to the current page and start the live wire: screencast
-/// frames + console/exception events + navigation notices, all pushed
-/// through `dispatch` as frontend-ready JSON envelopes.
-async fn attach_and_start(endpoint: String, dispatch: Dispatch) -> Result<(), String> {
+/// Server-side floor on how often a frame is put on the wire.
+///
+/// Chromium emits a frame per paint — 60/s on an animating page — and the
+/// only limiter used to be in the browser tab, which is the wrong end: every
+/// dropped frame had already crossed the websocket, and on thClaws Remote
+/// that is somebody's phone data. The client cap stays as a backstop.
+fn frame_min_ms() -> u64 {
+    std::env::var("THCLAWS_BROWSER_FRAME_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(80)
+}
+
+/// Attach to one page target and start the live wire: screencast frames +
+/// console/exception events + navigation notices, broadcast to every viewer
+/// as frontend-ready JSON envelopes.
+async fn attach_and_start(tab: &TabInfo) -> Result<(), String> {
     use futures::StreamExt;
-    let ws_url = page_ws_url(&endpoint).await?;
-    let (stream, _) = tokio_tungstenite::connect_async(&ws_url)
+    let (stream, _) = tokio_tungstenite::connect_async(&tab.ws)
         .await
         .map_err(|e| format!("cdp connect: {e}"))?;
     let (writer, mut reader) = stream.split();
@@ -909,11 +1007,12 @@ async fn attach_and_start(endpoint: String, dispatch: Dispatch) -> Result<(), St
         next_id: AtomicU64::new(1),
         screencast_on: AtomicBool::new(false),
         alive: AtomicBool::new(true),
+        last_frame_ms: AtomicU64::new(0),
     });
 
-    // Reader task: route replies by id; convert events into dispatches.
+    // Reader task: route replies by id; convert events into broadcasts.
     let s2 = session.clone();
-    let d2 = dispatch.clone();
+    let min_ms = frame_min_ms();
     rt().spawn(async move {
         while let Some(Ok(msg)) = reader.next().await {
             let tokio_tungstenite::tungstenite::Message::Text(text) = msg else {
@@ -931,14 +1030,22 @@ async fn attach_and_start(endpoint: String, dispatch: Dispatch) -> Result<(), St
             match v.get("method").and_then(Value::as_str) {
                 Some("Page.screencastFrame") => {
                     let p = v.get("params").cloned().unwrap_or(Value::Null);
-                    if p.get("data").and_then(Value::as_str).is_some() {
-                        d2(frame_envelope(&p));
+                    // Rate-limited here, not in the tab: a frame dropped on
+                    // the client has already been paid for on the wire.
+                    let now = since_start_ms();
+                    let last = s2.last_frame_ms.load(Ordering::Relaxed);
+                    if p.get("data").and_then(Value::as_str).is_some()
+                        && now.saturating_sub(last) >= min_ms
+                    {
+                        s2.last_frame_ms.store(now, Ordering::Relaxed);
+                        broadcast(frame_envelope(&p));
                     }
                     if let Some(sid) = p.get("sessionId") {
                         // Ack AFTER forwarding — natural backpressure —
                         // but fire-and-forget: awaiting the ack's REPLY
                         // here would deadlock the reader (it's the only
-                        // task that can route replies).
+                        // task that can route replies). A dropped frame is
+                        // still acked, or Chromium stops sending.
                         s2.notify("Page.screencastFrameAck", json!({ "sessionId": sid }))
                             .await;
                     }
@@ -949,23 +1056,16 @@ async fn attach_and_start(endpoint: String, dispatch: Dispatch) -> Result<(), St
                     let text: Vec<String> = p
                         .get("args")
                         .and_then(Value::as_array)
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(|x| {
-                                    x.get("value").map(|v| match v.as_str() {
-                                        Some(s) => s.to_string(),
-                                        None => v.to_string(),
-                                    })
-                                })
-                                .collect()
-                        })
+                        .map(|a| a.iter().map(console_arg_text).collect())
                         .unwrap_or_default();
-                    d2(json!({
-                        "type": "browser_console",
-                        "level": level,
-                        "text": text.join(" "),
-                    })
-                    .to_string());
+                    broadcast(
+                        json!({
+                            "type": "browser_console",
+                            "level": level,
+                            "text": text.join(" "),
+                        })
+                        .to_string(),
+                    );
                 }
                 Some("Runtime.exceptionThrown") => {
                     let desc = v
@@ -973,18 +1073,20 @@ async fn attach_and_start(endpoint: String, dispatch: Dispatch) -> Result<(), St
                         .or_else(|| v.pointer("/params/exceptionDetails/text"))
                         .and_then(Value::as_str)
                         .unwrap_or("uncaught exception");
-                    d2(json!({
-                        "type": "browser_console",
-                        "level": "error",
-                        "text": desc,
-                    })
-                    .to_string());
+                    broadcast(
+                        json!({
+                            "type": "browser_console",
+                            "level": "error",
+                            "text": desc,
+                        })
+                        .to_string(),
+                    );
                 }
                 Some("Page.frameNavigated") => {
                     if let Some(url) = v.pointer("/params/frame/url").and_then(Value::as_str) {
                         // Only top-level frames carry no parentId.
                         if v.pointer("/params/frame/parentId").is_none() {
-                            d2(json!({ "type": "browser_nav", "url": url }).to_string());
+                            broadcast(json!({ "type": "browser_nav", "url": url }).to_string());
                         }
                     }
                 }
@@ -996,6 +1098,13 @@ async fn attach_and_start(endpoint: String, dispatch: Dispatch) -> Result<(), St
 
     session.call("Page.enable", json!({})).await?;
     session.call("Runtime.enable", json!({})).await?;
+    // Chromium does not paint a background tab and does not deliver input to
+    // one: attaching to a tab that is not in front gives a black live view
+    // and a takeover whose every keystroke times out. Found by running the
+    // live tests against a profile that had restored seven tabs, not by
+    // reading the code. Best-effort — a target that refuses is still worth
+    // screencasting, it just may not repaint.
+    let _ = session.call("Page.bringToFront", json!({})).await;
     session
         .call(
             "Page.startScreencast",
@@ -1013,12 +1122,212 @@ async fn attach_and_start(endpoint: String, dispatch: Dispatch) -> Result<(), St
     Ok(())
 }
 
+// ── Target tracking ──────────────────────────────────────────────────
+
+/// One page target as `/json/list` reports it.
+#[derive(Clone, Debug, PartialEq)]
+struct TabInfo {
+    id: String,
+    url: String,
+    title: String,
+    ws: String,
+}
+
+fn page_targets(body: &str) -> Vec<TabInfo> {
+    let Ok(list) = serde_json::from_str::<Vec<Value>>(body) else {
+        return Vec::new();
+    };
+    list.iter()
+        .filter(|t| t.get("type").and_then(Value::as_str) == Some("page"))
+        .filter_map(|t| {
+            Some(TabInfo {
+                id: t.get("id").and_then(Value::as_str)?.to_string(),
+                url: t
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                title: t
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                ws: t
+                    .get("webSocketDebuggerUrl")
+                    .and_then(Value::as_str)?
+                    .to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Which page the live view belongs on.
+///
+/// The old rule was "the first `page` in `/json/list`, once, at attach" — so
+/// the moment the agent opened a second tab the human was watching a page
+/// nobody was on, with nothing on screen to say so. In order:
+///
+/// 1. A pin the human set from the tab strip, while that tab still exists.
+/// 2. A target id never seen before — that is the agent opening a tab, and
+///    the view follows it.
+/// 3. Where we already are, if it is still there.
+/// 4. Whatever is left, so a closed tab re-attaches instead of freezing on
+///    its last frame.
+fn choose_target(
+    current: Option<&str>,
+    pinned: Option<&str>,
+    seen: &std::collections::HashSet<String>,
+    tabs: &[TabInfo],
+) -> Option<String> {
+    let exists = |id: &str| tabs.iter().any(|t| t.id == id);
+    if let Some(p) = pinned {
+        if exists(p) {
+            return Some(p.to_string());
+        }
+    }
+    if let Some(fresh) = tabs.iter().find(|t| !seen.contains(&t.id)) {
+        return Some(fresh.id.clone());
+    }
+    if let Some(c) = current {
+        if exists(c) {
+            return Some(c.to_string());
+        }
+    }
+    tabs.first().map(|t| t.id.clone())
+}
+
+async fn list_targets(endpoint: &str) -> Result<Vec<TabInfo>, String> {
+    let body = reqwest::get(format!("{endpoint}/json/list"))
+        .await
+        .map_err(|e| format!("cdp /json/list: {e}"))?
+        .text()
+        .await
+        .map_err(|e| format!("cdp /json/list body: {e}"))?;
+    Ok(page_targets(&body))
+}
+
+fn tabs_envelope(tabs: &[TabInfo], active: Option<&str>) -> String {
+    json!({
+        "type": "browser_tabs",
+        "active": active,
+        "tabs": tabs
+            .iter()
+            .map(|t| json!({ "id": t.id, "url": t.url, "title": t.title }))
+            .collect::<Vec<_>>(),
+    })
+    .to_string()
+}
+
+/// What the human is told about the view itself, as distinct from the page.
+/// A dead target used to leave the last frame on screen forever, which reads
+/// as "the page froze" rather than "the view came loose" (dev-plan/65 #5).
+fn view_envelope(state: &str, tab: Option<&TabInfo>, error: Option<&str>) -> String {
+    json!({
+        "type": "browser_view",
+        "state": state,
+        "target": tab.map(|t| t.id.clone()),
+        "url": tab.map(|t| t.url.clone()),
+        "error": error,
+    })
+    .to_string()
+}
+
+/// How often `/json/list` is polled while anyone is watching.
+///
+/// Polling rather than a second websocket running `Target.setDiscoverTargets`
+/// on purpose: one localhost GET per tick, no second reader task to deadlock
+/// against the first, and nobody watching a video stream can see 750 ms.
+const TARGET_POLL_MS: u64 = 750;
+
+/// Follow the agent while anyone is watching: keep the tab strip current,
+/// move the view to a tab the agent just opened, and re-attach when the page
+/// under it dies. Exits when the last viewer leaves.
+fn start_watcher(endpoint: String) {
+    if WATCHER_ON.swap(true, Ordering::SeqCst) {
+        return; // already running
+    }
+    rt().spawn(async move {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        loop {
+            if viewers().lock().unwrap().is_empty() {
+                break;
+            }
+            if let Ok(tabs) = list_targets(&endpoint).await {
+                reconcile(&tabs, &mut seen).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(TARGET_POLL_MS)).await;
+        }
+        WATCHER_ON.store(false, Ordering::SeqCst);
+    });
+}
+
+async fn reconcile(tabs: &[TabInfo], seen: &mut std::collections::HashSet<String>) {
+    let current = attached().lock().unwrap().clone();
+    let pin = pinned().lock().unwrap().clone();
+    let want = choose_target(current.as_deref(), pin.as_deref(), seen, tabs);
+    // A session whose reader task ended is a socket that is gone: re-attach
+    // even when the target id has not changed.
+    let session_dead = page_slot()
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| !s.alive.load(Ordering::SeqCst))
+        .unwrap_or(true);
+
+    if want != current || session_dead {
+        match want
+            .as_deref()
+            .and_then(|id| tabs.iter().find(|t| t.id == id))
+        {
+            Some(tab) => {
+                broadcast(view_envelope("attaching", Some(tab), None));
+                match attach_and_start(tab).await {
+                    Ok(()) => {
+                        *attached().lock().unwrap() = Some(tab.id.clone());
+                        broadcast(view_envelope("live", Some(tab), None));
+                    }
+                    Err(e) => {
+                        *attached().lock().unwrap() = None;
+                        broadcast(view_envelope("error", Some(tab), Some(&e)));
+                    }
+                }
+            }
+            None => {
+                *attached().lock().unwrap() = None;
+                *page_slot().lock().unwrap() = None;
+                broadcast(view_envelope("detached", None, None));
+            }
+        }
+    }
+    // Marked seen AFTER the decision: a tab is "new" exactly once.
+    for t in tabs {
+        seen.insert(t.id.clone());
+    }
+    let active = attached().lock().unwrap().clone();
+    let envelope = tabs_envelope(tabs, active.as_deref());
+    let changed = {
+        let mut last = last_tabs().lock().unwrap();
+        if *last != envelope {
+            last.clone_from(&envelope);
+            true
+        } else {
+            false
+        }
+    };
+    if changed {
+        broadcast(envelope);
+    }
+}
+
 // ── Public sync API (call from non-tokio threads only) ───────────────
 
-/// Start (or restart) the live screencast, pushing frames + console
-/// events through `dispatch`. Re-attaches to the currently active
-/// page every time, so a takeover toggle recovers from closed tabs.
-pub fn screencast_start(dispatch: Dispatch) -> Result<(), String> {
+/// Register a viewer and make sure the live wire is running.
+///
+/// Idempotent per client: a second start from the same dispatch replaces its
+/// own entry and nothing else. The first frame, the tab strip and the view
+/// state all arrive as broadcasts, so a viewer that joins an already-running
+/// stream is caught up by the snapshot sent here.
+pub fn screencast_start(viewer: u64, dispatch: Dispatch) -> Result<(), String> {
     ensure_up()?;
     let endpoint = state()
         .lock()
@@ -1026,26 +1335,181 @@ pub fn screencast_start(dispatch: Dispatch) -> Result<(), String> {
         .as_ref()
         .map(|s| s.endpoint.clone())
         .ok_or("engine-owned browser not running (CDP off)")?;
-    // Drop any previous session — its reader task ends when the ws does.
-    if let Some(old) = page_slot().lock().unwrap().take() {
-        let _ = rt().block_on(old.call("Page.stopScreencast", json!({})));
+    let snapshot = last_tabs().lock().unwrap().clone();
+    viewers().lock().unwrap().insert(viewer, dispatch.clone());
+    if !snapshot.is_empty() {
+        dispatch(snapshot);
     }
-    rt().block_on(attach_and_start(endpoint, dispatch))
+    start_watcher(endpoint);
+    Ok(())
 }
 
-pub fn screencast_stop() {
-    if let Some(s) = page_slot().lock().unwrap().take() {
+/// Drop one viewer. The stream stops only when the last one leaves — a phone
+/// closing its tab must not blank the desktop window.
+pub fn screencast_stop(viewer: u64) {
+    let remaining = {
+        let mut v = viewers().lock().unwrap();
+        v.remove(&viewer);
+        v.len()
+    };
+    if remaining > 0 {
+        return;
+    }
+    let session = page_slot().lock().unwrap().take();
+    if let Some(s) = session {
         let _ = rt().block_on(s.call("Page.stopScreencast", json!({})));
     }
+    *attached().lock().unwrap() = None;
+    *pinned().lock().unwrap() = None;
+    last_tabs().lock().unwrap().clear();
     // A takeover session is the most likely moment a fresh login just
     // happened — snapshot now so it survives even an immediate pause.
     flush_cookies();
+}
+
+/// Pin the live view to one tab, or `None` to follow the agent again. The
+/// watcher applies it on its next tick rather than re-attaching from the
+/// caller's thread.
+pub fn select_tab(target: Option<String>) {
+    *pinned().lock().unwrap() = target;
 }
 
 /// Native input on the live page. `kind`: click | move | wheel |
 /// text | key. Coordinates are page CSS pixels — NOT the screencast frame's
 /// pixels, which are a scaled-down version of that space. The tab converts
 /// using the `w`/`h` each frame carries (see [`frame_envelope`]).
+/// Chromium's modifier bitmask, shared by `Input.dispatchKeyEvent` and
+/// `Input.dispatchMouseEvent`: Alt=1, Ctrl=2, Meta=4, Shift=8. Without it a
+/// takeover can click but cannot shift-click, and every keystroke arrives
+/// unmodified — no Ctrl-A, no Cmd-C, no capital letter from a real Shift.
+fn modifier_mask(args: &Value) -> u32 {
+    let on = |k: &str| args.get(k).and_then(Value::as_bool).unwrap_or(false);
+    (on("alt") as u32)
+        | ((on("ctrl") as u32) << 1)
+        | ((on("meta") as u32) << 2)
+        | ((on("shift") as u32) << 3)
+}
+
+/// A key as CDP wants it: the DOM `code`, the legacy virtual key code, and
+/// the text it inserts when it is a printing key.
+#[derive(Debug, PartialEq)]
+struct KeyDesc {
+    code: String,
+    vk: u32,
+    text: Option<String>,
+}
+
+/// Translate a browser `KeyboardEvent.key` into that.
+///
+/// The old table had nine named keys and rejected everything else, so a
+/// takeover could press Enter and the arrows and nothing a person actually
+/// types. Named keys keep their real `code`/`keyCode` because pages listen
+/// for them; anything else that is one character is a printing key.
+fn key_descriptor(key: &str) -> Option<KeyDesc> {
+    let named = |code: &str, vk: u32, text: Option<&str>| {
+        Some(KeyDesc {
+            code: code.to_string(),
+            vk,
+            text: text.map(str::to_string),
+        })
+    };
+    match key {
+        "Enter" => return named("Enter", 13, Some("\r")),
+        "Tab" => return named("Tab", 9, None),
+        "Backspace" => return named("Backspace", 8, None),
+        "Escape" => return named("Escape", 27, None),
+        "Delete" => return named("Delete", 46, None),
+        "ArrowUp" => return named("ArrowUp", 38, None),
+        "ArrowDown" => return named("ArrowDown", 40, None),
+        "ArrowLeft" => return named("ArrowLeft", 37, None),
+        "ArrowRight" => return named("ArrowRight", 39, None),
+        "Home" => return named("Home", 36, None),
+        "End" => return named("End", 35, None),
+        "PageUp" => return named("PageUp", 33, None),
+        "PageDown" => return named("PageDown", 34, None),
+        "Insert" => return named("Insert", 45, None),
+        " " | "Spacebar" => return named("Space", 32, Some(" ")),
+        // Modifiers arrive as their own keydown; they carry no text and no
+        // page cares about the bare press, but swallowing them silently
+        // would look like a dropped keystroke.
+        "Shift" => return named("ShiftLeft", 16, None),
+        "Control" => return named("ControlLeft", 17, None),
+        "Alt" => return named("AltLeft", 18, None),
+        "Meta" => return named("MetaLeft", 91, None),
+        _ => {}
+    }
+    if let Some(n) = key.strip_prefix('F').and_then(|n| n.parse::<u32>().ok()) {
+        if (1..=12).contains(&n) {
+            return named(&format!("F{n}"), 111 + n, None);
+        }
+    }
+    let mut chars = key.chars();
+    let (c, rest) = (chars.next()?, chars.next());
+    if rest.is_some() {
+        return None; // an unknown multi-character key name
+    }
+    let upper = c.to_ascii_uppercase();
+    let code = if c.is_ascii_alphabetic() {
+        format!("Key{upper}")
+    } else if c.is_ascii_digit() {
+        format!("Digit{c}")
+    } else {
+        String::new() // punctuation: the text is what matters, not the code
+    };
+    Some(KeyDesc {
+        code,
+        vk: if c.is_ascii_alphanumeric() {
+            upper as u32
+        } else {
+            0
+        },
+        text: Some(c.to_string()),
+    })
+}
+
+/// The `Input.dispatchKeyEvent` payloads one takeover keystroke becomes.
+///
+/// Split out of `input` so the rules are testable without a browser — in
+/// particular the one Chromium happens to enforce for us on macOS and would
+/// not on Linux: a key struck with Ctrl or Meta held is a COMMAND, and must
+/// carry no `text`, or Ctrl-A selects all and types an "a" as well.
+fn key_events(kind: &str, args: &Value) -> Result<Vec<Value>, String> {
+    let key = args.get("key").and_then(Value::as_str).unwrap_or("");
+    let desc = key_descriptor(key).ok_or_else(|| format!("unsupported key: {key}"))?;
+    let mods = modifier_mask(args);
+    const CTRL_OR_META: u32 = 2 | 4;
+    let text = desc.text.filter(|_| mods & CTRL_OR_META == 0);
+    let base = json!({
+        "key": key,
+        "code": desc.code,
+        "windowsVirtualKeyCode": desc.vk,
+        "nativeVirtualKeyCode": desc.vk,
+        "modifiers": mods,
+    });
+    let mut out = Vec::new();
+    if kind != "keyup" {
+        let mut down = base.clone();
+        // A key that inserts text is `keyDown`; one that does not is
+        // `rawKeyDown`, or Chromium turns the press into a character the
+        // page never asked for.
+        down["type"] = json!(if text.is_some() {
+            "keyDown"
+        } else {
+            "rawKeyDown"
+        });
+        if let Some(t) = &text {
+            down["text"] = json!(t);
+        }
+        out.push(down);
+    }
+    if kind != "keydown" {
+        let mut up = base;
+        up["type"] = json!("keyUp");
+        out.push(up);
+    }
+    Ok(out)
+}
+
 pub fn input(kind: &str, args: &Value) -> Result<(), String> {
     let session = page_slot()
         .lock()
@@ -1056,12 +1520,16 @@ pub fn input(kind: &str, args: &Value) -> Result<(), String> {
         return Err("live page session closed — toggle takeover to re-attach".into());
     }
     let get_f = |k: &str| args.get(k).and_then(Value::as_f64).unwrap_or(0.0);
+    // Mouse events carry them too — shift-click extends a selection and
+    // ctrl/cmd-click opens a link in a tab, and neither worked without this.
+    let mods = modifier_mask(args);
     rt().block_on(async {
         match kind {
             "click" => {
                 let (x, y) = (get_f("x"), get_f("y"));
                 let base = json!({
                     "x": x, "y": y, "button": "left", "buttons": 1, "clickCount": 1,
+                    "modifiers": mods,
                 });
                 let mut press = base.clone();
                 press["type"] = json!("mousePressed");
@@ -1082,7 +1550,7 @@ pub fn input(kind: &str, args: &Value) -> Result<(), String> {
                             "type": if kind == "down" { "mousePressed" } else { "mouseReleased" },
                             "x": get_f("x"), "y": get_f("y"),
                             "button": "left", "buttons": if kind == "down" { 1 } else { 0 },
-                            "clickCount": 1,
+                            "clickCount": 1, "modifiers": mods,
                         }),
                     )
                     .await?;
@@ -1093,6 +1561,7 @@ pub fn input(kind: &str, args: &Value) -> Result<(), String> {
                     "type": "mouseMoved",
                     "x": get_f("x"), "y": get_f("y"),
                     "buttons": if held { 1 } else { 0 },
+                    "modifiers": mods,
                 });
                 if held {
                     ev["button"] = json!("left");
@@ -1107,6 +1576,7 @@ pub fn input(kind: &str, args: &Value) -> Result<(), String> {
                             "type": "mouseWheel",
                             "x": get_f("x"), "y": get_f("y"),
                             "deltaX": get_f("deltaX"), "deltaY": get_f("deltaY"),
+                            "modifiers": mods,
                         }),
                     )
                     .await?;
@@ -1120,41 +1590,14 @@ pub fn input(kind: &str, args: &Value) -> Result<(), String> {
                     .call("Input.insertText", json!({ "text": text }))
                     .await?;
             }
-            "key" => {
-                let key = args.get("key").and_then(Value::as_str).unwrap_or("");
-                let (code, vk, text) = match key {
-                    "Enter" => ("Enter", 13, Some("\r")),
-                    "Tab" => ("Tab", 9, None),
-                    "Backspace" => ("Backspace", 8, None),
-                    "Escape" => ("Escape", 27, None),
-                    "Delete" => ("Delete", 46, None),
-                    "ArrowUp" => ("ArrowUp", 38, None),
-                    "ArrowDown" => ("ArrowDown", 40, None),
-                    "ArrowLeft" => ("ArrowLeft", 37, None),
-                    "ArrowRight" => ("ArrowRight", 39, None),
-                    other => return Err(format!("unsupported key: {other}")),
-                };
-                let mut down = json!({
-                    "type": "keyDown",
-                    "key": key, "code": code,
-                    "windowsVirtualKeyCode": vk,
-                    "nativeVirtualKeyCode": vk,
-                });
-                if let Some(t) = text {
-                    down["text"] = json!(t);
+            // `key` is one press-and-release, for the on-screen buttons.
+            // `keydown` / `keyup` are the real thing: a focused frame in the
+            // Browser tab forwards the human's own events, so a key can be
+            // held, a chord can be struck, and autorepeat behaves.
+            "key" | "keydown" | "keyup" => {
+                for ev in key_events(kind, args)? {
+                    session.call("Input.dispatchKeyEvent", ev).await?;
                 }
-                session.call("Input.dispatchKeyEvent", down).await?;
-                session
-                    .call(
-                        "Input.dispatchKeyEvent",
-                        json!({
-                            "type": "keyUp",
-                            "key": key, "code": code,
-                            "windowsVirtualKeyCode": vk,
-                            "nativeVirtualKeyCode": vk,
-                        }),
-                    )
-                    .await?;
             }
             other => return Err(format!("unsupported input kind: {other}")),
         }
@@ -1370,5 +1813,447 @@ mod tests {
                 "{lock} should be cleared after reaping a dead orphan"
             );
         }
+    }
+
+    /// Close every page target but the first. The live tests share one
+    /// persistent Chromium profile, which restores the tabs the last run
+    /// opened — seven of them by the third run, and a background tab neither
+    /// paints nor accepts input.
+    fn trim_to_one_tab(endpoint: &str) {
+        let tabs = rt().block_on(list_targets(endpoint)).unwrap_or_default();
+        for t in tabs.iter().skip(1) {
+            let _ = rt().block_on(reqwest::get(format!("{endpoint}/json/close/{}", t.id)));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+
+    fn tab(id: &str, url: &str) -> TabInfo {
+        TabInfo {
+            id: id.into(),
+            url: url.into(),
+            title: String::new(),
+            ws: format!("ws://127.0.0.1:1/devtools/page/{id}"),
+        }
+    }
+
+    fn seen_of(ids: &[&str]) -> std::collections::HashSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `/json/list` is every target, not every tab: service workers, the
+    /// browser itself and extension pages all appear, and a target with no
+    /// debugger URL cannot be attached to at all.
+    #[test]
+    fn only_attachable_page_targets_become_tabs() {
+        let body = r#"[
+            {"type":"page","id":"A","url":"https://a/","title":"A",
+             "webSocketDebuggerUrl":"ws://x/A"},
+            {"type":"service_worker","id":"S","url":"https://a/sw.js",
+             "webSocketDebuggerUrl":"ws://x/S"},
+            {"type":"page","id":"B","url":"https://b/","title":"B"}
+        ]"#;
+        let tabs = page_targets(body);
+        assert_eq!(tabs.len(), 1, "only the attachable page: {tabs:?}");
+        assert_eq!(tabs[0].id, "A");
+        assert!(page_targets("not json").is_empty());
+    }
+
+    /// The defect this phase exists for: the agent opens a tab and the human
+    /// keeps watching the old one, with nothing on screen to say so.
+    #[test]
+    fn the_view_follows_the_tab_the_agent_just_opened() {
+        let tabs = vec![tab("A", "https://a/"), tab("B", "https://b/")];
+        let seen = seen_of(&["A"]);
+        assert_eq!(
+            choose_target(Some("A"), None, &seen, &tabs).as_deref(),
+            Some("B"),
+            "an unseen target is the agent opening a tab"
+        );
+        // ...but exactly once. Next tick B is known, so the view stays put.
+        let seen = seen_of(&["A", "B"]);
+        assert_eq!(
+            choose_target(Some("B"), None, &seen, &tabs).as_deref(),
+            Some("B")
+        );
+    }
+
+    /// A human who clicked a tab is steering; the agent opening another one
+    /// must not yank the view away from them.
+    #[test]
+    fn a_pin_outranks_the_agents_new_tab() {
+        let tabs = vec![tab("A", "https://a/"), tab("B", "https://b/")];
+        assert_eq!(
+            choose_target(Some("A"), Some("A"), &seen_of(&["A"]), &tabs).as_deref(),
+            Some("A"),
+            "B is new, but the human pinned A"
+        );
+        // A pin on a tab that has since closed is not a reason to show
+        // nothing — fall through to the normal rules.
+        assert_eq!(
+            choose_target(None, Some("gone"), &seen_of(&["A", "B"]), &tabs).as_deref(),
+            Some("A")
+        );
+    }
+
+    /// The old behaviour on a closed tab was to freeze on the last frame,
+    /// which reads as "the page hung" rather than "the view came loose".
+    #[test]
+    fn a_closed_tab_re_attaches_and_an_empty_browser_detaches() {
+        let tabs = vec![tab("B", "https://b/")];
+        assert_eq!(
+            choose_target(Some("A"), None, &seen_of(&["A", "B"]), &tabs).as_deref(),
+            Some("B"),
+            "the tab we were on is gone — take what is left"
+        );
+        assert_eq!(choose_target(Some("A"), None, &seen_of(&["A"]), &[]), None);
+    }
+
+    /// `RemoteObject` carries `value` only for primitives, so the old arm
+    /// dropped every object log on the floor — `console.log({a:1})` arrived
+    /// as an empty line, indistinguishable from a console nobody forwards.
+    #[test]
+    fn object_console_args_render_instead_of_arriving_blank() {
+        let primitive = json!({ "type": "string", "value": "hello" });
+        assert_eq!(console_arg_text(&primitive), "hello");
+
+        let object = json!({
+            "type": "object",
+            "className": "Object",
+            "description": "Object",
+            "preview": {
+                "type": "object",
+                "overflow": false,
+                "properties": [
+                    { "name": "status", "type": "number", "value": "500" },
+                    { "name": "url", "type": "string", "value": "/api/x" }
+                ]
+            }
+        });
+        assert_eq!(console_arg_text(&object), "{status: 500, url: /api/x}");
+
+        let array = json!({
+            "type": "object",
+            "subtype": "array",
+            "preview": {
+                "type": "object",
+                "subtype": "array",
+                "overflow": true,
+                "properties": [{ "name": "0", "type": "number", "value": "1" }]
+            }
+        });
+        assert_eq!(console_arg_text(&array), "[1, \u{2026}]");
+
+        // No value and no preview: say what it was, never nothing.
+        let opaque = json!({ "type": "function", "description": "() => {}" });
+        assert_eq!(console_arg_text(&opaque), "() => {}");
+        assert_eq!(
+            console_arg_text(&json!({ "type": "undefined" })),
+            "undefined"
+        );
+    }
+
+    /// The cap has to be enforceable from the engine; the browser tab's own
+    /// limiter runs after the bytes have already crossed the wire.
+    #[test]
+    fn the_frame_floor_is_engine_side_and_overridable() {
+        let _g = crate::kms::test_env_lock();
+        std::env::remove_var("THCLAWS_BROWSER_FRAME_MS");
+        assert_eq!(frame_min_ms(), 80);
+        std::env::set_var("THCLAWS_BROWSER_FRAME_MS", "0");
+        assert_eq!(
+            frame_min_ms(),
+            0,
+            "0 must mean every frame, not the default"
+        );
+        std::env::remove_var("THCLAWS_BROWSER_FRAME_MS");
+    }
+
+    /// Takeover could press nine named keys and nothing a person types. A
+    /// page listens for `code` and `keyCode`, so a letter is not just text.
+    #[test]
+    fn a_key_becomes_what_chromium_expects() {
+        let d = key_descriptor("a").expect("a letter is a key");
+        assert_eq!(d.code, "KeyA");
+        assert_eq!(d.vk, 'A' as u32, "pages read the legacy keyCode");
+        assert_eq!(d.text.as_deref(), Some("a"));
+
+        // The browser already applied Shift, so the key IS the capital.
+        assert_eq!(key_descriptor("A").unwrap().text.as_deref(), Some("A"));
+        assert_eq!(key_descriptor("A").unwrap().code, "KeyA");
+        assert_eq!(key_descriptor("7").unwrap().code, "Digit7");
+        assert_eq!(key_descriptor(" ").unwrap().code, "Space");
+        assert_eq!(key_descriptor("F5").unwrap().vk, 116);
+        // Named keys keep their real identity and insert nothing...
+        assert_eq!(key_descriptor("Escape").unwrap().text, None);
+        // ...except Enter, which pages expect to carry a carriage return.
+        assert_eq!(key_descriptor("Enter").unwrap().text.as_deref(), Some("\r"));
+        // Non-ASCII typing still works: the text is the character.
+        assert_eq!(
+            key_descriptor("\u{e01}").unwrap().text.as_deref(),
+            Some("\u{e01}")
+        );
+        // An unknown key name is refused rather than sent as garbage.
+        assert!(key_descriptor("Frobnicate").is_none());
+        assert!(key_descriptor("").is_none());
+    }
+
+    /// A chord must not type. Chromium refuses a Meta chord's text on macOS
+    /// by itself — a live test of "cmd-A does not insert an a" passes with
+    /// this rule removed, which is why the rule is asserted HERE, on the
+    /// payload, where removing it fails. On Linux Ctrl-A would have selected
+    /// all and typed an "a" too.
+    #[test]
+    fn a_chord_carries_no_text_and_a_plain_key_does() {
+        let plain = key_events("key", &json!({ "key": "a" })).expect("plain a");
+        assert_eq!(plain.len(), 2, "one press and one release");
+        assert_eq!(plain[0]["type"], "keyDown");
+        assert_eq!(plain[0]["text"], "a");
+        assert_eq!(plain[1]["type"], "keyUp");
+
+        for held in ["ctrl", "meta"] {
+            let chord = key_events("key", &json!({ "key": "a", held: true })).expect("chord");
+            assert_eq!(
+                chord[0].get("text"),
+                None,
+                "{held}-a is a command, not an 'a'"
+            );
+            assert_eq!(
+                chord[0]["type"], "rawKeyDown",
+                "a key with no text is a rawKeyDown"
+            );
+        }
+        // Shift is not a command modifier: shift-A still types.
+        let shifted = key_events("key", &json!({ "key": "A", "shift": true })).expect("shift");
+        assert_eq!(shifted[0]["text"], "A");
+        assert_eq!(shifted[0]["modifiers"], 8);
+    }
+
+    /// A held key is a down with no up; the release is its own event. One
+    /// combined press was all takeover could send, so nothing could be held.
+    #[test]
+    fn keydown_and_keyup_are_separable() {
+        let down = key_events("keydown", &json!({ "key": "Shift" })).expect("down");
+        assert_eq!(down.len(), 1);
+        assert_eq!(down[0]["type"], "rawKeyDown");
+        let up = key_events("keyup", &json!({ "key": "Shift" })).expect("up");
+        assert_eq!(up.len(), 1);
+        assert_eq!(up[0]["type"], "keyUp");
+        assert!(key_events("keydown", &json!({ "key": "Frobnicate" })).is_err());
+    }
+
+    /// Alt=1, Ctrl=2, Meta=4, Shift=8. Getting this wrong is silent: the page
+    /// receives a keystroke, just not the one the human struck.
+    #[test]
+    fn modifiers_pack_into_chromiums_bitmask() {
+        assert_eq!(modifier_mask(&json!({})), 0);
+        assert_eq!(modifier_mask(&json!({ "alt": true })), 1);
+        assert_eq!(modifier_mask(&json!({ "ctrl": true })), 2);
+        assert_eq!(modifier_mask(&json!({ "meta": true })), 4);
+        assert_eq!(modifier_mask(&json!({ "shift": true })), 8);
+        assert_eq!(
+            modifier_mask(&json!({ "ctrl": true, "shift": true, "alt": true, "meta": true })),
+            15
+        );
+    }
+
+    /// The whole point of the phase, against a real Chromium: open a second
+    /// tab and the live view must move to it by itself.
+    ///
+    /// `#[ignore]` because it launches a browser — run it deliberately:
+    /// `cargo test --features gui --lib -- --ignored the_view_follows`
+    #[test]
+    #[ignore = "launches a real chromium"]
+    fn the_view_follows_a_second_tab_for_real() {
+        let endpoint = match arm(true) {
+            Some(e) => e,
+            None => return, // no chromium on this machine; nothing to prove
+        };
+        let _ = ensure_up();
+        trim_to_one_tab(&endpoint);
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = seen.clone();
+        let d: Dispatch = Arc::new(move |p: String| sink.lock().unwrap().push(p));
+        screencast_start(9_001, d).expect("screencast start");
+
+        let wait = |pred: &dyn Fn(&[String]) -> bool, what: &str| {
+            for _ in 0..80 {
+                if pred(&seen.lock().unwrap()) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            panic!("timed out waiting for {what}: {:?}", seen.lock().unwrap());
+        };
+        wait(
+            &|v| v.iter().any(|p| p.contains(r#""state":"live""#)),
+            "the first attach",
+        );
+        wait(
+            &|v| v.iter().any(|p| p.contains(r#""type":"browser_frame""#)),
+            "a frame",
+        );
+
+        let before: std::collections::HashSet<String> = rt()
+            .block_on(list_targets(&endpoint))
+            .expect("targets")
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        // However many tabs the persistent profile restored — the claim is
+        // about the DELTA, not the starting count.
+        let started_with = before.len();
+
+        // The agent opening a tab, in the only terms the engine sees. The new
+        // target is identified by its ID, not its URL: `/json/new` opens
+        // about:blank whatever is asked for, which is what made the first
+        // version of this assertion fail against code that was working.
+        let created = rt().block_on(async {
+            reqwest::Client::new()
+                .put(format!("{endpoint}/json/new"))
+                .send()
+                .await
+                .and_then(|r| r.error_for_status())
+                .is_ok()
+        });
+        assert!(created, "could not open a second tab over the DevTools API");
+
+        wait(
+            &|v| {
+                v.iter().any(|p| {
+                    p.contains(r#""type":"browser_tabs""#)
+                        && p.matches(r#""id":"#).count() == started_with + 1
+                })
+            },
+            "the tab strip to list both tabs",
+        );
+        wait(
+            &|_| {
+                attached()
+                    .lock()
+                    .unwrap()
+                    .as_deref()
+                    .is_some_and(|id| !before.contains(id))
+            },
+            "the view to follow the tab that was just opened",
+        );
+
+        screencast_stop(9_001);
+        assert!(
+            page_slot().lock().unwrap().is_none(),
+            "the last viewer leaving must drop the session"
+        );
+        shutdown();
+    }
+
+    /// Keyboard passthrough, end to end against a real page: type into an
+    /// input and read the value back out of the DOM. Unit tests can prove the
+    /// descriptor is well formed; only this proves Chromium agrees.
+    ///
+    /// `#[ignore]` — it launches a browser.
+    #[test]
+    #[ignore = "launches a real chromium"]
+    fn typing_reaches_the_page_and_a_chord_does_not_type() {
+        let endpoint = match arm(true) {
+            Some(e) => e,
+            None => return,
+        };
+        let _ = ensure_up();
+        trim_to_one_tab(&endpoint);
+        let d: Dispatch = Arc::new(|_| {});
+        screencast_start(9_002, d).expect("screencast start");
+        for _ in 0..80 {
+            if page_slot().lock().unwrap().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let session = page_slot()
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("a page session to type into");
+
+        let eval = |expr: &str| -> Value {
+            rt().block_on(session.call(
+                "Runtime.evaluate",
+                json!({ "expression": expr, "returnByValue": true }),
+            ))
+            .expect("Runtime.evaluate")
+        };
+        eval("document.body.innerHTML = '<input id=i>'; document.getElementById('i').focus(); 1");
+
+        for key in ["h", "i", " ", "A"] {
+            input("key", &json!({ "key": key, "shift": key == "A" }))
+                .unwrap_or_else(|e| panic!("key {key}: {e}"));
+        }
+        let typed = eval("document.getElementById('i').value");
+        assert_eq!(
+            typed.pointer("/result/value").and_then(Value::as_str),
+            Some("hi A"),
+            "the page should have received exactly what was typed"
+        );
+
+        // A chord does not type. Note what this does and does not prove:
+        // Chromium suppresses a Meta chord's text itself on macOS, so this
+        // assertion passes even with our own rule removed (verified by
+        // removing it). It is a guard on the behaviour, not on the arm —
+        // `a_chord_carries_no_text_and_a_plain_key_does` is the one that
+        // fails when the rule goes.
+        input("key", &json!({ "key": "a", "meta": true })).expect("cmd-a");
+        let after = eval("document.getElementById('i').value");
+        assert_eq!(
+            after.pointer("/result/value").and_then(Value::as_str),
+            Some("hi A"),
+            "cmd-a must not have typed an 'a'"
+        );
+
+        // Backspace is a named key with no text, and must still delete.
+        input("key", &json!({ "key": "Backspace" })).expect("backspace");
+        let after = eval("document.getElementById('i').value");
+        assert_eq!(
+            after.pointer("/result/value").and_then(Value::as_str),
+            Some("hi "),
+            "backspace should have removed the last character"
+        );
+
+        screencast_stop(9_002);
+        shutdown();
+    }
+
+    /// Two viewers, and neither one's stop may blank the other.
+    ///
+    /// The near-miss worth pinning: keying this registry on the address of
+    /// the client's `dispatch` `Arc` reads as reasonable and is wrong — the
+    /// desktop builds a fresh `Arc` for every IPC message, so a stop would
+    /// never match its own start and the stream would run forever. Identity
+    /// is `IpcContext::viewer_id`, minted once per connection.
+    #[test]
+    fn a_stop_from_one_viewer_leaves_the_other_watching() {
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let mk = |tag: &'static str, seen: Arc<Mutex<Vec<String>>>| -> Dispatch {
+            Arc::new(move |_p: String| seen.lock().unwrap().push(tag.to_string()))
+        };
+        viewers().lock().unwrap().clear();
+        viewers()
+            .lock()
+            .unwrap()
+            .insert(1, mk("desktop", seen.clone()));
+        viewers()
+            .lock()
+            .unwrap()
+            .insert(2, mk("phone", seen.clone()));
+
+        broadcast("{}".to_string());
+        assert_eq!(seen.lock().unwrap().len(), 2, "both viewers get the frame");
+
+        viewers().lock().unwrap().remove(&2);
+        seen.lock().unwrap().clear();
+        broadcast("{}".to_string());
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["desktop".to_string()],
+            "the phone left; the desktop must still be watching"
+        );
+        viewers().lock().unwrap().clear();
     }
 }

@@ -335,50 +335,54 @@ pub(crate) fn services_prompt_section(browser_active: bool) -> String {
             "**Browser automation** (Playwright tools active). Read pages as \
              TEXT, and read as little of it as the question needs. In cost order, \
              cheapest first:\n\
-             - `browser_find` — searches the page and returns only what matches. \
-             Reach for this FIRST whenever you know what you are looking for: a \
-             price, a status, one row of a table, whether a word is present.\n\
-             - `browser_snapshot` — the page's full text / accessibility tree. \
-             Correct for orienting yourself on a page you have not seen. It is \
-             the largest thing you can put in context, so do not use it as a \
-             reflex after every click — act, then read only what you need to \
-             confirm.\n\
+             - `browser_find(text:)` or `browser_find(regex:)` — searches the page \
+             and returns only what matches, with a few lines of context. Reach for \
+             it FIRST whenever you know what you are after: a price, a status, one \
+             row of a table, whether a word is present.\n\
+             - `browser_evaluate` — JavaScript against the real DOM, returning the \
+             value. When you know the shape of the page this is the cheapest read \
+             there is: `() => document.querySelector('.price').textContent` costs a \
+             few tokens where a snapshot costs thousands. It is also the only way \
+             to see what the accessibility tree does not carry — a `data-` \
+             attribute, an input's live `value`, element counts. Return ONE small \
+             extracted value, never `innerHTML`.\n\
+             - `browser_snapshot` — the full text / accessibility tree, and the \
+             most expensive thing you can put in context: one encyclopaedia \
+             article measures 889 KB, and it is capped, so you would read a \
+             fraction of it and not know which. **Almost always pass one of:**\n\
+             \u{20}\u{20}- `depth: 3` for the shape of the page without its \
+             contents — how to orient yourself;\n\
+             \u{20}\u{20}- `target: <ref>` to snapshot ONE element you already \
+             located;\n\
+             \u{20}\u{20}- `filename: \"page.txt\"` to write it into the \
+             workspace instead of your context, then `Grep` it — a few hundred \
+             tokens for a page that would otherwise cost sixty thousand.\n\
+             A bare `browser_snapshot` is a last resort, not a reflex after every \
+             click.\n\
              **A snapshot is not the page.** It is an accessibility tree, and \
-             product grids, cards and other list content frequently do not \
-             appear in it even though they are plainly on screen. It is also the \
-             result most likely to be truncated, leaving you looking at a small \
-             percentage of it. So NEVER report that something is absent on the \
-             strength of a snapshot or a `browser_find` that came back empty — \
-             confirm with `browser_evaluate` against the live DOM first. \
-             Answering \"there is no X here\" when X is on the user's screen is \
-             worse than any number of extra tool calls.\n\
-             - `browser_evaluate` — runs JavaScript against the real DOM and \
-             returns the value. When you know the shape of the page, this is by \
-             far the cheapest way to read it: \
-             `() => document.querySelector('.price').textContent` costs a few \
-             tokens where a snapshot costs thousands. It is also the only way to \
-             read things the accessibility tree does not carry — a `data-` \
-             attribute, an input's live `value`, computed style, element counts, \
-             or the shape of a JSON blob the page already fetched. Prefer \
-             returning ONE small extracted value over dumping `innerHTML`.\n\
-             - `browser_take_screenshot` — pixels, and a LAST resort. Only when \
-             the answer cannot be text: charts, canvases, text baked into an \
-             image, or a layout you must visually judge. Never screenshot to \
-             read text that a snapshot would have given you.\n\
+             product grids, cards and other list content often do not appear in it \
+             though they are plainly on screen. So NEVER report something absent \
+             on the strength of a snapshot or an empty `browser_find` — confirm \
+             with `browser_evaluate` against the live DOM first. Answering \"there \
+             is no X here\" when X is on the user's screen is worse than any \
+             number of extra calls.\n\
+             - `browser_take_screenshot` — pixels, a LAST resort. Only when the \
+             answer cannot be text: charts, canvases, text baked into an image, a \
+             layout you must judge visually. Never screenshot to read text.\n\
+             **When a page misbehaves, read what it did, do not screenshot the \
+             error.** `browser_console_messages` returns the console, and \
+             `browser_network_requests(filter: \"/api/\")` lists the requests the \
+             page actually made — then `browser_network_request` with the number \
+             for one request in full. A failed status code answers \"why is this \
+             page empty\" as no screenshot can. Both take `filename` too.\n\
              Interact by the refs a snapshot or find returns (`browser_click`, \
-             `browser_type`, `browser_fill_form`, `browser_select_option`) — \
-             `browser_fill_form` fills a whole form in one call, so prefer it \
-             over a chain of per-field types. After an action that navigates or \
-             submits, `browser_wait_for` the text you expect rather than \
-             snapshotting repeatedly to poll.\n\
-             A good loop is: `browser_find` or `browser_evaluate` to locate what \
-             you need \u{2192} act on it \u{2192} `browser_wait_for` the change you \
-             expect. Reach for a full `browser_snapshot` when you are lost or \
-             genuinely need the whole page, not between every step. For listings \
-             — search results, product grids, tables of rows — go straight to \
-             `browser_evaluate` with a `querySelectorAll` and return just the \
-             fields you need; it is both the cheapest and the only one that sees \
-             what the page actually rendered."
+             `browser_type`, `browser_fill_form`, `browser_select_option`); \
+             `browser_fill_form` fills a whole form in one call, so prefer it over \
+             per-field types. After a navigation or submit, `browser_wait_for` the \
+             text you expect instead of polling with snapshots.\n\
+             For listings — search results, product grids, tables of rows — go \
+             straight to `browser_evaluate` with a `querySelectorAll` returning \
+             just the fields you need."
                 .to_string(),
         );
     }
@@ -855,6 +859,60 @@ mod tests {
         assert!(
             !s.contains("browser_run_code_unsafe"),
             "must not advertise a tool the model cannot see"
+        );
+    }
+
+    /// dev-plan/65 #2: the expensive tool takes three arguments that make it
+    /// cheap, and the section never named any of them — so the model only ever
+    /// had all-or-nothing. `filename` is the big one: it writes the snapshot
+    /// into the workspace, where Grep reads it for a few hundred tokens
+    /// instead of sixty thousand.
+    #[test]
+    fn the_section_names_the_arguments_that_make_a_snapshot_cheap() {
+        let s = services_prompt_section(true);
+        for arg in ["depth", "target", "filename"] {
+            assert!(s.contains(arg), "snapshot's `{arg}` must be offered");
+        }
+        assert!(
+            s.contains("Grep"),
+            "filename is only useful if the model greps it"
+        );
+        // browser_find takes text/regex, not the `query` a reader might guess.
+        assert!(
+            s.contains("browser_find(text:)") || s.contains("browser_find(text:"),
+            "name find's real parameter"
+        );
+    }
+
+    /// The section is paid for on EVERY request the browser is on for, whether
+    /// or not the turn touches a page — measured at 2,815 bytes before
+    /// dev-plan/65 P2, against ~15 KB of tool schemas beside it. Naming the
+    /// cheap parameters is worth a little of that; drifting into an essay is
+    /// not, and nothing else in the file would notice.
+    #[test]
+    fn the_browser_section_stays_small_enough_to_pay_for_every_turn() {
+        // The difference between the two renders IS the browser section, so
+        // this measures it without depending on how the bullets are joined.
+        let cost = services_prompt_section(true).len() - services_prompt_section(false).len();
+        assert!(
+            cost < 3_200,
+            "browser section is {cost} bytes — it is standing cost on every \
+             request; cut prose before adding more"
+        );
+    }
+
+    /// The two tools that answer "why is this page empty" without pixels. The
+    /// article this whole subsystem came from is about reading the network,
+    /// and the section had never mentioned either one.
+    #[test]
+    fn the_section_offers_the_console_and_the_network() {
+        let s = services_prompt_section(true);
+        assert!(s.contains("browser_console_messages"));
+        assert!(s.contains("browser_network_requests"));
+        let at = |t: &str| s.find(t).expect("named");
+        assert!(
+            at("browser_network_requests") < at("Interact by the refs"),
+            "diagnosis comes before interaction, not as an afterthought"
         );
     }
 
