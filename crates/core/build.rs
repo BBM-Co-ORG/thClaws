@@ -22,12 +22,34 @@ fn main() {
     // Always re-run when build.rs itself changes.
     println!("cargo:rerun-if-changed=build.rs");
 
-    let sha = git(&["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".into());
-    let branch = git(&["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_else(|| "unknown".into());
-    let dirty = match git(&["status", "--porcelain"]) {
-        Some(s) if !s.trim().is_empty() => "1",
-        Some(_) => "0",
-        None => "0",
+    // A per-customer build compiles an exported tree with no .git; the build
+    // scripts pass the commit they exported instead.
+    for v in [
+        "THCLAWS_BUILD_GIT_SHA",
+        "THCLAWS_BUILD_GIT_BRANCH",
+        "THCLAWS_BUILD_GIT_DIRTY",
+    ] {
+        println!("cargo:rerun-if-env-changed={v}");
+    }
+    let given = |v: &str| std::env::var(v).ok().filter(|s| !s.trim().is_empty());
+    let sha = given("THCLAWS_BUILD_GIT_SHA")
+        .or_else(|| git(&["rev-parse", "--short", "HEAD"]))
+        .unwrap_or_else(|| "unknown".into());
+    let branch = given("THCLAWS_BUILD_GIT_BRANCH")
+        .or_else(|| git(&["rev-parse", "--abbrev-ref", "HEAD"]))
+        .unwrap_or_else(|| "unknown".into());
+    let dirty = match given("THCLAWS_BUILD_GIT_DIRTY") {
+        Some(d) => {
+            if d == "1" || d == "true" {
+                "1"
+            } else {
+                "0"
+            }
+        }
+        None => match git(&["status", "--porcelain"]) {
+            Some(s) if !s.trim().is_empty() => "1",
+            _ => "0",
+        },
     };
 
     let profile = std::env::var("PROFILE").unwrap_or_else(|_| "unknown".into());
@@ -116,6 +138,57 @@ fn main() {
     let require = forced || (!embedded_b64.is_empty() && !embedded_policy_b64.is_empty());
     println!("cargo:rustc-env=THCLAWS_POLICY_REQUIRED={}", require as u8);
 
+    // ── Customer profile (per-customer EE builds) ────────────────────
+    //
+    // `THCLAWS_CUSTOMER=<id>` gives the build its own user-level profile
+    // (`~/.config/thclaws-<id>`, keychain service `thclaws-<id>`) so it never
+    // reads — or writes — a regular install's keys and settings. Unset =
+    // empty = `thclaws`, unchanged.
+    println!("cargo:rerun-if-env-changed=THCLAWS_CUSTOMER");
+    let customer = std::env::var("THCLAWS_CUSTOMER").unwrap_or_default();
+    let customer = customer.trim();
+    if !customer.is_empty() && !valid_customer_id(customer) {
+        panic!(
+            "THCLAWS_CUSTOMER={customer:?} is not a valid customer id: \
+             lowercase letters, digits and '-', starting with a letter or digit, at most 32 characters"
+        );
+    }
+    println!("cargo:rustc-env=THCLAWS_CUSTOMER={customer}");
+
+    // ── Customer logo (per-customer EE builds) ───────────────────────
+    //
+    // `THCLAWS_CUSTOMER_LOGO` / `THCLAWS_CUSTOMER_LOGO_DARK` name image
+    // files baked into the binary so a running build is visibly the
+    // customer's even before a policy loads. Explicit env only — never a
+    // home-dir default, so a maintainer's machine cannot leak a logo into
+    // someone else's build. Unset = empty = open-core, unchanged.
+    let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
+    for (var, file, mime_var) in [
+        (
+            "THCLAWS_CUSTOMER_LOGO",
+            "customer_logo.bin",
+            "THCLAWS_CUSTOMER_LOGO_MIME",
+        ),
+        (
+            "THCLAWS_CUSTOMER_LOGO_DARK",
+            "customer_logo_dark.bin",
+            "THCLAWS_CUSTOMER_LOGO_DARK_MIME",
+        ),
+    ] {
+        println!("cargo:rerun-if-env-changed={var}");
+        let (bytes, mime) = match std::env::var(var) {
+            Ok(p) if !p.trim().is_empty() => {
+                println!("cargo:rerun-if-changed={p}");
+                let bytes =
+                    std::fs::read(&p).unwrap_or_else(|e| panic!("{var} at {p:?} unreadable: {e}"));
+                (bytes, logo_mime(&p))
+            }
+            _ => (Vec::new(), ""),
+        };
+        std::fs::write(out_dir.join(file), bytes).expect("write customer logo");
+        println!("cargo:rustc-env={mime_var}={mime}");
+    }
+
     // ── Bundled SSO credentials ──────────────────────────────────────
     //
     // Official release builds bake in the OAuth client IDs so the
@@ -195,6 +268,23 @@ fn embed_windows_icon() {}
 /// pick it up."
 /// Conventional path for the signed policy at build time, mirroring
 /// `default_pubkey_path`. Same directory the runtime searches last.
+/// Image MIME type from the logo's extension. Anything unrecognised is
+/// refused at build time rather than served with a guessed type.
+fn logo_mime(path: &str) -> &'static str {
+    match std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("svg") => "image/svg+xml",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        _ => panic!("customer logo {path:?}: use a .png, .svg, .jpg or .webp file"),
+    }
+}
+
 fn default_policy_path() -> Option<String> {
     let home = std::env::var("HOME")
         .ok()
@@ -391,4 +481,15 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
     let y = y + if m <= 2 { 1 } else { 0 };
     (y, m, d)
+}
+
+/// `^[a-z0-9][a-z0-9-]{0,31}$` — the id becomes a directory and a keychain
+/// service name.
+fn valid_customer_id(id: &str) -> bool {
+    let b = id.as_bytes();
+    !b.is_empty()
+        && b.len() <= 32
+        && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
+        && b.iter()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
 }

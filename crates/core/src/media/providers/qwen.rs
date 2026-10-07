@@ -49,7 +49,77 @@ const MODELS: &[ImageModelInfo] = &[
         aliases: &["qwen-3-pro", "qwen-image-3.0-pro"],
         label: "Qwen Image 3.0 Pro",
     },
+    ImageModelInfo {
+        id: "qwen-image-max",
+        aliases: &["qwen-max", "qwen-image-max"],
+        label: "Qwen Image Max",
+    },
+    ImageModelInfo {
+        id: "qwen-image-plus",
+        aliases: &["qwen-plus", "qwen-image-plus"],
+        label: "Qwen Image Plus",
+    },
+    ImageModelInfo {
+        id: "qwen-image-edit-plus",
+        aliases: &["qwen-edit", "qwen-image-edit-plus"],
+        label: "Qwen Image Edit Plus (image→image)",
+    },
+    ImageModelInfo {
+        id: "qwen-image-edit-max",
+        aliases: &["qwen-edit-max", "qwen-image-edit-max"],
+        label: "Qwen Image Edit Max (image→image)",
+    },
+    ImageModelInfo {
+        id: "qwen-image-edit",
+        aliases: &["qwen-image-edit"],
+        label: "Qwen Image Edit (image→image)",
+    },
+    ImageModelInfo {
+        id: "wan2.7-image",
+        aliases: &["wan-image", "wan2.7-image"],
+        label: "Wan 2.7 Image",
+    },
+    ImageModelInfo {
+        id: "wan2.7-image-pro",
+        aliases: &["wan-image-pro", "wan2.7-image-pro"],
+        label: "Wan 2.7 Image Pro",
+    },
+    ImageModelInfo {
+        id: "z-image-turbo",
+        aliases: &["z-image", "z-image-turbo"],
+        label: "Z-Image Turbo (text→image)",
+    },
 ];
+
+/// Request shapes on the multimodal-generation endpoint differ by family
+/// (Model Studio API reference, checked live 2026-09-29).
+#[derive(Debug, PartialEq)]
+enum Family {
+    /// qwen-image-2.0/3.0 (+pro): 2K tiles, `n`, `negative_prompt`.
+    Qwen,
+    /// qwen-image-max/-plus: text→image only, their own five sizes.
+    QwenFixed,
+    /// qwen-image-edit*: image→image, output follows the input — no `size`.
+    QwenEdit,
+    /// wan2.7-image(-pro): text→image or editing, no `negative_prompt`.
+    Wan,
+    /// z-image-turbo: text→image only, `size` + `prompt_extend`.
+    ZImage,
+}
+
+fn family(model: &str) -> Family {
+    if model.starts_with("qwen-image-edit") {
+        Family::QwenEdit
+    } else if model.starts_with("qwen-image-max") || model.starts_with("qwen-image-plus") {
+        Family::QwenFixed
+    } else if model.starts_with("wan") {
+        Family::Wan
+    } else if model.starts_with("z-image") {
+        Family::ZImage
+    } else {
+        Family::Qwen
+    }
+}
 
 pub struct QwenImageProvider;
 
@@ -74,6 +144,60 @@ impl QwenImageProvider {
             _ => "2688*1536", // 16:9 default
         }
     }
+
+    /// qwen-image-max/-plus accept exactly these five.
+    fn fixed_size(req: &ImageRequest) -> &'static str {
+        match req.aspect_ratio.as_str() {
+            "1:1" => "1328*1328",
+            "9:16" => "928*1664",
+            "3:4" => "1104*1472",
+            "4:3" => "1472*1104",
+            _ => "1664*928",
+        }
+    }
+
+    /// z-image-turbo tops out at 2048*2048 total pixels.
+    fn z_size(req: &ImageRequest) -> &'static str {
+        match req.aspect_ratio.as_str() {
+            "1:1" => "1536*1536",
+            "9:16" => "1152*2048",
+            "3:4" => "1296*1728",
+            "4:3" => "1728*1296",
+            _ => "2048*1152",
+        }
+    }
+
+    fn parameters(req: &ImageRequest) -> Result<Value> {
+        let editing = !req.input_images.is_empty();
+        let fam = family(&req.model);
+        match fam {
+            Family::QwenFixed | Family::ZImage if editing => {
+                return Err(Error::Tool(format!(
+                    "{} is text→image only — use qwen-image-edit-plus (or wan2.7-image) to edit an image",
+                    req.model
+                )))
+            }
+            Family::QwenEdit if !editing => {
+                return Err(Error::Tool(format!(
+                    "{} edits an image — give it an input image, or use qwen-image-3.0 for text→image",
+                    req.model
+                )))
+            }
+            _ => {}
+        }
+        Ok(match fam {
+            Family::Qwen => json!({
+                "size": Self::size(req), "n": 1, "negative_prompt": "", "watermark": false
+            }),
+            Family::QwenFixed => json!({
+                "size": Self::fixed_size(req), "n": 1, "negative_prompt": "", "watermark": false
+            }),
+            Family::QwenEdit => json!({ "n": 1, "negative_prompt": "", "watermark": false }),
+            Family::Wan if editing => json!({ "n": 1, "watermark": false }),
+            Family::Wan => json!({ "size": Self::size(req), "n": 1, "watermark": false }),
+            Family::ZImage => json!({ "size": Self::z_size(req), "prompt_extend": false }),
+        })
+    }
 }
 
 #[async_trait]
@@ -91,20 +215,19 @@ impl ImageProvider for QwenImageProvider {
                 return Some(m.id.to_string());
             }
         }
-        // Forward-compat: accept any future `qwen-image*` id verbatim.
-        if raw.starts_with("qwen-image") {
+        // Forward-compat: accept any future id of these families verbatim.
+        if raw.starts_with("qwen-image")
+            || (raw.starts_with("wan") && raw.contains("-image"))
+            || raw.starts_with("z-image")
+        {
             return Some(raw.to_string());
         }
         None
     }
 
     async fn generate(&self, req: &ImageRequest) -> Result<ImageResult> {
-        let ep = crate::media::provider::resolve_endpoint(
-            &["DASHSCOPE_API_KEY"],
-            DASHSCOPE_BASE,
-            "dashscope",
-        )?;
-        let size = Self::size(req);
+        let parameters = Self::parameters(req)?;
+        let ep = crate::media::provider::resolve_dashscope_endpoint(DASHSCOPE_BASE)?;
 
         // content: image parts first (data URIs for local bytes), then
         // the text instruction — text2image is just the text part.
@@ -119,12 +242,7 @@ impl ImageProvider for QwenImageProvider {
         let body = json!({
             "model": req.model,
             "input": { "messages": [ { "role": "user", "content": content } ] },
-            "parameters": {
-                "size": size,
-                "n": 1,
-                "negative_prompt": "",
-                "watermark": false
-            }
+            "parameters": parameters,
         });
         let url = format!("{}{}", ep.base_url.trim_end_matches('/'), GEN_PATH);
         let client = Client::builder()
@@ -191,5 +309,71 @@ impl ImageProvider for QwenImageProvider {
             .map(|b| b.to_vec())
             .map_err(|e| Error::Tool(format!("qwen image body: {e}")))?;
         Ok(ImageResult { bytes })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req(model: &str, aspect: &str, images: usize) -> ImageRequest {
+        ImageRequest {
+            model: model.into(),
+            prompt: "p".into(),
+            input_images: (0..images)
+                .map(|_| crate::media::provider::InputImage {
+                    bytes: vec![0],
+                    mime: "image/png".into(),
+                })
+                .collect(),
+            aspect_ratio: aspect.into(),
+            size: String::new(),
+            text: Vec::new(),
+            font: None,
+        }
+    }
+
+    #[test]
+    fn each_family_sends_its_own_parameters() {
+        let p = |m: &str, a: &str, n: usize| QwenImageProvider::parameters(&req(m, a, n)).unwrap();
+        assert_eq!(p("qwen-image-3.0", "16:9", 0)["size"], "2688*1536");
+        assert_eq!(p("qwen-image-max", "9:16", 0)["size"], "928*1664");
+        assert_eq!(p("qwen-image-plus", "", 0)["size"], "1664*928");
+        assert!(p("qwen-image-edit-plus", "16:9", 1).get("size").is_none());
+        assert_eq!(p("wan2.7-image", "1:1", 0)["size"], "2048*2048");
+        assert!(p("wan2.7-image", "1:1", 1).get("size").is_none());
+        assert!(p("wan2.7-image", "1:1", 0).get("negative_prompt").is_none());
+        let z = p("z-image-turbo", "16:9", 0);
+        assert_eq!(z["size"], "2048*1152");
+        assert_eq!(z["prompt_extend"], false);
+        assert!(z.get("n").is_none());
+    }
+
+    #[test]
+    fn text_only_and_edit_only_models_refuse_the_wrong_input() {
+        let err = |m: &str, n: usize| QwenImageProvider::parameters(&req(m, "", n)).is_err();
+        assert!(err("qwen-image-max", 1));
+        assert!(err("z-image-turbo", 1));
+        assert!(err("qwen-image-edit-plus", 0));
+        assert!(!err("wan2.7-image", 1));
+    }
+
+    #[test]
+    fn new_models_resolve() {
+        let p = QwenImageProvider;
+        assert_eq!(p.resolve_model("z-image").as_deref(), Some("z-image-turbo"));
+        assert_eq!(
+            p.resolve_model("wan-image").as_deref(),
+            Some("wan2.7-image")
+        );
+        assert_eq!(
+            p.resolve_model("qwen-edit").as_deref(),
+            Some("qwen-image-edit-plus")
+        );
+        assert_eq!(
+            p.resolve_model("wan2.8-image").as_deref(),
+            Some("wan2.8-image")
+        );
+        assert!(p.resolve_model("wan2.7-t2v").is_none());
     }
 }

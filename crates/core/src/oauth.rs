@@ -69,7 +69,12 @@ pub struct TokenEntry {
 
 impl TokenStore {
     fn path() -> Option<PathBuf> {
-        crate::util::home_dir().map(|h| h.join(".config/thclaws/oauth_tokens.json"))
+        crate::util::home_dir().map(|h| {
+            h.join(format!(
+                ".config/{}/oauth_tokens.json",
+                crate::profile::app_dir_name()
+            ))
+        })
     }
 
     pub fn load() -> Self {
@@ -832,8 +837,9 @@ fn open_browser(url: &str) {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
-        let _ = std::process::Command::new("cmd")
-            .args(["/c", "start", url])
+        // Not `cmd /c start`: cmd.exe splits the URL at every '&'.
+        let _ = std::process::Command::new("rundll32")
+            .args(["url.dll,FileProtocolHandler", url])
             .creation_flags(0x08000000)
             .spawn();
     }

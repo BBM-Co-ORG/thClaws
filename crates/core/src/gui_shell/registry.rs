@@ -322,7 +322,10 @@ impl Default for ShellRegistry {
 /// the same shells anyway in that degenerate case).
 pub fn user_shell_dir() -> PathBuf {
     if let Some(home) = crate::util::home_dir() {
-        return home.join(".config").join("thclaws").join("gui-shell");
+        return home
+            .join(".config")
+            .join(crate::profile::app_dir_name())
+            .join("gui-shell");
     }
     PathBuf::from(".thclaws").join("gui-shell")
 }
@@ -359,7 +362,10 @@ fn shadow_dir_for(shell_id: &str) -> Result<PathBuf> {
     } else {
         home.join(".cache")
     };
-    Ok(cache_base.join("thclaws").join("gui-shell").join(shell_id))
+    Ok(cache_base
+        .join(crate::profile::app_dir_name())
+        .join("gui-shell")
+        .join(shell_id))
 }
 
 /// Walk a discovery directory: each immediate subdirectory that

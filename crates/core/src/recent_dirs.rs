@@ -16,7 +16,12 @@ pub const MAX_RECENT_DIRS: usize = 3;
 /// Path to the persisted list. `None` when no home directory is
 /// available (sandboxed CI / minimal containers).
 pub fn recent_dirs_path() -> Option<std::path::PathBuf> {
-    crate::util::home_dir().map(|h| h.join(".config/thclaws/recent_dirs.json"))
+    crate::util::home_dir().map(|h| {
+        h.join(format!(
+            ".config/{}/recent_dirs.json",
+            crate::profile::app_dir_name()
+        ))
+    })
 }
 
 /// Load the persisted list, defaulting to empty on any missing /

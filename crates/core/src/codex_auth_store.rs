@@ -21,7 +21,7 @@ const PROFILE_AUTH_DIR: &str = "auth";
 /// `HOME` resolution. Matches `secrets.rs` and `oauth.rs` conventions —
 /// thClaws does NOT use macOS `Library/Application Support/` even on macOS.
 fn thclaws_config_dir() -> Option<PathBuf> {
-    crate::util::home_dir().map(|h| h.join(".config").join("thclaws"))
+    crate::util::home_dir().map(|h| h.join(".config").join(crate::profile::app_dir_name()))
 }
 
 fn sanitize_profile_name(profile: &str) -> String {

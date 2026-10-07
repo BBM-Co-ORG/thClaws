@@ -51,6 +51,11 @@ pub fn enabled() -> bool {
     if std::env::var("THCLAWS_INSIDE_DOCKER").ok().as_deref() == Some("1") {
         return false;
     }
+    // An org build updates from its org's download page, never the public
+    // releases; `desktop_update` covers it.
+    if crate::policy::thclaws_cloud_url().is_some() {
+        return false;
+    }
     !matches!(
         std::env::var("THCLAWS_UPDATE_CHECK").ok().as_deref(),
         Some("0") | Some("false") | Some("off")
@@ -152,7 +157,10 @@ fn cache_path() -> Option<PathBuf> {
     } else {
         home.join(".cache")
     };
-    Some(base.join("thclaws").join("update-check.json"))
+    Some(
+        base.join(crate::profile::app_dir_name())
+            .join("update-check.json"),
+    )
 }
 
 /// `Some(update)` when `tag` names a release newer than this binary.

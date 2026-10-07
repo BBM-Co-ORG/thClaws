@@ -91,7 +91,10 @@ impl MessengerConfig {
     /// had their binding here.
     pub fn legacy_user_path() -> Result<PathBuf, MessengerConfigError> {
         let home = crate::util::home_dir().ok_or(MessengerConfigError::NoHome)?;
-        Ok(home.join(".config").join("thclaws").join("messenger.json"))
+        Ok(home
+            .join(".config")
+            .join(crate::profile::app_dir_name())
+            .join("messenger.json"))
     }
 
     /// Read from disk. Project path first; legacy user path as

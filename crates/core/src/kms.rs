@@ -350,7 +350,8 @@ pub(crate) fn with_kms_lock<T>(kref: &KmsRef, f: impl FnOnce() -> T) -> T {
 }
 
 fn user_root() -> Option<PathBuf> {
-    crate::util::home_dir().map(|h| h.join(".config/thclaws/kms"))
+    crate::util::home_dir()
+        .map(|h| h.join(format!(".config/{}/kms", crate::profile::app_dir_name())))
 }
 
 const PROJECT_KMS_DIR: &str = ".thclaws/state/kms";
@@ -3620,7 +3621,7 @@ pub fn write_frontmatter(map: &std::collections::BTreeMap<String, String>, body:
 // `KmsWrite` / `KmsAppend` tools and the `/kms file-answer` slash
 // command bypass `Sandbox::check_write` to land inside the KMS root
 // (project-scope `.thclaws/state/kms/.../pages/...` is otherwise blocked).
-// Same pattern as TodoWrite's intentional `.thclaws/todos.md` carve-
+// Same pattern as TodoWrite's intentional `.thclaws/state/todos.md` carve-
 // out: the path is computed from a validated KMS name + a validated
 // page name (no `..`, no path separators, no symlinks, must resolve
 // inside the KMS root via `KmsRef::page_path`-style canonicalization).

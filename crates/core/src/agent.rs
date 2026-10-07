@@ -876,6 +876,9 @@ pub struct Agent {
     pub max_iterations: usize,
     pub max_retries: usize,
     pub thinking_budget: Option<u32>,
+    /// Prototype: run a browser step with thinking off. See
+    /// [`BrowserStepThinking`] and `config::AppConfig::browser_fast_steps`.
+    pub browser_fast_steps: bool,
     pub permission_mode: PermissionMode,
     /// Tool names that always trip the approval gate, even under
     /// `PermissionMode::Auto` (config `askTools`). Interactive-only — with
@@ -967,6 +970,88 @@ fn cross_provider_kind(
     (Some(wanted) != current).then_some(wanted)
 }
 
+/// Prototype: decide what a browser step is worth thinking about.
+///
+/// A browse alternates between two kinds of turn. One is a plan — "find the
+/// cheapest flight, then book it" — and deserves the session's thinking level.
+/// The other is mechanical: the snapshot is in the transcript, the elements
+/// are enumerated with refs, and the only question is which ref comes next.
+/// Decision-model work (Jev, Kev and the rest) earns its speed by answering
+/// the second kind in a single pass, and the same split is available here for
+/// free, because a browser step is already recognisable from the tools the
+/// previous iteration called.
+///
+/// So: an iteration that follows browser-only tool calls runs with thinking
+/// OFF, and the moment the step stops looking mechanical it goes back to the
+/// configured level. Two signals end it, both cheap and both observed rather
+/// than guessed at:
+///
+/// - **A repeat.** The same tool aimed at the same target twice running means
+///   the last action did not do what the model expected. That is the point to
+///   start thinking, not the point to try it a third time.
+/// - **Anything else in the mix.** One non-browser call — a read, a shell
+///   command, a subagent — and the turn is no longer a step.
+///
+/// Off by default. It buys latency with reasoning, and which way that trade
+/// lands is the thing to measure, not to assume.
+#[derive(Debug, Default)]
+struct BrowserStepThinking {
+    /// The previous iteration called browser tools and nothing else.
+    following_browser: bool,
+    /// `name(target)` of the previous iteration's calls, to catch a repeat.
+    last_signature: Option<String>,
+}
+
+impl BrowserStepThinking {
+    /// A browser tool by either of the names it can arrive under: native, or
+    /// namespaced by the MCP server that provides it.
+    fn is_browser_tool(name: &str) -> bool {
+        name.starts_with("browser_") || name.contains("__browser_")
+    }
+
+    /// What identifies a step, for spotting one repeated. The element ref is
+    /// what makes two clicks the same click; without it every click on a page
+    /// would look like a repeat.
+    fn signature(calls: &[(String, serde_json::Value)]) -> String {
+        calls
+            .iter()
+            .map(|(name, input)| {
+                let target = ["ref", "element", "selector", "url"]
+                    .iter()
+                    .find_map(|k| input.get(*k).and_then(|v| v.as_str()))
+                    .unwrap_or("");
+                format!("{name}({target})")
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// The budget for the iteration about to run.
+    fn budget(&self, configured: Option<u32>) -> Option<u32> {
+        if self.following_browser {
+            Some(0)
+        } else {
+            configured
+        }
+    }
+
+    /// Record what this iteration called, and decide whether the next one is
+    /// still a step.
+    fn observe(&mut self, calls: &[(String, serde_json::Value)]) {
+        if calls.is_empty() || !calls.iter().all(|(n, _)| Self::is_browser_tool(n)) {
+            self.following_browser = false;
+            self.last_signature = None;
+            return;
+        }
+        let signature = Self::signature(calls);
+        let repeated = self.last_signature.as_deref() == Some(signature.as_str());
+        self.last_signature = Some(signature);
+        // A repeat means the page did not answer the way the model expected.
+        // Hand the next iteration its full thinking back.
+        self.following_browser = !repeated;
+    }
+}
+
 impl Agent {
     pub fn new(
         provider: Arc<dyn Provider>,
@@ -991,6 +1076,7 @@ impl Agent {
             max_iterations: 200,
             max_retries: 3,
             thinking_budget: None,
+            browser_fast_steps: false,
             permission_mode: PermissionMode::Auto,
             ask_tools: Vec::new(),
             approver: Arc::new(AutoApprover),
@@ -1119,6 +1205,12 @@ impl Agent {
     /// (`config.thinking_budget`; see `providers::ThinkingLevel`).
     pub fn with_thinking_budget(mut self, budget: Option<u32>) -> Self {
         self.thinking_budget = budget;
+        self
+    }
+
+    /// Prototype — see [`BrowserStepThinking`].
+    pub fn with_browser_fast_steps(mut self, on: bool) -> Self {
+        self.browser_fast_steps = on;
         self
     }
 
@@ -1292,6 +1384,10 @@ impl Agent {
         let max_iterations = self.max_iterations;
         let max_retries = self.max_retries;
         let thinking_budget = self.thinking_budget;
+        // Copied out with the rest: `try_stream!` builds a 'static stream, so
+        // anything it reads from `self` would borrow the agent for as long as
+        // the stream lives.
+        let browser_fast_steps = self.browser_fast_steps;
         // Captured here only as the *fallback* default when no global mode
         // has been set yet. The actual gate at tool-dispatch time reads
         // `permissions::current_mode()` so EnterPlanMode / ExitPlanMode /
@@ -1309,6 +1405,10 @@ impl Agent {
         let injection_queue = self.injection_queue.clone();
 
         try_stream! {
+            // One turn id for every gateway call this turn makes, so a quota
+            // install lets an admitted turn finish (`gateway_turn`). Nested
+            // turns (subagents) reuse the open one.
+            let _turn = crate::gateway_turn::TurnGuard::begin();
             {
                 let mut h = history.lock().expect("history lock");
                 h.push(Message {
@@ -1331,6 +1431,9 @@ impl Agent {
 
             // 0 means unlimited.
             let effective_max = if max_iterations == 0 { usize::MAX } else { max_iterations };
+            // Prototype: thinking is a session-wide setting, but a browse is
+            // not one kind of turn. This carries the per-iteration answer.
+            let mut browser_step = BrowserStepThinking::default();
             for iteration in 0..effective_max {
                 yield AgentEvent::IterationStart { iteration };
 
@@ -1500,7 +1603,11 @@ impl Agent {
                     messages,
                     tools: tool_defs,
                     max_tokens: request_max_tokens,
-                    thinking_budget,
+                    thinking_budget: if browser_fast_steps {
+                        browser_step.budget(thinking_budget)
+                    } else {
+                        thinking_budget
+                    },
                     stream_chunk_timeout_override: chunk_timeout_override,
                 };
                 if let Some(m) = &masker {
@@ -1525,7 +1632,10 @@ impl Agent {
                         match active_provider.stream(req.clone()).await {
                             Ok(s) => { stream_result = Some(s); break; }
                             Err(e) => {
-                                let is_config = matches!(e, Error::Config(_));
+                                // A spent credit quota stays spent; a rate-limit 429 clears.
+                                let is_config = matches!(e, Error::Config(_))
+                                    || crate::providers::is_quota_exceeded(&e.to_string())
+                                    || crate::desktop_update::is_client_update_required(&e.to_string());
                                 if !is_config && attempt < max_retries {
                                     let delay = tokio::time::Duration::from_secs(1 << attempt);
                                     eprintln!(
@@ -1811,6 +1921,21 @@ impl Agent {
                 // these tools (they clear every guard anyway). Any other mix
                 // (mutating tools, approvals, parse errors) leaves the flag
                 // false and falls through to the sequential loop unchanged.
+                // Before dispatch, so the NEXT iteration knows whether this
+                // one was a browser step. Reading it after would mean reading
+                // it once per dispatch path.
+                if browser_fast_steps {
+                    let calls: Vec<(String, Value)> = turn_tool_uses
+                        .iter()
+                        .filter_map(|tu| match tu {
+                            ContentBlock::ToolUse { name, input, .. } => {
+                                Some((name.clone(), input.clone()))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    browser_step.observe(&calls);
+                }
                 let mut handled_concurrently = false;
                 {
                     let exec: Vec<(String, String, Value)> = turn_tool_uses
@@ -2829,6 +2954,79 @@ pub struct AgentTurnOutcome {
     pub stop_reason: Option<String>,
     pub usage: Option<Usage>,
     pub iterations: usize,
+}
+
+#[cfg(test)]
+mod browser_step_thinking_tests {
+    use super::BrowserStepThinking as B;
+    use serde_json::json;
+
+    fn call(name: &str, target: &str) -> (String, serde_json::Value) {
+        (name.to_string(), json!({ "ref": target }))
+    }
+
+    #[test]
+    fn a_browser_tool_is_recognised_under_either_name() {
+        assert!(B::is_browser_tool("browser_click"));
+        assert!(B::is_browser_tool("playwright__browser_click"));
+        assert!(!B::is_browser_tool("Read"));
+        assert!(!B::is_browser_tool("browserify"));
+    }
+
+    #[test]
+    fn a_step_after_browser_calls_costs_no_thinking() {
+        let mut b = B::default();
+        assert_eq!(
+            b.budget(Some(32_000)),
+            Some(32_000),
+            "the first turn is a plan"
+        );
+        b.observe(&[call("browser_click", "@21")]);
+        assert_eq!(b.budget(Some(32_000)), Some(0), "the next one is a step");
+    }
+
+    #[test]
+    fn one_non_browser_call_ends_the_step() {
+        let mut b = B::default();
+        b.observe(&[call("browser_click", "@21")]);
+        b.observe(&[call("browser_click", "@22"), ("Read".into(), json!({}))]);
+        assert_eq!(b.budget(Some(32_000)), Some(32_000));
+    }
+
+    /// The signal that the page did not answer as expected. Thinking comes
+    /// back rather than the same click being tried a third time.
+    #[test]
+    fn the_same_click_twice_hands_thinking_back() {
+        let mut b = B::default();
+        b.observe(&[call("browser_click", "@21")]);
+        assert_eq!(b.budget(Some(32_000)), Some(0));
+        b.observe(&[call("browser_click", "@21")]);
+        assert_eq!(b.budget(Some(32_000)), Some(32_000), "a repeat is a stall");
+    }
+
+    #[test]
+    fn a_different_target_is_progress_not_a_repeat() {
+        let mut b = B::default();
+        b.observe(&[call("browser_click", "@21")]);
+        b.observe(&[call("browser_click", "@22")]);
+        assert_eq!(b.budget(Some(32_000)), Some(0));
+    }
+
+    #[test]
+    fn a_turn_with_no_tools_is_not_a_step() {
+        let mut b = B::default();
+        b.observe(&[call("browser_click", "@21")]);
+        b.observe(&[]);
+        assert_eq!(b.budget(Some(32_000)), Some(32_000));
+    }
+
+    /// Off a browse the policy must be invisible: whatever was configured is
+    /// what goes out, including `auto`.
+    #[test]
+    fn auto_survives_when_nothing_browsed() {
+        let b = B::default();
+        assert_eq!(b.budget(None), None);
+    }
 }
 
 #[cfg(test)]

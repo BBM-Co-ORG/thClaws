@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { send, subscribe, type IPCMessage } from "../hooks/useIPC";
+import { currentBranding } from "../hooks/useBranding";
 import { ChatMarkdown } from "./ChatMarkdown";
 
 // docs/browser Phase 1 — the Browser tab for the engine-managed
@@ -725,7 +726,7 @@ export function BrowserView({ active }: { active: boolean }) {
                 <p className="text-xs mt-1 leading-relaxed" style={{ color: "#dc2626" }}>
                   ⚠ the browser server&apos;s command isn&apos;t on PATH — it can&apos;t start.
                   On desktop, install Node.js (e.g. <code>brew install node</code>) and
-                  restart thClaws.
+                  restart {currentBranding().name}.
                 </p>
               )}
               {/* Why the live view is missing, rather than leaving the user to
@@ -744,7 +745,7 @@ export function BrowserView({ active }: { active: boolean }) {
                       ⓘ No Playwright Chromium found, so the <strong>live view and
                       takeover run on ~1 fps screenshots</strong>. Install it once for a
                       real live stream: <code>npx playwright install chromium</code>,
-                      then restart thClaws.
+                      then restart {currentBranding().name}.
                     </>
                   )}
                 </p>

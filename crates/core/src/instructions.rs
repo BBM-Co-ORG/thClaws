@@ -13,7 +13,12 @@
 /// always resolves (`current_dir().ok()` is the only failure path).
 pub fn instructions_path(scope: &str) -> Option<std::path::PathBuf> {
     match scope {
-        "global" => crate::util::home_dir().map(|h| h.join(".config/thclaws/AGENTS.md")),
+        "global" => crate::util::home_dir().map(|h| {
+            h.join(format!(
+                ".config/{}/AGENTS.md",
+                crate::profile::app_dir_name()
+            ))
+        }),
         // The workspace root, which every agent under a host shares and loads
         // `AGENTS.md` from; the process cwd when there is no host.
         _ => Some(crate::workdir::workspace_root().join("AGENTS.md")),

@@ -36,11 +36,14 @@ pub fn current_member_id() -> Option<String> {
 
 /// Attach the member header to an outbound request when a member scope
 /// is active — the single helper every gateway-capable HTTP site calls.
+/// Also the turn header (`gateway_turn`), added only when the request goes
+/// to the thClaws gateway.
 pub fn attach_member(rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-    match current_member_id() {
+    let rb = match current_member_id() {
         Some(id) => rb.header(MEMBER_HEADER, id),
         None => rb,
-    }
+    };
+    crate::gateway_turn::tag(rb)
 }
 
 #[cfg(test)]

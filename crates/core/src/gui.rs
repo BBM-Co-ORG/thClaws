@@ -728,7 +728,7 @@ fn pin_webview2_data_folder() {
         let local = std::env::var("LOCALAPPDATA")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| std::env::temp_dir());
-        let data_dir = local.join("thclaws").join("WebView2");
+        let data_dir = local.join(crate::profile::app_dir_name()).join("WebView2");
         let _ = std::fs::create_dir_all(&data_dir);
         // SAFETY: `set_var` is only unsafe in multi-threaded contexts;
         // we're single-threaded here at process start before any tokio
@@ -2053,11 +2053,14 @@ fn run_gui_inner(
                     "team_enabled": team_enabled,
                     "version": crate::version::VERSION,
                 });
-                let js = format!(
-                    "window.__thclaws_dispatch('{}')",
-                    escape_for_js(&state.to_string())
-                );
-                let _ = webview.evaluate_script(&js);
+                let cwd = std::env::current_dir().unwrap_or_default();
+                for frame in [
+                    state.to_string(),
+                    crate::tools::todo::todo_update_frame(&cwd),
+                ] {
+                    let js = format!("window.__thclaws_dispatch('{}')", escape_for_js(&frame));
+                    let _ = webview.evaluate_script(&js);
+                }
             }
             Event::UserEvent(UserEvent::QuitRequested) => {
                 request_gui_shutdown(&shared_for_events, control_flow, latest_window_size);

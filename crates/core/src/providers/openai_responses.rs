@@ -287,14 +287,14 @@ impl Provider for OpenAIResponsesProvider {
         let body = self.build_body(&req);
         let resp = self
             .apply_codex_headers(
-                self.client
-                    .post(&self.base_url)
+                crate::multi_tenant::attach_member(self.client.post(&self.base_url))
                     .header("authorization", format!("Bearer {}", self.api_key))
                     .header("content-type", "application/json"),
             )
             .json(&body)
             .send()
             .await
+            .inspect(crate::desktop_update::observe)
             .map_err(|e| Error::Provider(format!("http: {e}")))?;
 
         if !resp.status().is_success() {

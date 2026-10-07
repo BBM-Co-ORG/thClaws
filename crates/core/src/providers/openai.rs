@@ -493,6 +493,7 @@ impl OpenAIProvider {
         rb.json(body)
             .send()
             .await
+            .inspect(crate::desktop_update::observe)
             .map_err(|e| Error::Provider(format!("http: {e}")))
     }
 }
@@ -995,7 +996,12 @@ impl Provider for OpenAIProvider {
                         )));
                     }
                 }
-            } else if status.is_client_error() && carries_image && !too_large {
+            } else if status.is_client_error()
+                && carries_image
+                && !too_large
+                && !super::is_quota_exceeded(&text)
+                && !crate::desktop_update::is_client_update_required(&text)
+            {
                 let retry_body = self.build_body(&strip_request_images(&req));
                 match self.send_body(&retry_body).await {
                     Ok(r) if r.status().is_success() => resp = r,

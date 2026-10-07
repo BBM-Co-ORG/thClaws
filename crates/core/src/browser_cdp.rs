@@ -809,7 +809,10 @@ fn profile_dir_for(container: bool) -> PathBuf {
     let key = format!("{:016x}", hasher.finish());
     crate::util::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".cache/thclaws/browser-profile")
+        .join(format!(
+            ".cache/{}/browser-profile",
+            crate::profile::app_dir_name()
+        ))
         .join(key)
 }
 

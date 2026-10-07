@@ -162,11 +162,7 @@ const DASHSCOPE_BASE: &str = "https://dashscope-intl.aliyuncs.com";
 const DASHSCOPE_PATH: &str = "/api/v1/services/aigc/video-generation/video-synthesis";
 
 async fn dashscope_submit(payload: &Value) -> Result<String> {
-    let ep = crate::media::provider::resolve_endpoint(
-        &["DASHSCOPE_API_KEY"],
-        DASHSCOPE_BASE,
-        "dashscope",
-    )?;
+    let ep = crate::media::provider::resolve_dashscope_endpoint(DASHSCOPE_BASE)?;
     let resp: Value =
         crate::multi_tenant::attach_member(http().post(format!("{}{DASHSCOPE_PATH}", ep.base_url)))
             .bearer_auth(&ep.api_key)
@@ -190,11 +186,7 @@ async fn dashscope_submit(payload: &Value) -> Result<String> {
 }
 
 async fn dashscope_poll(task_id: &str, cancel: &AtomicBool) -> Result<String> {
-    let ep = crate::media::provider::resolve_endpoint(
-        &["DASHSCOPE_API_KEY"],
-        DASHSCOPE_BASE,
-        "dashscope",
-    )?;
+    let ep = crate::media::provider::resolve_dashscope_endpoint(DASHSCOPE_BASE)?;
     let started = std::time::Instant::now();
     loop {
         if cancel.load(Ordering::Relaxed) {

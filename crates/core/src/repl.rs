@@ -432,6 +432,10 @@ pub enum SlashCommand {
     /// is missing or whose manifest fails to parse. M6.16.1 BUG L2.
     PluginGc,
     Tasks,
+    /// `/todo` shows `.thclaws/state/todos.md`; `/todo clear` deletes it.
+    Todo {
+        clear: bool,
+    },
     Context,
     /// M6.39.4: print the active system prompt as the LLM currently
     /// sees it. Output mode selectable for compactness:
@@ -924,6 +928,8 @@ pub enum CloudSlash {
     List { mine: bool },
     /// `/cloud status` — show resolved URL + whether a token is stored.
     Status,
+    /// `/cloud doctor` — live check of sign-in: token storage, reach, account.
+    Doctor,
     /// `/cloud get <slug>` — install/update the given agent into cwd.
     /// Empty cwd → fresh extract. Non-empty cwd + matching agent UUID
     /// → safe overwrite. Non-empty cwd + mismatching/missing UUID →
@@ -1894,7 +1900,14 @@ pub fn parse_slash(input: &str) -> Option<SlashCommand> {
         "mcp" => parse_mcp_subcommand(args),
         "tools" | "tool" => SlashCommand::Tools,
         "plugin" | "plugins" => parse_plugin_subcommand(cmd, args),
-        "tasks" | "todo" => SlashCommand::Tasks,
+        "tasks" => SlashCommand::Tasks,
+        "todo" | "todos" => match args.trim() {
+            "" | "list" => SlashCommand::Todo { clear: false },
+            "clear" => SlashCommand::Todo { clear: true },
+            other => SlashCommand::Unknown(format!(
+                "unknown /todo subcommand '{other}' — use /todo or /todo clear"
+            )),
+        },
         "context" => SlashCommand::Context,
         "system" => {
             let trimmed = args.trim();
@@ -2250,6 +2263,7 @@ fn parse_cloud_subcommand(args: &str) -> SlashCommand {
         }
         "publish" => SlashCommand::Cloud(CloudSlash::Publish),
         "unbind" => SlashCommand::Cloud(CloudSlash::Unbind),
+        "doctor" | "diag" | "diagnose" => SlashCommand::Cloud(CloudSlash::Doctor),
         // `rev` because this is a thing you check often and mid-flow.
         "revision" | "rev" => {
             let norm = normalize_dashes(rest);
@@ -2308,7 +2322,7 @@ fn parse_cloud_subcommand(args: &str) -> SlashCommand {
         }
         other => SlashCommand::Unknown(format!(
             "unknown cloud subcommand: '{other}' \
-             (try: /cloud status, /cloud list [--mine], /cloud get <slug>, \
+             (try: /cloud status, /cloud doctor, /cloud list [--mine], /cloud get <slug>, \
              /cloud publish, /cloud unbind, /cloud revision, \
              /cloud push|pull [<slug>] [--delete] [--dry-run] [--force-rebind] [--force])"
         )),
@@ -4437,7 +4451,8 @@ pub fn built_in_commands() -> &'static [BuiltInCommand] {
         // Team
         BuiltInCommand { name: "subagent", description: "Run / manage named agent defs (<name> <prompt> · new · edit · cancel · list · install · marketplace · search · info)", category: "Team", usage: "<sub|name> [args]" },
         BuiltInCommand { name: "team",     description: "Show team agent status",                     category: "Team", usage: "" },
-        BuiltInCommand { name: "tasks",    description: "List current tasks/todos",                   category: "Team", usage: "" },
+        BuiltInCommand { name: "tasks",    description: "List the agent's Task-tool tasks",           category: "Team", usage: "" },
+        BuiltInCommand { name: "todo",     description: "Show the todo scratchpad (clear deletes it)", category: "Team", usage: "[clear]" },
 
         // Automation
         BuiltInCommand { name: "workflow", description: "Run multi-agent workflows",                  category: "Automation", usage: "run <goal> | exec <path> | list | inspect <id> | resume <id> | rm <id>" },
@@ -4652,7 +4667,8 @@ pub fn render_help() -> &'static str {
                        Toggle a plugin on/off without uninstalling it.\n  \
      /plugin show <name>\n  \
                        Show full manifest details for an installed plugin.\n  \
-     /tasks            List current tasks/todos\n  \
+     /tasks            List the agent's Task-tool tasks\n  \
+     /todo [clear]     Show the todo scratchpad; clear deletes it\n  \
      /context          Show the current system prompt\n  \
      /thinking BUDGET  Set extended-thinking token budget (0 = off)\n  \
      /cwd              Show current working directory\n  \
@@ -4750,6 +4766,8 @@ pub fn render_help() -> &'static str {
      \x20                   (fingerprints cached in FOLDER/.thclaws-index.json).\n  \
      /cloud status        Show the configured catalog URL + whether a\n  \
      \x20                   CLI token is stored.\n  \
+     /cloud doctor        Diagnose sign-in: where the token is stored,\n  \
+     \x20                   whether the cloud answers, which account.\n  \
      /cloud list [--mine] Browse thClaws.cloud catalog (dev-plan/34).\n  \
      /cloud get <slug>    Install or update an agent into the current\n  \
      \x20                   folder. Empty folder → fresh install.\n  \
@@ -4809,6 +4827,19 @@ pub fn build_provider(config: &AppConfig) -> Result<Arc<dyn Provider>> {
     {
         return Err(crate::error::Error::Config(format!(
             "shared agents are gateway-only — '{}' has no gateway route",
+            config.model
+        )));
+    }
+
+    // Gateway-locked install (THCLAWS_GATEWAY_PROVIDERS set): the same rule,
+    // keyed on the providers that install's gateway actually routes — so
+    // `/model` cannot reach the Agent SDK, a local runtime or any upstream
+    // the gateway does not serve.
+    if crate::shared::gateway_providers_locked()
+        && crate::providers::thclaws_gateway::for_kind(config, kind).is_none()
+    {
+        return Err(crate::error::Error::Config(format!(
+            "'{}' is not available on this deployment — only its gateway's models can be used",
             config.model
         )));
     }
@@ -5602,6 +5633,19 @@ pub async fn build_provider_with_fallback(
     //    user's settings.json is untouched and let the caller
     //    degrade gracefully. No silent swap to a paid provider.
     config.model = original;
+    if let Some(hint) = crate::providers::locked_sign_in_hint() {
+        let offered: Vec<&str> = crate::providers::locked_offered_providers()
+            .iter()
+            .map(|k| k.name())
+            .collect();
+        return (
+            None,
+            Some(format!(
+                "{hint} This deployment offers: {}.",
+                offered.join(", ")
+            )),
+        );
+    }
     (None, Some(
         format!(
             "no usable LLM provider for `{}` and no local fallback (Ollama / LMStudio / vLLM / llama.cpp) reachable. Set an API key via Settings → Provider API keys, run `/model <provider>/<model>` to switch, or start a local runtime (see Chapter 2).",
@@ -5744,6 +5788,7 @@ pub async fn run_print_mode_with(
     // Both binaries call THIS, not the `run_print_mode` wrapper — a hook on
     // the wrapper armed nothing and `-p` shipped PII unmasked.
     config.apply_process_globals();
+    crate::desktop_update::spawn_cli_check();
     let cwd = std::env::current_dir()?;
 
     let mut tool_registry = ToolRegistry::with_builtins();
@@ -5979,6 +6024,7 @@ pub async fn run_print_mode_with(
         .with_max_iterations(config.max_iterations)
         .with_max_tokens(config.max_tokens)
         .with_thinking_budget(config.thinking_budget)
+        .with_browser_fast_steps(config.browser_fast_steps)
         .with_permission_mode(perm_mode)
         .with_ask_tools(config.ask_tools.clone().unwrap_or_default())
         .with_hooks(hooks_arc.clone());
@@ -6362,6 +6408,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
     // ensures CLI users get the configurable timeout too (default
     // 120s, override via `stream_chunk_timeout_secs` in settings.json).
     config.apply_process_globals();
+    crate::desktop_update::spawn_cli_check();
 
     let cwd = std::env::current_dir()?;
     // Keep `memory_store` around for the `/memory list/show/dump/...`
@@ -6766,6 +6813,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
     .with_max_iterations(config.max_iterations)
     .with_max_tokens(config.max_tokens)
     .with_thinking_budget(config.thinking_budget)
+    .with_browser_fast_steps(config.browser_fast_steps)
     .with_permission_mode(perm_mode)
     .with_ask_tools(config.ask_tools.clone().unwrap_or_default())
     .with_approver(approver.clone())
@@ -8229,6 +8277,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     .with_max_iterations(config.max_iterations)
                     .with_max_tokens(config.max_tokens)
                     .with_thinking_budget(config.thinking_budget)
+        .with_browser_fast_steps(config.browser_fast_steps)
                     .with_permission_mode(perm_mode)
                     .with_approver(approver.clone())
                     .with_hooks(std::sync::Arc::new(config.hooks.clone()));
@@ -8258,10 +8307,23 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                 SlashCommand::Providers => {
                     use crate::providers::ProviderTier;
                     let current = config.detect_provider_kind().ok();
+                    let locked = crate::shared::gateway_providers_locked();
+                    let kinds = if locked {
+                        println!("{COLOR_BOLD}Available on this deployment (through its gateway):{COLOR_RESET}");
+                        match crate::providers::locked_sign_in_hint() {
+                            Some(hint) => {
+                                println!("{COLOR_YELLOW}{hint}{COLOR_RESET}");
+                                crate::providers::locked_offered_providers()
+                            }
+                            None => crate::providers::locked_install_providers(&config),
+                        }
+                    } else {
+                        ProviderKind::display_ordered()
+                    };
                     let mut last_tier: Option<ProviderTier> = None;
-                    for kind in ProviderKind::display_ordered() {
+                    for kind in kinds {
                         let tier = kind.tier();
-                        if Some(tier) != last_tier {
+                        if !locked && Some(tier) != last_tier {
                             let header = match tier {
                                 ProviderTier::Featured => "Featured (gateway-routable):",
                                 ProviderTier::Additional => "Additional (bring your own key):",
@@ -8325,6 +8387,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     .with_max_iterations(config.max_iterations)
                     .with_max_tokens(config.max_tokens)
                     .with_thinking_budget(config.thinking_budget)
+        .with_browser_fast_steps(config.browser_fast_steps)
                     .with_permission_mode(perm_mode)
                     .with_approver(approver.clone())
                     .with_hooks(std::sync::Arc::new(config.hooks.clone()));
@@ -8808,6 +8871,19 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                                 t.id, t.status, t.subject
                             );
                         }
+                    }
+                }
+                SlashCommand::Todo { clear } => {
+                    let root = std::env::current_dir().unwrap_or_default();
+                    if clear {
+                        crate::tools::todo::clear_todos(&root);
+                        println!("{COLOR_DIM}todos cleared{COLOR_RESET}");
+                    } else {
+                        let todos = crate::tools::todo::read_todos_from_disk(&root);
+                        println!(
+                            "{COLOR_DIM}{}{COLOR_RESET}",
+                            crate::tools::todo::render_todos(&todos)
+                        );
                     }
                 }
                 SlashCommand::Context => {
@@ -9387,6 +9463,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                                 .with_max_iterations(config.max_iterations)
                                 .with_max_tokens(config.max_tokens)
                                 .with_thinking_budget(config.thinking_budget)
+        .with_browser_fast_steps(config.browser_fast_steps)
                                 .with_permission_mode(perm_mode)
                                 .with_approver(approver.clone())
                                 .with_hooks(std::sync::Arc::new(config.hooks.clone()));
@@ -9474,6 +9551,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                                 .with_max_iterations(config.max_iterations)
                                 .with_max_tokens(config.max_tokens)
                                 .with_thinking_budget(config.thinking_budget)
+        .with_browser_fast_steps(config.browser_fast_steps)
                                 .with_permission_mode(perm_mode)
                                 .with_approver(approver.clone())
                                 .with_hooks(std::sync::Arc::new(config.hooks.clone()));
@@ -9959,7 +10037,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                         let project_prefix = std::env::current_dir()
                             .map(|p| p.join(".thclaws/skills"))
                             .unwrap_or_default();
-                        let user_prefix = home.join(".config/thclaws/skills");
+                        let user_prefix = home.join(format!(".config/{}/skills", crate::profile::app_dir_name()));
                         let claude_prefix = home.join(".claude/skills");
 
                         let level_of = |dir: &std::path::Path| -> &str {
@@ -10006,7 +10084,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     let project_prefix = std::env::current_dir()
                         .map(|p| p.join(".thclaws/skills"))
                         .unwrap_or_default();
-                    let user_prefix = home.join(".config/thclaws/skills");
+                    let user_prefix = home.join(format!(".config/{}/skills", crate::profile::app_dir_name()));
                     let skill_level = |dir: &std::path::Path| -> &str {
                         if dir.starts_with(&project_prefix) {
                             "project"
@@ -12384,6 +12462,12 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                                 println!("{line}");
                             }
                         }
+                        CloudSlash::Doctor => {
+                            let url = crate::cloud::resolve_cloud_url(None, cloud_cfg.as_ref());
+                            for line in crate::cloud::browser_login::doctor_lines(&url).await {
+                                println!("{line}");
+                            }
+                        }
                         CloudSlash::Unbind => {
                             for line in crate::cloud::cmd::unbind_lines() {
                                 println!("{line}");
@@ -14704,7 +14788,18 @@ mod tests {
     #[test]
     fn parse_slash_new_commands() {
         assert_eq!(parse_slash("/tasks"), Some(SlashCommand::Tasks));
-        assert_eq!(parse_slash("/todo"), Some(SlashCommand::Tasks));
+        assert_eq!(
+            parse_slash("/todo"),
+            Some(SlashCommand::Todo { clear: false })
+        );
+        assert_eq!(
+            parse_slash("/todo clear"),
+            Some(SlashCommand::Todo { clear: true })
+        );
+        assert!(matches!(
+            parse_slash("/todo nuke"),
+            Some(SlashCommand::Unknown(_))
+        ));
         assert_eq!(parse_slash("/context"), Some(SlashCommand::Context));
         assert_eq!(parse_slash("/version"), Some(SlashCommand::Version));
         assert_eq!(parse_slash("/v"), Some(SlashCommand::Version));

@@ -251,6 +251,9 @@ pub fn build_policy(
         ] {
             deny_read.push(h.join(d));
         }
+        if crate::profile::customer().is_some() {
+            deny_read.push(crate::profile::config_path(h, ""));
+        }
     }
     deny_read.extend(extra_deny_read.iter().cloned());
 

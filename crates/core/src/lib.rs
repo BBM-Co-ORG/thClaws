@@ -45,6 +45,7 @@ pub mod context;
 #[cfg(feature = "cost_bridge")]
 pub mod cost_bridge;
 pub mod deploy_client;
+pub mod desktop_update;
 pub mod doctor;
 pub mod dotenv;
 pub mod endpoints;
@@ -64,6 +65,7 @@ pub mod external_url;
 #[cfg(feature = "gui")]
 pub mod file_preview;
 pub mod filmscript;
+pub mod gateway_turn;
 pub mod goal_state;
 #[cfg(feature = "gui")]
 pub mod gui;
@@ -103,6 +105,7 @@ pub mod permissions;
 pub mod phone_home;
 pub mod plugins;
 pub mod policy;
+pub mod profile;
 pub mod prompts;
 pub mod providers;
 pub mod recent_dirs;

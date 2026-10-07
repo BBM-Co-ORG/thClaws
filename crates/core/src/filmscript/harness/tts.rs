@@ -29,7 +29,7 @@ const PAD_TO_SECS: &str = "2.2";
 /// Providers the dispatcher can resolve (for the error message + D3
 /// validation). Speech only in D2; music/SFX (AudioProvider, design B.1a)
 /// are a later extension.
-const KNOWN_PROVIDERS: &[&str] = &["elevenlabs", "openai", "gemini", "minimax"];
+const KNOWN_PROVIDERS: &[&str] = &["elevenlabs", "openai", "gemini", "minimax", "dashscope"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VoiceDef {
@@ -51,11 +51,10 @@ pub struct VoiceDef {
 /// example ids so a bare workspace still compiles.
 pub fn load_registry() -> BTreeMap<String, VoiceDef> {
     let mut reg: BTreeMap<String, VoiceDef> = BTreeMap::new();
-    for (id, provider, voice) in [
-        ("th-female-warm", "gemini", "Kore"),
-        ("th-male-low", "gemini", "Charon"),
-        ("narrator", "gemini", "Charon"),
-    ] {
+    for (id, provider, voice) in builtin_voices(
+        crate::media::registry::backend_reachable("gemini"),
+        crate::media::registry::backend_reachable("dashscope"),
+    ) {
         reg.insert(
             id.into(),
             VoiceDef {
@@ -72,6 +71,27 @@ pub fn load_registry() -> BTreeMap<String, VoiceDef> {
         }
     }
     reg
+}
+
+/// The built-in voice ids, on Gemini — or on Qwen3-TTS where only DashScope
+/// is reachable (a gateway-locked install such as SIS).
+fn builtin_voices(
+    gemini: bool,
+    dashscope: bool,
+) -> [(&'static str, &'static str, &'static str); 3] {
+    if !gemini && dashscope {
+        [
+            ("th-female-warm", "dashscope", "Cherry"),
+            ("th-male-low", "dashscope", "Ethan"),
+            ("narrator", "dashscope", "Ethan"),
+        ]
+    } else {
+        [
+            ("th-female-warm", "gemini", "Kore"),
+            ("th-male-low", "gemini", "Charon"),
+            ("narrator", "gemini", "Charon"),
+        ]
+    }
 }
 
 fn lang_name(lang: &str) -> &str {
@@ -130,6 +150,18 @@ pub async fn synthesize(
             KNOWN_PROVIDERS.join("|")
         ))
     })?;
+    if !crate::media::registry::backend_reachable(&def.provider) {
+        let avail: Vec<&str> = KNOWN_PROVIDERS
+            .iter()
+            .copied()
+            .filter(|p| crate::media::registry::backend_reachable(p))
+            .collect();
+        return Err(Error::Tool(format!(
+            "voice '{voice_id}': TTS provider '{}' is not available on this deployment — use a voice on: {}",
+            def.provider,
+            if avail.is_empty() { "(none)".to_string() } else { avail.join(", ") }
+        )));
+    }
     let req = TtsRequest {
         text,
         prompt: &prompt,
@@ -172,7 +204,6 @@ pub struct TtsRequest<'a> {
     pub voice: &'a str,
     pub model: Option<&'a str>,
     pub lang: &'a str,
-    #[allow(dead_code)]
     pub tone: Option<&'a str>,
 }
 
@@ -204,7 +235,38 @@ fn provider_for(name: &str) -> Option<Box<dyn TtsProvider>> {
         "openai" => Some(Box::new(OpenAiTts)),
         "gemini" => Some(Box::new(GeminiTts)),
         "minimax" => Some(Box::new(MiniMaxTts)),
+        "dashscope" => Some(Box::new(DashScopeTts)),
         _ => None,
+    }
+}
+
+/// Qwen3-TTS through DashScope (`sis` on SIS). Thai speaks in `Auto` mode;
+/// the tone hint steers delivery only on the instruct model.
+struct DashScopeTts;
+
+#[async_trait]
+impl TtsProvider for DashScopeTts {
+    fn caps(&self) -> TtsCaps {
+        TtsCaps {
+            id: "dashscope",
+            languages: &["th", "en"],
+            out_ext: "wav",
+            supports_style_prompt: false,
+        }
+    }
+    async fn synthesize(&self, req: &TtsRequest<'_>) -> Result<TtsAudio> {
+        Ok(TtsAudio {
+            bytes: crate::media::providers::dashscope_tts::synthesize_wav(
+                req.model
+                    .unwrap_or(crate::media::providers::dashscope_tts::DEFAULT_MODEL),
+                req.text,
+                req.voice,
+                req.lang,
+                req.tone,
+            )
+            .await?,
+            ext: "wav",
+        })
     }
 }
 
@@ -584,6 +646,16 @@ fn wrap_wav_24k_mono(pcm: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn builtin_voices_move_to_dashscope_only_when_gemini_is_unreachable() {
+        assert!(builtin_voices(true, true).iter().all(|v| v.1 == "gemini"));
+        assert!(builtin_voices(true, false).iter().all(|v| v.1 == "gemini"));
+        let sis = builtin_voices(false, true);
+        assert!(sis.iter().all(|v| v.1 == "dashscope"));
+        assert!(provider_for("dashscope").is_some());
+        assert!(KNOWN_PROVIDERS.contains(&"dashscope"));
+    }
+
     use super::*;
 
     #[test]

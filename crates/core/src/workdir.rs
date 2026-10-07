@@ -230,6 +230,9 @@ mod tests {
 
     #[tokio::test]
     async fn unscoped_falls_back_to_process_cwd() {
+        // Other tests move the process cwd under this lock; without it the
+        // two reads below can straddle one of those moves.
+        let _g = crate::kms::test_env_lock();
         let expected = std::env::current_dir().unwrap();
         assert_eq!(current_workdir(), expected);
         assert!(!workdir_is_scoped());

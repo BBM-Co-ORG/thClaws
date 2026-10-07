@@ -20,11 +20,10 @@
 //!
 //! ## Frontend
 //!
-//! GUI strings live in React. They'll consume branding through an IPC
-//! handler in a follow-up commit; for now the frontend renders the
-//! built-in "thClaws" strings unconditionally. Phase 1 covers the Rust
-//! surface; the React side is a small follow-up that doesn't gate the
-//! policy infrastructure.
+//! GUI strings live in React and read [`payload`] — pushed on every
+//! `frontend_ready` and answered on `branding_get` (IPC), and served at
+//! `GET /api/branding` in `--serve`. A per-customer build also embeds
+//! the customer's logo (`THCLAWS_CUSTOMER_LOGO`, build.rs).
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -126,6 +125,84 @@ fn materialize() -> Branding {
     b
 }
 
+/// Customer logo baked in at build time (`THCLAWS_CUSTOMER_LOGO`, see
+/// build.rs). Empty on open-core builds. Comes from the binary, not the
+/// policy, so a customer build is identifiable before any policy loads.
+const CUSTOMER_LOGO: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/customer_logo.bin"));
+const CUSTOMER_LOGO_MIME: &str = env!("THCLAWS_CUSTOMER_LOGO_MIME");
+const CUSTOMER_LOGO_DARK: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/customer_logo_dark.bin"));
+const CUSTOMER_LOGO_DARK_MIME: &str = env!("THCLAWS_CUSTOMER_LOGO_DARK_MIME");
+
+fn data_uri(bytes: &[u8], mime: &str) -> Option<String> {
+    use base64::Engine;
+    if bytes.is_empty() || mime.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    ))
+}
+
+/// `true` on a per-customer build that embeds a logo.
+pub fn has_customer_logo() -> bool {
+    !CUSTOMER_LOGO.is_empty()
+}
+
+/// SHA-256 of the embedded policy public key, hex, first 16 bytes — what a
+/// release manifest records, so support can match a laptop to its build.
+/// `None` on a build with no embedded key.
+pub fn embedded_pubkey_fingerprint() -> Option<String> {
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+    let raw = crate::policy::verify::EMBEDDED_PUBKEY_BASE64;
+    if raw.is_empty() {
+        return None;
+    }
+    let bytes = base64::engine::general_purpose::STANDARD.decode(raw).ok()?;
+    let d = Sha256::digest(&bytes);
+    Some(d[..16].iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// The frame the GUI renders branding from (`branding_get` IPC and
+/// `GET /api/branding`). `banner` is the policy's banner text only — the
+/// REPL's ASCII art default is not a GUI banner.
+pub fn payload() -> serde_json::Value {
+    let b = current();
+    let active = crate::policy::active();
+    let bp = active
+        .and_then(|a| a.policy.policies.branding.as_ref())
+        .filter(|p| p.enabled);
+    let banner = bp
+        .and_then(|p| p.banner_text.clone())
+        .filter(|s| !s.trim().is_empty());
+    let policy = active.map(|a| {
+        serde_json::json!({
+            "issuer": a.policy.issuer,
+            "issued_at": a.policy.issued_at,
+            "expires_at": a.policy.expires_at,
+            "key_source": a.key_source_label,
+        })
+    });
+    let logo = data_uri(CUSTOMER_LOGO, CUSTOMER_LOGO_MIME);
+    serde_json::json!({
+        "type": "branding",
+        "name": b.name,
+        "support_email": b.support_email,
+        "about": b.about_text,
+        "banner": banner,
+        "logo": logo,
+        "logo_dark": data_uri(CUSTOMER_LOGO_DARK, CUSTOMER_LOGO_DARK_MIME).or_else(|| logo.clone()),
+        "customer_build": has_customer_logo(),
+        "pubkey_fingerprint": embedded_pubkey_fingerprint(),
+        "policy": policy,
+        // An org gateway desktop signs in to this cloud instead of taking
+        // API keys; the GUI offers that sign-in where it would ask for a key.
+        "org_cloud_url": crate::policy::thclaws_cloud_url(),
+    })
+}
+
 /// Substitute branding placeholders into a template string. Replaces
 /// `{product}` with the product name and `{support_email}` with the
 /// support email. Other `{...}` placeholders are left untouched so
@@ -172,6 +249,43 @@ mod tests {
         };
         let out = format!("Hello, {{product}}!").replace("{product}", &b.name);
         assert_eq!(out, "Hello, ACME Agent!");
+    }
+
+    #[test]
+    fn data_uri_needs_bytes_and_mime() {
+        assert_eq!(data_uri(b"", "image/png"), None);
+        assert_eq!(data_uri(b"x", ""), None);
+        assert_eq!(
+            data_uri(b"hi", "image/png").as_deref(),
+            Some("data:image/png;base64,aGk=")
+        );
+    }
+
+    #[test]
+    fn payload_has_the_gui_fields() {
+        let p = payload();
+        assert_eq!(p["type"], "branding");
+        assert!(p["name"].is_string());
+        for k in [
+            "logo",
+            "logo_dark",
+            "banner",
+            "policy",
+            "pubkey_fingerprint",
+            "customer_build",
+        ] {
+            assert!(p.get(k).is_some(), "missing {k}");
+        }
+        assert_eq!(p["customer_build"].as_bool(), Some(has_customer_logo()));
+        if has_customer_logo() {
+            assert!(p["logo"].as_str().unwrap().starts_with("data:image/"));
+            assert!(
+                p["logo_dark"].is_string(),
+                "dark falls back to the light logo"
+            );
+        } else {
+            assert!(p["logo"].is_null());
+        }
     }
 
     #[test]

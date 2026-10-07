@@ -211,9 +211,13 @@ pub fn for_kind(config: &AppConfig, kind: ProviderKind) -> Option<GatewayOverlay
 }
 
 /// Metering is non-negotiable in these environments — BYOK never
-/// bypasses it (dev-plan/41/42/45).
+/// bypasses it (dev-plan/41/42/45). An org-locked desktop too: a key left
+/// in the shared env/keychain by a regular thClaws install (e.g. its own
+/// `SIS_API_KEY`) must not take the org's traffic off the gateway.
 fn gateway_forced() -> bool {
-    crate::workdir::is_multiuser() || crate::shared::is_active()
+    crate::workdir::is_multiuser()
+        || crate::shared::is_active()
+        || crate::shared::gateway_providers_locked()
 }
 
 /// A real BYOK key for `kind`: non-empty and not the hosted pods'
@@ -264,10 +268,16 @@ pub fn model_is_gateway_servable(model: &str) -> bool {
 /// [`GATEWAY_BASE_URL`]. `pub(crate)` so the media-generation tools
 /// route through the exact same base as the LLM path.
 pub(crate) fn resolve_base_url() -> String {
-    std::env::var("THCLAWS_GATEWAY_BASE_URL")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    base_url_for(
+        crate::policy::thclaws_gateway_url(),
+        std::env::var("THCLAWS_GATEWAY_BASE_URL").ok(),
+    )
+}
+
+/// A thClaws-gateway policy's URL outranks the env override.
+fn base_url_for(policy_url: Option<String>, env: Option<String>) -> String {
+    policy_url
+        .or_else(|| env.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()))
         .unwrap_or_else(|| GATEWAY_BASE_URL.to_string())
 }
 
@@ -277,6 +287,14 @@ pub(crate) fn resolve_base_url() -> String {
 /// from the SAME three sources as the LLM path (an env-only check made
 /// `TextToImage` blind to cloud-login / keychain gateway users).
 pub(crate) fn resolve_access_key() -> Option<String> {
+    // Under a thClaws-gateway policy the only credential is the user's
+    // own sign-in to the policy's cloud (per-user, revocable, subject to
+    // its domain/test-user rules). A `gateway` key left in the keychain —
+    // e.g. one minted against thclaws.cloud — belongs to another gateway
+    // and would only 401 there, or bill someone else.
+    if crate::shared::policy_gateway_mode() {
+        return crate::cloud::token();
+    }
     if let Ok(v) = std::env::var("THCLAWS_GATEWAY_API_KEY") {
         let trimmed = v.trim().to_string();
         if !trimmed.is_empty() {
@@ -298,6 +316,23 @@ pub(crate) fn resolve_access_key() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_policy_gateway_url_outranks_the_env_override() {
+        assert_eq!(
+            base_url_for(
+                Some("https://gateway.sis.example".into()),
+                Some("https://staging.example".into())
+            ),
+            "https://gateway.sis.example"
+        );
+        assert_eq!(
+            base_url_for(None, Some(" https://staging.example ".into())),
+            "https://staging.example"
+        );
+        assert_eq!(base_url_for(None, Some("  ".into())), GATEWAY_BASE_URL);
+        assert_eq!(base_url_for(None, None), GATEWAY_BASE_URL);
+    }
 
     /// SIS asked for the same usage reporting they saw on our side, which
     /// means their Qwen server has to ride the METERED path. Three of the

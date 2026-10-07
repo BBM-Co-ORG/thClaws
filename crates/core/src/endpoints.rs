@@ -16,7 +16,12 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 fn path() -> Option<PathBuf> {
-    crate::util::home_dir().map(|h| h.join(".config/thclaws/endpoints.json"))
+    crate::util::home_dir().map(|h| {
+        h.join(format!(
+            ".config/{}/endpoints.json",
+            crate::profile::app_dir_name()
+        ))
+    })
 }
 
 fn read_map() -> BTreeMap<String, String> {

@@ -3,6 +3,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { send, subscribe } from "../hooks/useIPC";
+import { currentBranding } from "../hooks/useBranding";
 import { promptHistory, recordPrompt } from "../hooks/promptHistory";
 import { useTheme } from "../hooks/useTheme";
 import { SlashCommandPopup } from "./SlashCommandPopup";
@@ -327,7 +328,7 @@ export function TerminalView({ active, modalOpen }: Props) {
         BANNER +
         "\x1b[0m" +
         "\r\n" +
-        "\x1b[2mthClaws — type a message, or /help for commands\x1b[0m\r\n",
+        `\x1b[2m${currentBranding().name} — type a message, or /help for commands\x1b[0m\r\n`,
     );
 
     // Wait briefly for `initial_state` to arrive before writing the

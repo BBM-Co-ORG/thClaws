@@ -245,6 +245,41 @@ pub struct GatewayPolicy {
     /// (read-only model) so users aren't completely blocked.
     #[serde(default)]
     pub read_only_local_models_allowed: bool,
+    /// `None` / `"openai_compat"` = the generic gateway above (the provider
+    /// is replaced by an OpenAI client at `url`). `"thclaws"` = the
+    /// customer's own thClaws gateway: the install runs locked to it the
+    /// way a hosted runner does (see [`thclaws_gateway`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// `kind: "thclaws"` only — the provider segments the gateway serves,
+    /// e.g. `["sis"]`. The same list `THCLAWS_GATEWAY_PROVIDERS` carries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<String>,
+    /// `kind: "thclaws"` only — the customer's cloud (sign-in, CLI token).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud_url: Option<String>,
+    /// `kind: "thclaws"` only — the model a desktop starts on when its
+    /// settings name one the gateway does not serve (e.g. the open-core
+    /// default). Must be under one of `providers`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+}
+
+pub const GATEWAY_KIND_THCLAWS: &str = "thclaws";
+const GATEWAY_KIND_OPENAI_COMPAT: &str = "openai_compat";
+
+impl GatewayPolicy {
+    fn kind_str(&self) -> &str {
+        self.kind
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .unwrap_or(GATEWAY_KIND_OPENAI_COMPAT)
+    }
+
+    pub fn is_thclaws(&self) -> bool {
+        self.kind_str().eq_ignore_ascii_case(GATEWAY_KIND_THCLAWS)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -334,6 +369,73 @@ pub fn runtime() -> Option<&'static RuntimePolicy> {
     active()
         .and_then(|a| a.policy.policies.runtime.as_ref())
         .filter(|r| r.enabled)
+}
+
+/// The active `gateway` block when it is the customer's own thClaws
+/// gateway (`kind: "thclaws"`). The single accessor every lock knob reads
+/// first — the routed/locked provider list, the gateway base URL, the
+/// cloud URL, gateway activation — so a policy-governed desktop behaves
+/// like a hosted runner whatever its env or settings say.
+pub fn thclaws_gateway() -> Option<&'static GatewayPolicy> {
+    active()
+        .and_then(|a| a.policy.policies.gateway.as_ref())
+        .filter(|g| g.enabled && g.is_thclaws())
+}
+
+/// The policy's thClaws gateway base URL, trailing slash trimmed.
+pub fn thclaws_gateway_url() -> Option<String> {
+    thclaws_gateway()
+        .map(|g| g.url.trim().trim_end_matches('/').to_string())
+        .filter(|u| !u.is_empty())
+}
+
+/// The policy's cloud URL (sign-in / CLI token), trailing slash trimmed.
+pub fn thclaws_cloud_url() -> Option<String> {
+    thclaws_gateway()
+        .and_then(|g| g.cloud_url.as_deref())
+        .map(|u| u.trim().trim_end_matches('/').to_string())
+        .filter(|u| !u.is_empty())
+}
+
+/// A provider failure that is really "can't reach the company gateway",
+/// rewritten to tell the user what to do. `None` unless a thClaws-kind
+/// gateway policy with `fail_closed` is active and `raw` is a network
+/// failure (DNS, connect, timeout).
+pub fn unreachable_gateway_message(raw: &str) -> Option<String> {
+    let g = thclaws_gateway().filter(|g| g.fail_closed)?;
+    network_failure_hint(raw, &g.url)
+}
+
+fn network_failure_hint(raw: &str, gateway_url: &str) -> Option<String> {
+    let lower = raw.to_ascii_lowercase();
+    let network = [
+        "error sending request",
+        "dns error",
+        "failed to lookup address",
+        "tcp connect error",
+        "connection refused",
+        "connection reset",
+        "timed out",
+        "operation timed out",
+        "no route to host",
+        "network is unreachable",
+    ]
+    .iter()
+    .any(|m| lower.contains(m));
+    if !network {
+        return None;
+    }
+    let host = gateway_url
+        .trim()
+        .split("://")
+        .last()
+        .unwrap_or(gateway_url)
+        .split(['/', ':'])
+        .next()
+        .unwrap_or(gateway_url);
+    Some(format!(
+        "Can't reach your organisation's AI gateway ({host}). Connect to the company network or VPN, then try again."
+    ))
 }
 
 /// Permission mode the org forces, lowercased. `None` = user's choice.
@@ -484,6 +586,41 @@ fn validate_policies(policy: &Policy, path: &Path) -> Result<(), PolicyError> {
                 message: "gateway.enabled but gateway.url is empty — would fail open at provider construction".into(),
             });
         }
+        let kind = g.kind_str();
+        if !kind.eq_ignore_ascii_case(GATEWAY_KIND_THCLAWS)
+            && !kind.eq_ignore_ascii_case(GATEWAY_KIND_OPENAI_COMPAT)
+        {
+            return Err(PolicyError::InvalidConfig {
+                path: path.to_path_buf(),
+                message: format!(
+                    "gateway.kind '{kind}' is not known — use \"{GATEWAY_KIND_THCLAWS}\" or \"{GATEWAY_KIND_OPENAI_COMPAT}\""
+                ),
+            });
+        }
+        if g.enabled && g.is_thclaws() && !g.providers.iter().any(|p| !p.trim().is_empty()) {
+            return Err(PolicyError::InvalidConfig {
+                path: path.to_path_buf(),
+                message: "gateway.kind \"thclaws\" needs gateway.providers (the segments it serves, e.g. [\"sis\"]) — an empty list would unlock every provider".into(),
+            });
+        }
+        if g.enabled && g.is_thclaws() {
+            if let Some(d) = g
+                .default_model
+                .as_deref()
+                .map(str::trim)
+                .filter(|d| !d.is_empty())
+            {
+                if crate::providers::locked_model_override(d, &g.providers, None).is_some() {
+                    return Err(PolicyError::InvalidConfig {
+                        path: path.to_path_buf(),
+                        message: format!(
+                            "gateway.default_model '{d}' is not served by gateway.providers [{}]",
+                            g.providers.join(", ")
+                        ),
+                    });
+                }
+            }
+        }
     }
     if let Some(s) = &policy.policies.sso {
         if s.enabled {
@@ -562,7 +699,18 @@ pub fn status_text() -> String {
         crate::audit::status_line(),
     ];
     if let Some(g) = p.policies.gateway.as_ref().filter(|g| g.enabled) {
-        lines.push(format!("gateway url: {}", g.url));
+        lines.push(format!("gateway url: {} (kind {})", g.url, g.kind_str()));
+        if g.is_thclaws() {
+            lines.push(format!(
+                "gateway providers: {} · cloud: {} · fail_closed={}",
+                g.providers.join(", "),
+                g.cloud_url.as_deref().unwrap_or("(settings/env)"),
+                on(g.fail_closed)
+            ));
+            if let Some(d) = g.default_model.as_deref() {
+                lines.push(format!("gateway default model: {d}"));
+            }
+        }
     }
     if let Some(r) = runtime() {
         let mut parts = vec![format!(
@@ -610,7 +758,10 @@ pub fn find_file() -> Option<PathBuf> {
         return Some(etc);
     }
     if let Some(home) = crate::util::home_dir() {
-        let user = home.join(".config/thclaws/policy.json");
+        let user = home.join(format!(
+            ".config/{}/policy.json",
+            crate::profile::app_dir_name()
+        ));
         if user.exists() {
             return Some(user);
         }
@@ -800,6 +951,7 @@ mod tests {
                     auth_header_template: None,
                     fail_closed: true,
                     read_only_local_models_allowed: false,
+                    ..Default::default()
                 }),
                 ..Default::default()
             },
@@ -807,6 +959,131 @@ mod tests {
         };
         let result = validate_policies(&p, &PathBuf::from("/tmp/x.json"));
         assert!(matches!(result, Err(PolicyError::InvalidConfig { .. })));
+    }
+
+    fn gateway_policy(g: GatewayPolicy) -> Policy {
+        Policy {
+            version: 1,
+            issuer: "test".into(),
+            issued_at: String::new(),
+            expires_at: None,
+            binding: None,
+            policies: Policies {
+                gateway: Some(g),
+                ..Default::default()
+            },
+            signature: None,
+        }
+    }
+
+    fn thclaws_gateway_block(providers: &[&str]) -> GatewayPolicy {
+        GatewayPolicy {
+            enabled: true,
+            url: "https://gateway.sis.example".into(),
+            fail_closed: true,
+            kind: Some("thclaws".into()),
+            providers: providers.iter().map(|p| p.to_string()).collect(),
+            cloud_url: Some("https://sis.example".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn gateway_kind_defaults_to_the_generic_gateway() {
+        let mut g = GatewayPolicy {
+            enabled: true,
+            url: "https://gw.example".into(),
+            ..Default::default()
+        };
+        assert!(!g.is_thclaws());
+        g.kind = Some("openai_compat".into());
+        assert!(!g.is_thclaws());
+        assert!(
+            validate_policies(&gateway_policy(g.clone()), &PathBuf::from("/tmp/x.json")).is_ok()
+        );
+        g.kind = Some(" THClaws ".into());
+        assert!(g.is_thclaws());
+    }
+
+    #[test]
+    fn validate_accepts_a_thclaws_gateway_with_providers() {
+        let p = gateway_policy(thclaws_gateway_block(&["sis"]));
+        assert!(validate_policies(&p, &PathBuf::from("/tmp/x.json")).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_a_thclaws_gateway_without_providers() {
+        for providers in [&[][..], &["  "][..]] {
+            let p = gateway_policy(thclaws_gateway_block(providers));
+            assert!(matches!(
+                validate_policies(&p, &PathBuf::from("/tmp/x.json")),
+                Err(PolicyError::InvalidConfig { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn validate_checks_the_default_model_is_served() {
+        let mut g = thclaws_gateway_block(&["sis"]);
+        g.default_model = Some("sis/qwen3.8-flash".into());
+        assert!(
+            validate_policies(&gateway_policy(g.clone()), &PathBuf::from("/tmp/x.json")).is_ok()
+        );
+        g.default_model = Some("claude-sonnet-4-6".into());
+        let err = validate_policies(&gateway_policy(g), &PathBuf::from("/tmp/x.json"));
+        assert!(
+            matches!(err, Err(PolicyError::InvalidConfig { ref message, .. }) if message.contains("default_model"))
+        );
+    }
+
+    #[test]
+    fn validate_rejects_an_unknown_gateway_kind() {
+        let mut g = thclaws_gateway_block(&["sis"]);
+        g.kind = Some("litellm".into());
+        let err = validate_policies(&gateway_policy(g), &PathBuf::from("/tmp/x.json"));
+        assert!(matches!(err, Err(PolicyError::InvalidConfig { .. })));
+    }
+
+    #[test]
+    fn thclaws_gateway_fields_round_trip_and_are_absent_by_default() {
+        let json = serde_json::to_string(&thclaws_gateway_block(&["sis"])).unwrap();
+        let back: GatewayPolicy = serde_json::from_str(&json).unwrap();
+        assert!(back.is_thclaws());
+        assert_eq!(back.providers, vec!["sis"]);
+        assert_eq!(back.cloud_url.as_deref(), Some("https://sis.example"));
+        let plain = serde_json::to_string(&GatewayPolicy::default()).unwrap();
+        assert!(
+            !plain.contains("kind") && !plain.contains("providers") && !plain.contains("cloud_url")
+        );
+    }
+
+    #[test]
+    fn an_unreachable_gateway_asks_for_the_company_network() {
+        let raw = "provider error: http: error sending request for url (https://gateway.sis.example/sis/chat/completions): dns error: failed to lookup address information";
+        let msg = network_failure_hint(raw, "https://gateway.sis.example/").unwrap();
+        assert!(msg.contains("gateway.sis.example"), "{msg}");
+        assert!(msg.contains("VPN"), "{msg}");
+        assert!(network_failure_hint(
+            "provider error: http: tcp connect error: Connection refused",
+            "https://gw.example:8443"
+        )
+        .unwrap()
+        .contains("(gw.example)"));
+        assert!(network_failure_hint(
+            "provider error: http 429 Too Many Requests: {}",
+            "https://gw.example"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn without_a_policy_nothing_is_rewritten_or_locked() {
+        if active().is_none() {
+            assert!(thclaws_gateway().is_none());
+            assert!(thclaws_gateway_url().is_none());
+            assert!(thclaws_cloud_url().is_none());
+            assert!(unreachable_gateway_message("error sending request for url (x)").is_none());
+        }
     }
 
     fn audit_policy(a: AuditPolicy) -> Policy {

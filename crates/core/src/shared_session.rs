@@ -1962,6 +1962,7 @@ async fn run_worker(context: WorkerContext) {
     let mut agent = Agent::new(provider, tools.clone(), &config.model, &system)
         .with_max_tokens(config.max_tokens)
         .with_thinking_budget(config.thinking_budget)
+        .with_browser_fast_steps(config.browser_fast_steps)
         .with_approver(approver.clone())
         .with_cancel(cancel.clone())
         .with_hooks(hooks_arc.clone());
@@ -3471,6 +3472,9 @@ async fn run_worker(context: WorkerContext) {
                     h.finish()
                 });
                 if fp.is_some() && fp == state.last_settings_fingerprint {
+                    // Logged because a skipped reload keeps the provider built
+                    // before a sign-in, which is invisible otherwise.
+                    eprintln!("[reload] skipped — settings.json unchanged since the last reload");
                     continue;
                 }
                 let prev_model = state.config.model.clone();
@@ -4407,7 +4411,8 @@ async fn handle_line(
                 if p.is_absolute() {
                     p
                 } else {
-                    state.cwd.join(&p)
+                    // agent folder ≠ user's files under a host (dev-plan/61)
+                    crate::workdir::current_workdir().join(&p)
                 }
             };
             let rewritten = crate::repl::build_kms_ingest_pdf_vision_prompt(
@@ -4500,7 +4505,9 @@ async fn handle_line(
             if p.is_absolute() {
                 p
             } else {
-                state.cwd.join(&p)
+                // state.cwd is the agent's own folder under a workspace host;
+                // the user's files are at the workspace root (dev-plan/61).
+                crate::workdir::current_workdir().join(&p)
             }
         };
         match crate::kms::ingest(&k, &source, alias.as_deref(), force) {

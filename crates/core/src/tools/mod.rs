@@ -305,6 +305,7 @@ pub fn reset_gates() {
 pub(crate) fn gateway_active() -> bool {
     std::env::var("THCLAWS_USES_GATEWAY").ok().as_deref() == Some("1")
         || crate::workdir::is_multiuser()
+        || crate::shared::policy_gateway_mode()
         || crate::config::AppConfig::load()
             .map(|c| c.gateway_proxy)
             .unwrap_or(false)

@@ -163,7 +163,12 @@ impl ScheduleStore {
     /// Returns `None` only on a broken Windows environment with no
     /// usable home dir.
     pub fn default_path() -> Option<PathBuf> {
-        crate::util::home_dir().map(|h| h.join(".config/thclaws/schedules.json"))
+        crate::util::home_dir().map(|h| {
+            h.join(format!(
+                ".config/{}/schedules.json",
+                crate::profile::app_dir_name()
+            ))
+        })
     }
 
     /// Load from the default user-level path. Returns a fresh empty

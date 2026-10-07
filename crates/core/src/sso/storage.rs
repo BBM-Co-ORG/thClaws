@@ -145,7 +145,10 @@ struct KnownSessions {
 const MARKER_FILENAME: &str = "sso-known.json";
 
 fn marker_path() -> Option<PathBuf> {
-    crate::util::home_dir().map(|h| h.join(".config/thclaws").join(MARKER_FILENAME))
+    crate::util::home_dir().map(|h| {
+        h.join(format!(".config/{}", crate::profile::app_dir_name()))
+            .join(MARKER_FILENAME)
+    })
 }
 
 fn read_marker() -> KnownSessions {

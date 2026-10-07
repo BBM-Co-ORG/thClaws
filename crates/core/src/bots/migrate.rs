@@ -1203,6 +1203,23 @@ fn rewrite_schedules(ws: &Path) -> Result<Vec<String>> {
 /// Mint a fresh v3 workspace: a host with one empty bot. Used when
 /// `--supervisor` is pointed at a directory that has no workspace in it yet —
 /// never at one that already holds a v2 agent, which needs [`apply`].
+/// A folder that is no workspace yet — no `bots.json`, no v2 agent, not a
+/// bot's folder, not home or above — becomes a host with one empty agent
+/// the first time the app opens it. Without this the first open stamped a
+/// v2 `settings.json` and only the second open upgraded it, so a new folder
+/// showed no bots until the app was reopened. `None` = not fresh, untouched.
+pub fn mint_if_fresh(ws: &Path) -> Option<Result<PathBuf>> {
+    if ws.join(super::CONFIG_REL).exists()
+        || crate::workdir::is_multiuser()
+        || is_inside_shelf(ws)
+        || is_never_a_workspace(ws)
+        || looks_like_v2_agent(ws)
+    {
+        return None;
+    }
+    Some(mint_new_workspace(ws, MAIN_SLUG))
+}
+
 pub fn mint_new_workspace(ws: &Path, slug: &str) -> Result<PathBuf> {
     super::validate_slug(slug)?;
     let dest = bot_dir(ws, slug);
@@ -1248,6 +1265,28 @@ pub fn looks_like_v2_agent(ws: &Path) -> bool {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_fresh_folder_is_minted_a_host_but_nothing_else_is() {
+        let _g = crate::kms::test_env_lock();
+        // Empty folder: becomes a host with one agent on first open.
+        let fresh = tempfile::tempdir().unwrap();
+        let dest = mint_if_fresh(fresh.path()).expect("fresh").unwrap();
+        assert!(fresh.path().join(super::super::CONFIG_REL).exists());
+        assert!(dest.is_dir());
+        // Already a host: untouched.
+        assert!(mint_if_fresh(fresh.path()).is_none());
+        // A v2 single-agent folder is the migration's job, not this one's.
+        let v2 = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(v2.path().join(".thclaws")).unwrap();
+        std::fs::write(v2.path().join(".thclaws/settings.json"), "{}").unwrap();
+        assert!(mint_if_fresh(v2.path()).is_none());
+        assert!(!v2.path().join(super::super::CONFIG_REL).exists());
+        // A bot's own folder inside a shelf is never a workspace of its own.
+        let shelf = fresh.path().join(".thclaws/bots/other");
+        std::fs::create_dir_all(&shelf).unwrap();
+        assert!(mint_if_fresh(&shelf).is_none());
+    }
 
     /// `~/.thclaws/` exists on most desktops (the classic app ran in the
     /// Dock's cwd before the picker was answered), so `~` passes every

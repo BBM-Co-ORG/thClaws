@@ -316,7 +316,10 @@ fn registry_path(user: bool) -> Result<PathBuf> {
     if user {
         let home = crate::util::home_dir()
             .ok_or_else(|| Error::Config("cannot locate user home directory".into()))?;
-        Ok(home.join(".config/thclaws/plugins.json"))
+        Ok(home.join(format!(
+            ".config/{}/plugins.json",
+            crate::profile::app_dir_name()
+        )))
     } else {
         let cwd = std::env::current_dir()?;
         Ok(cwd.join(".thclaws/plugins.json"))
@@ -327,7 +330,10 @@ fn plugins_dir(user: bool) -> Result<PathBuf> {
     if user {
         let home = crate::util::home_dir()
             .ok_or_else(|| Error::Config("cannot locate user home directory".into()))?;
-        Ok(home.join(".config/thclaws/plugins"))
+        Ok(home.join(format!(
+            ".config/{}/plugins",
+            crate::profile::app_dir_name()
+        )))
     } else {
         let cwd = std::env::current_dir()?;
         Ok(cwd.join(".thclaws/plugins"))

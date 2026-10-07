@@ -563,6 +563,11 @@ enum CloudCmd {
         /// Provide the token inline instead of prompting.
         #[arg(long)]
         token: Option<String>,
+        /// Sign in through the browser (your organisation's login) and store
+        /// a token for this machine. The one form of `cloud login` kept: no
+        /// token ever passes through argv.
+        #[arg(long)]
+        browser: bool,
     },
     /// REMOVED — open thclaws and clear the CLI token in
     /// Settings → thClaws.cloud.
@@ -1055,7 +1060,16 @@ async fn main() {
                     AutoOutcome::Failed(e) => eprintln!(
                         "\x1b[33m[thclaws] could not upgrade this workspace ({e}) — opening it as it is\x1b[0m"
                     ),
-                    AutoOutcome::NotV2 | AutoOutcome::AlreadyV3 => {}
+                    AutoOutcome::AlreadyV3 => {}
+                    AutoOutcome::NotV2 => match thclaws_core::bots::migrate::mint_if_fresh(&cwd) {
+                        Some(Ok(_)) => eprintln!(
+                            "\x1b[36m[thclaws] new workspace — it can hold more than one agent\x1b[0m"
+                        ),
+                        Some(Err(e)) => eprintln!(
+                            "\x1b[33m[thclaws] could not set up this new workspace for agents ({e}) — opening it as a single agent\x1b[0m"
+                        ),
+                        None => {}
+                    },
                 }
             }
         }
@@ -2104,6 +2118,22 @@ async fn run_agent_subcommand(cmd: AgentCmd) -> i32 {
 }
 
 async fn run_cloud_subcommand(cmd: CloudCmd, _cloud_url: Option<String>) -> i32 {
+    if let CloudCmd::Login { browser: true, .. } = cmd {
+        let settings = thclaws_core::config::ProjectConfig::load().unwrap_or_default();
+        let url =
+            thclaws_core::cloud::resolve_cloud_url(_cloud_url.as_deref(), settings.cloud.as_ref());
+        eprintln!("Signing in to {url} in your browser…");
+        return match thclaws_core::cloud::browser_login::login(&url).await {
+            Ok(()) => {
+                eprintln!("✓ signed in — token stored for this machine");
+                0
+            }
+            Err(e) => {
+                eprintln!("✗ {e}");
+                1
+            }
+        };
+    }
     // Every `thclaws cloud …` subcommand now redirects to the
     // in-session slash equivalent (or the GUI Settings panel for
     // login/logout). The clap subcommand structure stays so users
@@ -2115,12 +2145,36 @@ async fn run_cloud_subcommand(cmd: CloudCmd, _cloud_url: Option<String>) -> i32 
         // panel (and the equivalent IPC `cloud_config_set` for
         // headless). Same reason as publish/get below: no token
         // through shell argv or env.
-        CloudCmd::Login { .. } => Err("`thclaws cloud login` was removed. Open thclaws, go to \
+        CloudCmd::Login { .. } => Err("`thclaws cloud login --token` was removed — use \
+                 `thclaws cloud login --browser`, or open thclaws, go to \
                  Settings → thClaws.cloud, paste your CLI token from the \
                  dashboard (https://thclaws.cloud/dashboard). The token \
                  is stored in the OS keychain and used via the \
                  Authorization header — never through shell argv."
             .to_string()),
+        // An org-gateway build signs out of its organisation's cloud: revoke
+        // the token server-side, then forget it.
+        CloudCmd::Logout if thclaws_core::policy::thclaws_cloud_url().is_some() => {
+            let url = thclaws_core::policy::thclaws_cloud_url().unwrap_or_default();
+            match thclaws_core::cloud::browser_login::sign_out(&url).await {
+                Ok(thclaws_core::cloud::browser_login::SignOut::Revoked) => {
+                    eprintln!("✓ signed out of {url}");
+                    Ok(())
+                }
+                Ok(thclaws_core::cloud::browser_login::SignOut::NotSignedIn) => {
+                    eprintln!("not signed in to {url}");
+                    Ok(())
+                }
+                Ok(thclaws_core::cloud::browser_login::SignOut::LocalOnly(why)) => {
+                    eprintln!(
+                        "✓ signed out on this machine — but not revoked on the server ({why}); \
+                         the sign-in stays valid until it expires or an admin revokes it"
+                    );
+                    Ok(())
+                }
+                Err(e) => Err(e.to_string()),
+            }
+        }
         CloudCmd::Logout => Err("`thclaws cloud logout` was removed. Open thclaws, go to \
                  Settings → thClaws.cloud, click the clear button next to \
                  the CLI token field."

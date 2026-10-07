@@ -5,6 +5,7 @@ import rehypeHighlight from "rehype-highlight";
 import { resolveAssetSrc } from "../lib/fileAsset";
 import { Check, Copy, Paperclip } from "lucide-react";
 import { basePath, send, subscribe, sessionActionError, viewedTeamAgent } from "../hooks/useIPC";
+import { useBranding } from "../hooks/useBranding";
 import { promptHistory, recordPrompt } from "../hooks/promptHistory";
 import { useTheme } from "../hooks/useTheme";
 import { useVersion } from "../hooks/useVersion";
@@ -307,6 +308,7 @@ export function ChatView({ active, modalOpen }: Props) {
   const waitingTimerRef = useRef<number | null>(null);
   const firstByteSeenRef = useRef(false);
   const { resolved: themeMode } = useTheme();
+  const branding = useBranding();
   const version = useVersion();
 
   // Show the slash popup whenever the input begins with `/` and the
@@ -1761,13 +1763,37 @@ export function ChatView({ active, modalOpen }: Props) {
             className="flex flex-col items-center mt-20 select-none"
             style={{ color: "var(--text-secondary)" }}
           >
-            <img
-              src={themeMode === "light" ? logoLight : logoDark}
-              alt="thClaws"
-              className="mb-2 opacity-90"
-              style={{ width: 280, height: 280 }}
-              draggable={false}
-            />
+            {branding.logo ? (
+              <div className="flex flex-col items-center mb-2">
+                <img
+                  src={(themeMode === "light" ? branding.logo : branding.logo_dark) ?? branding.logo}
+                  alt={branding.name}
+                  style={{ maxWidth: 240, maxHeight: 120 }}
+                  draggable={false}
+                />
+                <div className="text-lg font-semibold mt-3" style={{ color: "var(--text-primary)" }}>
+                  {branding.name}
+                </div>
+                <div className="flex items-center gap-1 mt-1 text-xs opacity-70">
+                  <span>powered by</span>
+                  <img
+                    src={themeMode === "light" ? logoLight : logoDark}
+                    alt="thClaws"
+                    style={{ width: 28, height: 28 }}
+                    draggable={false}
+                  />
+                  <span>thClaws</span>
+                </div>
+              </div>
+            ) : (
+              <img
+                src={themeMode === "light" ? logoLight : logoDark}
+                alt="thClaws"
+                className="mb-2 opacity-90"
+                style={{ width: 280, height: 280 }}
+                draggable={false}
+              />
+            )}
             {version && (
               <div
                 className="text-xs font-mono mb-2 opacity-70"

@@ -41,22 +41,28 @@
 //! doesn't match the gateway, as defense in depth. Tracked in the
 //! dev-plan as a Phase 3 follow-up.
 
+use crate::policy::GatewayPolicy;
 use crate::providers::ProviderKind;
+
+/// The generic gateway block. A `kind: "thclaws"` gateway is not this:
+/// it keeps the thClaws providers and locks them to the customer's own
+/// gateway (`crate::policy::thclaws_gateway`), so nothing here applies.
+fn generic() -> Option<&'static GatewayPolicy> {
+    crate::policy::active()
+        .and_then(|a| a.policy.policies.gateway.as_ref())
+        .filter(|g| !g.is_thclaws())
+}
 
 /// `true` when a verified org policy is active and `policies.gateway`
 /// is `enabled`. Cheap — doesn't allocate.
 pub fn is_active() -> bool {
-    crate::policy::active()
-        .and_then(|a| a.policy.policies.gateway.as_ref())
-        .map(|g| g.enabled)
-        .unwrap_or(false)
+    generic().map(|g| g.enabled).unwrap_or(false)
 }
 
 /// The gateway URL when active. Returns `None` when the gate is off
 /// or no policy is loaded.
 pub fn gateway_url() -> Option<String> {
-    crate::policy::active()
-        .and_then(|a| a.policy.policies.gateway.as_ref())
+    generic()
         .filter(|g| g.enabled && !g.url.trim().is_empty())
         .map(|g| g.url.clone())
 }
@@ -67,7 +73,7 @@ pub fn gateway_url() -> Option<String> {
 /// (Ollama, LMStudio, AgentSdk) bypass when `read_only_local_models_allowed`
 /// is set.
 pub fn should_route(kind: ProviderKind) -> bool {
-    let g = match crate::policy::active().and_then(|a| a.policy.policies.gateway.as_ref()) {
+    let g = match generic() {
         Some(g) if g.enabled => g,
         _ => return false,
     };
@@ -105,8 +111,7 @@ fn is_local_provider(kind: ProviderKind) -> bool {
 /// the OpenAI client always sends *some* Authorization header, so an
 /// empty Bearer is fine for testing / unauthenticated gateway proxies.
 pub fn resolve_auth_header() -> Option<String> {
-    let template = crate::policy::active()
-        .and_then(|a| a.policy.policies.gateway.as_ref())
+    let template = generic()
         .filter(|g| g.enabled)
         .and_then(|g| g.auth_header_template.clone())?;
     Some(render_template(&template))
@@ -155,8 +160,7 @@ pub fn render_template(template: &str) -> String {
 /// `true` when the `fail_closed` sub-policy is set. Currently advisory —
 /// see module-level docs for the security stance.
 pub fn fail_closed() -> bool {
-    crate::policy::active()
-        .and_then(|a| a.policy.policies.gateway.as_ref())
+    generic()
         .map(|g| g.enabled && g.fail_closed)
         .unwrap_or(false)
 }

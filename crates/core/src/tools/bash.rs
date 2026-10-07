@@ -1365,10 +1365,7 @@ fn looks_like_tty_required(stdout: &str, stderr: &str) -> bool {
 fn scrub_sensitive_env(cmd: &mut tokio::process::Command) {
     scrub_sensitive_env_for(cmd, crate::workdir::is_multiuser(), || {
         crate::providers::thclaws_gateway::resolve_access_key().map(|key| {
-            let base = std::env::var("THCLAWS_GATEWAY_BASE_URL")
-                .ok()
-                .filter(|v| !v.trim().is_empty())
-                .unwrap_or_else(|| crate::providers::thclaws_gateway::GATEWAY_BASE_URL.to_string());
+            let base = crate::providers::thclaws_gateway::resolve_base_url();
             (key, base)
         })
     });

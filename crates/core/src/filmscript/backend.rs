@@ -39,6 +39,41 @@ impl BackendId {
         }
     }
 
+    /// The gateway segment family this backend's calls go through: Grok,
+    /// Seedance and Veo are Kie jobs; Happy Horse is DashScope.
+    fn media_id(self) -> &'static str {
+        match self {
+            BackendId::Grok | BackendId::Seedance | BackendId::Veo => "kie",
+            BackendId::Ltx => "ltx",
+            BackendId::HappyHorse => "happyhorse",
+        }
+    }
+
+    /// Reachable on this install (always when not gateway-locked).
+    pub fn reachable(self) -> bool {
+        crate::media::registry::backend_reachable(self.media_id())
+    }
+
+    pub const ALL: [BackendId; 5] = [
+        BackendId::Grok,
+        BackendId::Ltx,
+        BackendId::Seedance,
+        BackendId::Veo,
+        BackendId::HappyHorse,
+    ];
+
+    /// The default a film without `backend:` gets: Grok, or on a locked
+    /// install the first backend its gateway serves.
+    pub fn default_with(reach: impl Fn(BackendId) -> bool) -> Self {
+        if reach(BackendId::default()) {
+            return BackendId::default();
+        }
+        Self::ALL
+            .into_iter()
+            .find(|b| reach(*b))
+            .unwrap_or_default()
+    }
+
     pub fn parse(s: &str) -> Option<Self> {
         Some(match s.trim().to_ascii_lowercase().as_str() {
             "grok" => BackendId::Grok,

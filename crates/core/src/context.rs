@@ -173,9 +173,10 @@ pub fn find_claude_md(start: &Path) -> Option<String> {
 /// Pulled into a helper so the three loaders + scanners share one
 /// source of truth.
 fn load_claude_md_compat_flag() -> bool {
-    crate::config::AppConfig::load()
-        .map(|c| c.claude_md_compat)
-        .unwrap_or(false)
+    crate::profile::reads_claude_home()
+        && crate::config::AppConfig::load()
+            .map(|c| c.claude_md_compat)
+            .unwrap_or(false)
 }
 
 /// Test-injectable variant of [`find_claude_md`]. `claude_md_compat`
@@ -226,8 +227,14 @@ pub fn find_claude_md_with(start: &Path, claude_md_compat: bool) -> Option<Strin
             candidates.push(home.join(".claude/CLAUDE.md"));
             candidates.push(home.join(".claude/AGENTS.md"));
         }
-        candidates.push(home.join(".config/thclaws/CLAUDE.md"));
-        candidates.push(home.join(".config/thclaws/AGENTS.md"));
+        candidates.push(home.join(format!(
+            ".config/{}/CLAUDE.md",
+            crate::profile::app_dir_name()
+        )));
+        candidates.push(home.join(format!(
+            ".config/{}/AGENTS.md",
+            crate::profile::app_dir_name()
+        )));
         for candidate in candidates {
             if let Ok(contents) = std::fs::read_to_string(&candidate) {
                 parts.push(contents);
@@ -378,8 +385,14 @@ pub fn scan_claude_md_sizes(start: &Path) -> Vec<(PathBuf, u64)> {
             check(home.join(".claude/AGENTS.md"));
         }
         for candidate in [
-            home.join(".config/thclaws/CLAUDE.md"),
-            home.join(".config/thclaws/AGENTS.md"),
+            home.join(format!(
+                ".config/{}/CLAUDE.md",
+                crate::profile::app_dir_name()
+            )),
+            home.join(format!(
+                ".config/{}/AGENTS.md",
+                crate::profile::app_dir_name()
+            )),
         ] {
             check(candidate);
         }
@@ -458,8 +471,14 @@ pub fn scan_claude_md_oversize(start: &Path) -> Vec<ClaudeMdOversize> {
             check(home.join(".claude/AGENTS.md"));
         }
         for candidate in [
-            home.join(".config/thclaws/CLAUDE.md"),
-            home.join(".config/thclaws/AGENTS.md"),
+            home.join(format!(
+                ".config/{}/CLAUDE.md",
+                crate::profile::app_dir_name()
+            )),
+            home.join(format!(
+                ".config/{}/AGENTS.md",
+                crate::profile::app_dir_name()
+            )),
         ] {
             check(candidate);
         }

@@ -211,7 +211,7 @@ pub struct GeminiSpeechProvider;
 /// Wrap raw signed-16-bit little-endian mono PCM in a minimal WAV
 /// container so the file plays anywhere. Gemini TTS returns bare PCM at a
 /// rate advertised in the part's `mimeType` (`audio/L16;…;rate=24000`).
-fn pcm16_to_wav(pcm: &[u8], sample_rate: u32) -> Vec<u8> {
+pub(crate) fn pcm16_to_wav(pcm: &[u8], sample_rate: u32) -> Vec<u8> {
     let channels: u16 = 1;
     let bits: u16 = 16;
     let byte_rate = sample_rate * channels as u32 * (bits as u32 / 8);

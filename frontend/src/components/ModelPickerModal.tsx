@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { send } from "../hooks/useIPC";
+import { currentBranding } from "../hooks/useBranding";
 import { FusionConfigModal } from "./FusionConfigModal";
 import {
   isOpenRouterFreeOnly,
@@ -142,7 +143,7 @@ export function ModelPickerModal({ provider, current, models, onClose }: Props) 
             Pick a default model for {provider}
           </h2>
           <p className="text-xs mt-1" style={{ color: "var(--text-secondary)" }}>
-            Your API key is saved. Choose the model thClaws should default
+            Your API key is saved. Choose the model {currentBranding().name} should default
             to. You can switch any time with <code className="font-mono">/model</code>.
           </p>
         </div>

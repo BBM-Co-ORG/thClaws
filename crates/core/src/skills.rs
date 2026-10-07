@@ -155,14 +155,9 @@ pub struct SkillDef {
     pub description: String,
     #[serde(default)]
     pub when_to_use: String,
-    /// Optional default-model recommendation. When set and the user
-    /// has an API key for the relevant provider, the agent's
-    /// `model_override` is populated for the duration of the turn the
-    /// skill is invoked in. Falls back silently to the user's current
-    /// model with a warning chat line when no candidate has a key.
-    /// Issue: knowledge-worker skills (vision, long-context) need a
-    /// known-good default so non-experts don't have to know which
-    /// model supports what.
+    /// The `model:` frontmatter, parsed so older skills still load but
+    /// never acted on: a skill runs on the model the user picked, never
+    /// one it recommends (a locked install has no other model to offer).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<SkillModelSpec>,
     /// Optional tool gate this skill opens when invoked. Parsed from the
@@ -492,8 +487,11 @@ impl SkillStore {
     fn user_skill_dirs() -> Vec<PathBuf> {
         let mut dirs = Vec::new();
         if let Some(home) = crate::util::home_dir() {
-            dirs.push(home.join(".claude/skills")); // user Claude Code
-            dirs.push(home.join(".config/thclaws/skills")); // user thClaws
+            if crate::profile::reads_claude_home() {
+                dirs.push(home.join(".claude/skills")); // user Claude Code
+            }
+            dirs.push(home.join(format!(".config/{}/skills", crate::profile::app_dir_name())));
+            // user thClaws
         }
         dirs
     }
@@ -856,7 +854,7 @@ fn target_root(project_scope: bool) -> Result<PathBuf> {
     } else {
         let home = crate::util::home_dir()
             .ok_or_else(|| Error::Tool("cannot locate user home directory".into()))?;
-        Ok(home.join(".config/thclaws/skills"))
+        Ok(home.join(format!(".config/{}/skills", crate::profile::app_dir_name())))
     }
 }
 
@@ -987,7 +985,7 @@ pub fn install_from_git(
     } else {
         crate::util::home_dir()
             .ok_or_else(|| Error::Tool("cannot locate user home directory".into()))?
-            .join(".config/thclaws/skills")
+            .join(format!(".config/{}/skills", crate::profile::app_dir_name()))
     };
     std::fs::create_dir_all(&target_root)
         .map_err(|e| Error::Tool(format!("mkdir {}: {e}", target_root.display())))?;
@@ -1442,7 +1440,6 @@ impl SkillTool {
         &self,
         name: &str,
         description: &str,
-        model_spec: Option<&SkillModelSpec>,
         body: &str,
         input: &Value,
     ) -> Option<Result<String>> {
@@ -1453,15 +1450,10 @@ impl SkillTool {
         // Upgrade the Weak factory; absent (tests, HTTP surface) ⇒ inline.
         let factory = self.factory.get()?.upgrade()?;
 
-        // Pin the skill's recommended model only if the frontmatter names
-        // one — the factory's `subagent_model` further guards against a
-        // cross-provider pin misrouting.
-        let model = model_spec.and_then(|m| m.candidates().first().cloned());
         let agent_def = crate::agent_defs::AgentDef {
             name: format!("skill:{name}"),
             description: description.to_string(),
             instructions: format!("{body}{ISOLATED_SKILL_RETURN_CONTRACT}"),
-            model,
             ..Default::default()
         };
 
@@ -1575,7 +1567,7 @@ impl Tool for SkillTool {
         // Extract everything we need from the store, then drop the lock:
         // a std Mutex guard is not `Send` and can't be held across the
         // `.await` of an isolated skill's sub-agent run below.
-        let (isolated, body, dir, model_spec, tool_gate, description) = {
+        let (isolated, body, dir, tool_gate, description) = {
             let store = self.store.lock().unwrap();
             let skill = store.get(name).ok_or_else(|| {
                 let available = store.names().join(", ");
@@ -1596,7 +1588,6 @@ impl Tool for SkillTool {
                 skill.isolated,
                 skill.content().into_owned(),
                 skill.dir.clone(),
-                skill.model.clone(),
                 skill.tool_gate.clone(),
                 skill.description.clone(),
             )
@@ -1609,7 +1600,7 @@ impl Tool for SkillTool {
         // on this surface, or the recursion cap).
         if isolated {
             if let Some(res) = self
-                .try_run_isolated(name, &description, model_spec.as_ref(), &body, &input)
+                .try_run_isolated(name, &description, &body, &input)
                 .await
             {
                 return res;
@@ -1635,36 +1626,6 @@ impl Tool for SkillTool {
             result.push_str(&format!(
                 "\n\n_(The `{gate}` tools are now available for this session.)_\n"
             ));
-        }
-
-        // Resolve the effective model recommendation. settings.json
-        // may carry a per-skill override (e.g.
-        // `extract_save_skill_models: "claude-sonnet-4-6"`) that takes
-        // precedence over the embedded SKILL.md frontmatter `model:`
-        // field — lets users tune the recommended model without
-        // forking the whole skill body. Falls through to the
-        // frontmatter spec when no override is set.
-        let effective_spec =
-            crate::skills_state::skill_override(name).or_else(|| model_spec.clone());
-
-        // If a recommendation exists (from override OR frontmatter),
-        // ask the worker's resolver to apply it. The resolver writes
-        // into the agent's `model_override` slot so the very next
-        // provider.stream call uses the recommended model. Append a
-        // one-line note to the body so the model knows what
-        // happened (and can mention it to the user if relevant).
-        if let Some(spec) = effective_spec.as_ref() {
-            let outcome = crate::skills_state::request_model(spec);
-            let note = match outcome {
-                crate::skills_state::SkillModelOutcome::Switched(picked) => format!(
-                    "\n\n_(Note: this skill recommends `{picked}`; the active model has been switched for this turn — your previous model returns when the turn ends.)_\n"
-                ),
-                crate::skills_state::SkillModelOutcome::KeptCurrent { recommended } => format!(
-                    "\n\n_(Note: this skill works best with `{recommended}` (vision / long-context). You don't have an API key for that provider — proceeding with your current model. Add the relevant key in Settings if results look poor.)_\n"
-                ),
-                crate::skills_state::SkillModelOutcome::NoResolver => String::new(),
-            };
-            result.push_str(&note);
         }
 
         Ok(result)
@@ -2203,11 +2164,10 @@ mod tests {
             .expect("extract-and-save should be seeded as a built-in");
         assert_eq!(skill.name, "extract-and-save");
         assert!(!skill.description.is_empty());
-        // Carries the model recommendation set in the frontmatter.
-        assert!(matches!(
-            skill.model,
-            Some(SkillModelSpec::Single(_)) | Some(SkillModelSpec::Priority(_))
-        ));
+        assert!(
+            skill.model.is_none(),
+            "built-in skills run on the user's model"
+        );
         // Body is materialized eagerly (no on-disk file to lazy-load).
         assert!(matches!(skill.content, SkillContent::Eager(_)));
         // Body content is non-empty and recognizable.

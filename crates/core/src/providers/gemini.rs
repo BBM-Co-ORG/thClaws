@@ -450,6 +450,7 @@ impl Provider for GeminiProvider {
             .json(&body)
             .send()
             .await
+            .inspect(crate::desktop_update::observe)
             .map_err(|e| Error::Provider(format!("http: {e}")))?;
 
         if !resp.status().is_success() {

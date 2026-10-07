@@ -190,7 +190,10 @@ impl TelegramConfig {
     /// silently delete or migrate user state.
     pub fn legacy_user_path() -> Result<PathBuf, TelegramConfigError> {
         let home = crate::util::home_dir().ok_or(TelegramConfigError::NoHome)?;
-        Ok(home.join(".config").join("thclaws").join("telegram.json"))
+        Ok(home
+            .join(".config")
+            .join(crate::profile::app_dir_name())
+            .join("telegram.json"))
     }
 
     /// Read from disk. `Ok(None)` when absent at the project path AND

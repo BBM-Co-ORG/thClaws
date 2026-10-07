@@ -206,6 +206,17 @@ pub async fn dispatch(
                 "tasks are maintained by the agent's `Task` tool during a turn; ask the agent to list them.".into(),
             );
         }
+        SlashCommand::Todo { clear } => {
+            // clear_todos broadcasts the empty list, so the sidebar empties too.
+            let root = std::env::current_dir().unwrap_or_default();
+            let text = if clear {
+                crate::tools::todo::clear_todos(&root);
+                "todos cleared".to_string()
+            } else {
+                crate::tools::todo::render_todos(&crate::tools::todo::read_todos_from_disk(&root))
+            };
+            emit(events_tx, text);
+        }
         SlashCommand::Usage => {
             let tracker =
                 crate::usage::UsageTracker::new(crate::usage::UsageTracker::default_path());
@@ -227,6 +238,28 @@ pub async fn dispatch(
             use crate::providers::ProviderTier;
             let current = state.config.detect_provider_kind().ok();
             let mut out = String::from("Providers:\n");
+            if crate::shared::gateway_providers_locked() {
+                out.push_str("\nAvailable on this deployment (through its gateway):\n");
+                let hint = crate::providers::locked_sign_in_hint();
+                if let Some(h) = &hint {
+                    out.push_str(&format!("  {h}\n"));
+                }
+                let kinds = if hint.is_some() {
+                    crate::providers::locked_offered_providers()
+                } else {
+                    crate::providers::locked_install_providers(&state.config)
+                };
+                for kind in kinds {
+                    let marker = if Some(kind) == current { "*" } else { " " };
+                    out.push_str(&format!(
+                        "  {marker} {:<12} → {}\n",
+                        kind.name(),
+                        kind.default_model(),
+                    ));
+                }
+                emit(events_tx, out);
+                return;
+            }
             let mut last_tier: Option<ProviderTier> = None;
             for kind in crate::providers::ProviderKind::display_ordered() {
                 let tier = kind.tier();
@@ -2324,7 +2357,9 @@ pub async fn dispatch(
             let source = if source.is_absolute() {
                 source
             } else {
-                state.cwd.join(&source)
+                // state.cwd is the agent's own folder under a workspace host;
+                // the user's files are at the workspace root (dev-plan/61).
+                crate::workdir::current_workdir().join(&source)
             };
             // A directory ingests every supported file under it. Seeding
             // a KMS from a notes folder or a docs tree was otherwise a
@@ -2422,7 +2457,9 @@ pub async fn dispatch(
             let source = if source.is_absolute() {
                 source
             } else {
-                state.cwd.join(&source)
+                // state.cwd is the agent's own folder under a workspace host;
+                // the user's files are at the workspace root (dev-plan/61).
+                crate::workdir::current_workdir().join(&source)
             };
             match crate::kms::ingest_pdf(&k, &source, alias.as_deref(), force, None).await {
                 Ok(r) => {
@@ -4070,6 +4107,14 @@ pub async fn dispatch(
                             crate::cloud::cmd::publish_cwd_lines(&cwd, None, cloud_cfg.as_ref())
                                 .await;
                         emit(lines.join("\n"));
+                    }
+                    CloudSlash::Doctor => {
+                        let url = crate::cloud::resolve_cloud_url(None, cloud_cfg.as_ref());
+                        emit(
+                            crate::cloud::browser_login::doctor_lines(&url)
+                                .await
+                                .join("\n"),
+                        );
                     }
                     CloudSlash::Unbind => {
                         // Single block, same reasoning as Status above.

@@ -7,7 +7,12 @@
 /// Path to the persisted theme file. `None` when no home directory is
 /// available (sandboxed CI / minimal containers).
 pub fn theme_path() -> Option<std::path::PathBuf> {
-    crate::util::home_dir().map(|h| h.join(".config/thclaws/theme.json"))
+    crate::util::home_dir().map(|h| {
+        h.join(format!(
+            ".config/{}/theme.json",
+            crate::profile::app_dir_name()
+        ))
+    })
 }
 
 /// Coerce a mode string to one of the three legal values. Any unknown

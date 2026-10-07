@@ -24,9 +24,13 @@ fn opt(input: &Value, key: &str) -> String {
 }
 
 const MODEL_DESC: &str = "Which speech model. Gemini: `flash` (default; \
-gemini-3.1-flash-tts-preview). Provider is inferred from the model. Default: flash.";
-const VOICE_DESC: &str = "Prebuilt voice name (Gemini: e.g. Kore, Charon, Puck, Aoede, \
-Fenrir). Omit for the provider default (Kore).";
+gemini-3.1-flash-tts-preview). DashScope: `qwen3-tts-flash` (alias `qwen-tts`) or \
+`qwen3-tts-instruct-flash` (honours `style`). Provider is inferred from the model. \
+Default: flash (where the gateway serves only DashScope: qwen3-tts-flash).";
+const VOICE_DESC: &str = "Prebuilt voice name. Gemini: e.g. Kore, Charon, Puck, Aoede, \
+Fenrir (default Kore). Qwen3-TTS: Cherry, Serena, Chelsie, Jennifer, Katerina, Maia, \
+Momo, Vivian, Sunny, Moon (female); Ethan, Ryan, Elias, Dylan, Kai, Nofish (male) — \
+default Cherry.";
 
 pub struct TextToSpeechTool;
 
@@ -37,7 +41,7 @@ impl Tool for TextToSpeechTool {
     }
     fn description(&self) -> &'static str {
         "Synthesize speech from text. Provider-abstracted (Gemini TTS, model \
-         `gemini-3.1-flash-tts-preview`). Output is written to \
+         `gemini-3.1-flash-tts-preview`; or DashScope Qwen3-TTS). Output is written to \
          `output/tts-<ts>-<sha8>.wav` (16-bit PCM WAV) and its path returned. \
          Requires `imageToolsEnabled: true` in `.thclaws/settings.json`, plus a \
          provider key in env (`GEMINI_API_KEY`/`GOOGLE_API_KEY`) — or the thClaws \
@@ -56,8 +60,12 @@ impl Tool for TextToSpeechTool {
                     "type": "string",
                     "description": "Optional natural-language delivery hint, e.g. \"Say warmly, like a friendly narrator\". Prepended as an instruction."
                 },
+                "language": {
+                    "type": "string",
+                    "description": "Language of the text, e.g. `th`, `en` (optional). Qwen3-TTS uses it to pick its language mode; Thai and other unlisted languages run in auto mode."
+                },
                 "model": { "type": "string", "description": MODEL_DESC },
-                "provider": { "type": "string", "description": "Optional explicit provider (`gemini`). Usually omit — inferred from `model`.", "enum": ["gemini"] }
+                "provider": { "type": "string", "description": "Optional explicit provider (`gemini` | `dashscope`). Usually omit — inferred from `model`.", "enum": ["gemini", "dashscope"] }
             },
             "required": ["text"]
         })
@@ -79,6 +87,7 @@ impl Tool for TextToSpeechTool {
             model,
             text,
             voice: opt(&input, "voice"),
+            language: opt(&input, "language"),
             style: if style.trim().is_empty() {
                 None
             } else {

@@ -264,7 +264,10 @@ fn mcp_allowlist_path() -> Option<std::path::PathBuf> {
     } else {
         crate::util::home_dir()?.join(".config")
     };
-    Some(base.join("thclaws").join("mcp_allowlist.json"))
+    Some(
+        base.join(crate::profile::app_dir_name())
+            .join("mcp_allowlist.json"),
+    )
 }
 
 #[derive(Default, Serialize, Deserialize)]

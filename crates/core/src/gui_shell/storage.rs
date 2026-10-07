@@ -44,7 +44,7 @@ pub fn storage_path(shell_id: &str, session_id: &str) -> Result<PathBuf> {
     validate_ids(shell_id, session_id)?;
     Ok(home
         .join(".config")
-        .join("thclaws")
+        .join(crate::profile::app_dir_name())
         .join("gui-shell")
         .join(shell_id)
         .join("state")

@@ -43,6 +43,74 @@ pub const GATEWAY_ALL_PROVIDERS: &[&str] = &[
     "moonshot",
 ];
 
+const GATEWAY_PROVIDERS_ENV: &str = "THCLAWS_GATEWAY_PROVIDERS";
+
+/// The provider segments to route through the gateway. `THCLAWS_GATEWAY_PROVIDERS`
+/// (comma list), when set, REPLACES [`GATEWAY_ALL_PROVIDERS`]: an install
+/// whose gateway serves one upstream only — its own model workspace, e.g.
+/// `sis` — sets exactly that, and the provisioner passes it to the runner.
+/// Unset or blank = the compiled Featured set, which is thclaws.cloud and
+/// every desktop.
+pub fn gateway_routed_providers() -> Vec<String> {
+    routed_for(
+        crate::policy::thclaws_gateway(),
+        std::env::var(GATEWAY_PROVIDERS_ENV).ok().as_deref(),
+    )
+}
+
+/// A `kind: "thclaws"` gateway policy's provider list outranks
+/// `THCLAWS_GATEWAY_PROVIDERS`, the way the policy outranks every setting.
+fn routed_for(policy: Option<&crate::policy::GatewayPolicy>, env: Option<&str>) -> Vec<String> {
+    match policy {
+        Some(g) => parse_gateway_providers(Some(&g.providers.join(","))),
+        None => parse_gateway_providers(env),
+    }
+}
+
+/// True when this install runs through its organisation's own thClaws
+/// gateway by policy — the desktop counterpart of a hosted runner's
+/// `THCLAWS_USES_GATEWAY=1`.
+pub fn policy_gateway_mode() -> bool {
+    crate::policy::thclaws_gateway().is_some()
+}
+
+/// True when `THCLAWS_GATEWAY_PROVIDERS` names at least one provider: an
+/// install locked to its gateway. There, nothing counts as having its own
+/// credentials — not the keyless local runtimes, not the Agent SDK — so the
+/// picker offers only what the gateway routes and `build_provider` refuses
+/// anything else. Unset = today's behaviour everywhere.
+pub fn gateway_providers_locked() -> bool {
+    locked_for(
+        crate::policy::thclaws_gateway(),
+        std::env::var(GATEWAY_PROVIDERS_ENV).ok().as_deref(),
+    )
+}
+
+fn locked_for(policy: Option<&crate::policy::GatewayPolicy>, env: Option<&str>) -> bool {
+    policy.is_some() || locked_by(env)
+}
+
+fn locked_by(raw: Option<&str>) -> bool {
+    raw.is_some_and(|v| v.split(',').any(|s| !s.trim().is_empty()))
+}
+
+fn parse_gateway_providers(raw: Option<&str>) -> Vec<String> {
+    let listed: Vec<String> = raw
+        .unwrap_or("")
+        .split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if listed.is_empty() {
+        GATEWAY_ALL_PROVIDERS
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        listed
+    }
+}
+
 /// The shared-brain directory when shared mode is active, else `None`.
 /// Read fresh each call (cheap); the env var is set once at pod start.
 pub fn shared_agent_dir() -> Option<PathBuf> {
@@ -109,6 +177,67 @@ pub fn shared_commands_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gateway_providers_default_to_the_featured_set() {
+        let all: Vec<String> = GATEWAY_ALL_PROVIDERS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(parse_gateway_providers(None), all);
+        assert_eq!(parse_gateway_providers(Some("")), all);
+        // A stray comma must not collapse the set to nothing.
+        assert_eq!(parse_gateway_providers(Some(" , ")), all);
+    }
+
+    #[test]
+    fn locked_only_when_a_provider_is_named() {
+        assert!(!locked_by(None));
+        assert!(!locked_by(Some("")));
+        assert!(!locked_by(Some(" , ")));
+        assert!(locked_by(Some("sis")));
+        assert!(locked_by(Some(",sis,")));
+    }
+
+    fn thclaws_policy(providers: &[&str]) -> crate::policy::GatewayPolicy {
+        crate::policy::GatewayPolicy {
+            enabled: true,
+            url: "https://gateway.sis.example".into(),
+            kind: Some("thclaws".into()),
+            providers: providers.iter().map(|p| p.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_thclaws_policy_locks_over_whatever_env_says() {
+        let g = thclaws_policy(&["sis"]);
+        assert_eq!(routed_for(Some(&g), Some("openai,anthropic")), vec!["sis"]);
+        assert_eq!(routed_for(Some(&g), None), vec!["sis"]);
+        assert!(locked_for(Some(&g), None));
+        assert!(locked_for(Some(&g), Some("")));
+    }
+
+    #[test]
+    fn without_a_policy_the_env_decides_as_before() {
+        let all: Vec<String> = GATEWAY_ALL_PROVIDERS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(routed_for(None, None), all);
+        assert_eq!(routed_for(None, Some("sis")), vec!["sis"]);
+        assert!(!locked_for(None, None));
+        assert!(locked_for(None, Some("sis")));
+    }
+
+    #[test]
+    fn gateway_providers_env_replaces_the_set() {
+        assert_eq!(parse_gateway_providers(Some("sis")), vec!["sis"]);
+        assert_eq!(
+            parse_gateway_providers(Some(" SIS , dashscope,")),
+            vec!["sis", "dashscope"]
+        );
+    }
 
     /// Reuse the crate-wide env lock so shared-mode tests serialise with
     /// the kms/context tests that also mutate `THCLAWS_SHARED_AGENT_DIR`

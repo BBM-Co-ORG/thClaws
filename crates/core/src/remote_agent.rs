@@ -39,7 +39,7 @@ pub fn token() -> Option<String> {
 /// surfaces stay consistent. Also pushes the value into the
 /// process env so the active session picks it up without a restart.
 pub fn set_token(token: &str) -> crate::error::Result<()> {
-    let backend = crate::secrets::get_backend().unwrap_or(crate::secrets::Backend::Keychain);
+    let backend = crate::secrets::resolved_backend();
     match backend {
         crate::secrets::Backend::Keychain => {
             crate::secrets::set(KEYCHAIN_KEY, token)?;
@@ -57,7 +57,7 @@ pub fn set_token(token: &str) -> crate::error::Result<()> {
 /// env var from the running process so subsequent `/deploy` calls
 /// don't see a stale value.
 pub fn clear_token() -> crate::error::Result<()> {
-    let backend = crate::secrets::get_backend().unwrap_or(crate::secrets::Backend::Keychain);
+    let backend = crate::secrets::resolved_backend();
     match backend {
         crate::secrets::Backend::Keychain => {
             // secrets::set with empty string is the existing

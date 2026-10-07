@@ -56,7 +56,7 @@ pub struct AutoLearnState {
 }
 
 fn config_dir() -> Option<PathBuf> {
-    crate::util::home_dir().map(|home| home.join(".config").join("thclaws"))
+    crate::util::home_dir().map(|home| home.join(".config").join(crate::profile::app_dir_name()))
 }
 
 fn state_path() -> Option<PathBuf> {

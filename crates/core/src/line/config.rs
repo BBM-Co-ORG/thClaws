@@ -91,7 +91,10 @@ impl LineConfig {
     /// set — pre-Tier 2 installs had their binding here.
     pub fn legacy_user_path() -> Result<PathBuf, LineConfigError> {
         let home = crate::util::home_dir().ok_or(LineConfigError::NoHome)?;
-        Ok(home.join(".config").join("thclaws").join("line.json"))
+        Ok(home
+            .join(".config")
+            .join(crate::profile::app_dir_name())
+            .join("line.json"))
     }
 
     /// Read from disk. Project path first; legacy user path as

@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Lock, FileText, X } from "lucide-react";
 import { send, subscribe } from "../hooks/useIPC";
+import { currentBranding } from "../hooks/useBranding";
 
 type Backend = "keychain" | "dotenv";
 
@@ -54,7 +55,7 @@ export function SecretsBackendDialog({
       >
         <div className="flex items-center justify-between mb-2">
           <h2 className="text-sm font-semibold" style={{ color: "var(--text-primary)" }}>
-            Where should thClaws store API keys?
+            Where should {currentBranding().name} store API keys?
           </h2>
           {onCancel && (
             <button

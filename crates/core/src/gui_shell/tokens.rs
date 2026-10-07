@@ -84,7 +84,7 @@ fn store_path() -> Result<PathBuf> {
         .ok_or_else(|| Error::Config("HOME not set; cannot resolve token store path".into()))?;
     Ok(home
         .join(".config")
-        .join("thclaws")
+        .join(crate::profile::app_dir_name())
         .join("gui-shell-tokens.json"))
 }
 

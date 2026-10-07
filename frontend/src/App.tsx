@@ -63,6 +63,8 @@ import {
 import { ContextWarningBanner } from "./components/ContextWarningBanner";
 import { useEditingShortcuts } from "./hooks/useEditingShortcuts";
 import { send, subscribe, type IPCMessage } from "./hooks/useIPC";
+import { useBranding } from "./hooks/useBranding";
+import { DesktopUpdateBanner } from "./components/DesktopUpdateBanner";
 
 type Tab = "terminal" | "chat" | "files" | "team" | "ui" | "shell" | "browser";
 
@@ -199,6 +201,7 @@ function StartupModal({
   force?: boolean;
 }) {
   const [cwd, setCwd] = useState("");
+  const branding = useBranding();
   // The page mounts one App while the bot list loads and one per bot after,
   // so `current_cwd` can land again after the user has started typing. Once
   // they have touched the box it is theirs.
@@ -318,7 +321,7 @@ function StartupModal({
           }}
         >
           <h2 className="text-sm font-semibold mb-3">
-            thClaws couldn't reach its backend
+            {branding.name} couldn't reach its backend
           </h2>
           <p
             className="text-xs mb-3"
@@ -387,7 +390,7 @@ function StartupModal({
           </h2>
         </div>
         <p className="text-xs mb-3" style={{ color: "var(--text-secondary)" }}>
-          thClaws will operate inside this directory. All file tools are
+          {branding.name} will operate inside this directory. All file tools are
           sandboxed to it. Change it now if needed.
         </p>
         <div className="flex gap-1.5 mb-1">
@@ -487,6 +490,7 @@ function StartupModal({
 // ── Main app ─────────────────────────────────────────────────────────
 
 export default function App() {
+  const branding = useBranding();
   // Wire up Cmd+C / Cmd+X / Cmd+V / Cmd+A / Cmd+Z for every <input>
   // and <textarea> in the app. Wry doesn't forward the macOS edit-menu
   // shortcuts by default; without this the user has to right-click
@@ -1069,6 +1073,20 @@ export default function App() {
     // the shell's flex row.
     <div className="fixed right-0 top-0 left-[var(--rail-w,0px)] flex flex-col h-[100dvh] overflow-clip">
       <FrontendReadyBeacon />
+      {branding.banner && !fullscreen && (
+        <div
+          className="px-3 py-1 text-xs text-center truncate"
+          style={{
+            background: "var(--bg-tertiary, var(--bg-secondary))",
+            color: "var(--text-secondary)",
+            borderBottom: "1px solid var(--border)",
+          }}
+          title={branding.banner}
+        >
+          {branding.banner}
+        </div>
+      )}
+      <DesktopUpdateBanner />
       {fullscreen && (
         <FullscreenExitChrome
           onExit={() => setFullscreen(false)}
@@ -1263,11 +1281,10 @@ export default function App() {
             session can carry both, one, or neither. */}
         <GoalSidebar />
         {/* Todo-list sidebar. Mirrors PlanSidebar's right-edge layout
-            but displays the `TodoWrite` scratchpad — display-only, no
-            action buttons. Hidden until the first `chat_todo_update`
-            envelope lands; the worker hydrates from
-            `.thclaws/todos.md` at boot so reopening a project shows
-            the prior list immediately. */}
+            but displays the `TodoWrite` scratchpad; its one action is
+            Clear. Hidden while the list is empty; the engine re-sends
+            `.thclaws/state/todos.md` on every `frontend_ready` so
+            reopening a project shows the prior list immediately. */}
         <TodoSidebar />
         {/* Plan-mode sidebar (M1). Renders nothing when no plan is
             active — plan_state's broadcaster fires `chat_plan_update`
@@ -1416,7 +1433,7 @@ export default function App() {
           }}
         >
           <span>
-            thClaws <strong>{update.version}</strong> is available
+            {branding.name} <strong>{update.version}</strong> is available
           </span>
           <button
             type="button"

@@ -322,7 +322,7 @@ Terminal tab and Chat tab **share the same session**. History scrolls together; 
 | Secrets backend choice | `~/.config/thclaws/secrets.json` |
 | API keys (keychain mode) | OS keychain, service `thclaws`, account `api-keys` (JSON blob) |
 | API keys (.env mode) | `~/.config/thclaws/.env` |
-| Sessions | `.thclaws/state/sessions/` (project-scoped) — see [chapter 7](ch07-sessions.md) |
+| Sessions | `.thclaws/bots/<agent>/.thclaws/state/sessions/` (per agent) — see [chapter 7](ch07-sessions.md) |
 | KMS (user) | `~/.config/thclaws/kms/` — see [chapter 9](ch09-knowledge-bases-kms.md) |
 | KMS (project) | `.thclaws/state/kms/` inside the working directory |
 | MCP servers (user) | `~/.config/thclaws/mcp.json` |

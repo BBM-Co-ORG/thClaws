@@ -211,13 +211,27 @@ fn url_decode(input: &str) -> String {
     out
 }
 
+/// Shared page shell for the browser tab the loopback answers — the same
+/// light card look as the cloud's sign-in page, with a dark-mode variant.
+fn page(title: &str, body: &str) -> String {
+    format!(
+        r#"<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title}</title><style>:root{{--bg:#f4f7f8;--card:#fff;--ink:#0b1f2a;--ink2:#3f5561;--line:#d6e0e4;--ok:#0a7480;--bad:#b4332c;--code:#eaf0f2}}@media(prefers-color-scheme:dark){{:root{{--bg:#0b161c;--card:#0f1c24;--ink:#e6f0f3;--ink2:#9fb3bd;--line:#223540;--ok:#22a9b5;--bad:#e0716b;--code:#16262f}}}}body{{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--bg);color:var(--ink);font:15px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif;padding:16px;box-sizing:border-box}}main{{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:28px;max-width:420px;width:100%;text-align:center}}.mark{{width:44px;height:44px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-size:22px;color:#fff;margin-bottom:12px}}h1{{font-size:20px;font-weight:600;margin:0 0 6px}}p{{color:var(--ink2);margin:6px 0}}code{{background:var(--code);padding:2px 6px;border-radius:4px;font-size:13px}}</style></head><body><main>{body}</main></body></html>"#
+    )
+}
+
 fn success_html() -> String {
-    r#"<!doctype html><html><head><meta charset="utf-8"><title>thClaws — signed in</title><style>body{font-family:system-ui,sans-serif;background:#0a1628;color:#e0f0ff;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}main{text-align:center}h1{color:#22d3ee;font-weight:300}p{color:#88a3c0}</style></head><body><main><h1>✓ Signed in to thClaws</h1><p>You can close this tab and return to the application.</p></main></body></html>"#.to_string()
+    page(
+        "Signed in",
+        r#"<div class="mark" style="background:var(--ok)">✓</div><h1>You're signed in</h1><p>Return to the desktop app — you can close this tab.</p>"#,
+    )
 }
 
 fn error_html(error: &str, description: &str) -> String {
-    format!(
-        r#"<!doctype html><html><head><meta charset="utf-8"><title>thClaws — sign-in failed</title><style>body{{font-family:system-ui,sans-serif;background:#0a1628;color:#e0f0ff;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}}main{{text-align:center;max-width:480px;padding:24px}}h1{{color:#ff9a3c;font-weight:300}}p{{color:#88a3c0}}code{{background:rgba(255,255,255,0.04);padding:2px 6px;border-radius:4px}}</style></head><body><main><h1>Sign-in failed</h1><p><code>{error}</code></p><p>{description}</p><p>Return to the thClaws application to retry.</p></main></body></html>"#
+    page(
+        "Sign-in failed",
+        &format!(
+            r#"<div class="mark" style="background:var(--bad)">!</div><h1>Sign-in didn't finish</h1><p><code>{error}</code></p><p>{description}</p><p>Start the sign-in again from the desktop app.</p>"#
+        ),
     )
 }
 

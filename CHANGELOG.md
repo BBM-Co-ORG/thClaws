@@ -7,6 +7,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.140.0] — 2026-10-06
+
+**A release about first launches.** Two things that only went wrong the first
+time: a brand-new folder opened as a single agent until the app was reopened,
+and a sign-in made before the key-storage question was answered could not save
+its token.
+
+### Fixed
+- **A new folder holds more than one agent from the first launch.** An empty or
+  plain folder used to open as a single-agent workspace and only become a
+  multi-agent one the second time the app opened it, so a new workspace showed
+  no agents until a restart. It is set up with its first agent straight away
+  now; existing single-agent workspaces still upgrade as before.
+- **Signing in before choosing where keys are stored works.** Until the
+  first-run storage question is answered, tokens and keys are kept in the
+  profile's `.env` — which is what thClaws already did everywhere else — instead
+  of failing with "keychain disabled by user preference". This affected a
+  browser sign-in from the CLI on a fresh install, and the remote-agent token.
+
+## [0.139.0] — 2026-10-06
+
+**A release about running thClaws inside an organisation.** An install locked to
+its organisation's gateway now behaves like one end to end: the person signs in
+through the browser instead of pasting a key, every tool — chat, images, video,
+voice — goes through that gateway and offers only what it serves, the app says
+when an update is available or required, and an enterprise build keeps its
+settings and keys apart from a personal thClaws on the same machine. Nothing
+changes for an install with no organisation policy.
+
+### Added
+- **Browser sign-in for an organisation gateway.** A desktop locked to its
+  organisation's gateway shows "Sign in to …" where it used to ask for an API
+  key; the browser signs in with the organisation's identity provider and hands
+  a token back over a loopback + PKCE exchange. **Sign out** revokes the token
+  on the server, not just on this machine, and says so when the server cannot
+  be reached.
+- **Update notices.** When the organisation publishes a newer build, the app
+  shows a banner (and a line in the terminal and CLI) — "available", "required
+  by <date>", or "blocked" once the organisation enforces a minimum version. A
+  refused request explains the update instead of retrying.
+- **`/cloud doctor`.** Checks sign-in live: where the token is stored (env,
+  keychain cache vs. the keychain itself), whether the cloud answers, which
+  account it is, and whether the model is ready. Sign-in also writes a
+  `[sign-in]` line for every step to the engine log (`/logs`).
+- **Credits on the sidebar** for an organisation that caps usage, and a clear
+  message when a request is refused for being over the limit.
+- **The todo scratchpad is visible and clearable** from the UI.
+
+### Changed
+- **A gateway-locked install offers only its gateway's providers** — in the
+  model picker, `/providers`, and the image, video and voice tools — and
+  starts on the model its policy names. `THCLAWS_GATEWAY_PROVIDERS` replaces
+  the compiled gateway set when an install serves a different one.
+- **A skill runs on the model you chose**, never on one it recommends.
+- **An organisation build keeps its own profile**: its own config folder and
+  keychain service, so a personal install's keys and settings on the same
+  machine are not picked up, and it no longer reads `~/.claude` content
+  (MCP servers, skills, agents, commands) from the user's home.
+- **Model catalogue refreshed**: Claude Sonnet 5.5 and GPT-6.1 Sol among the
+  additions, retired models removed, International rates for GLM 5.x and
+  kimi-k2.7-code on DashScope, and deepseek-v3.2 on DashScope no longer priced
+  at the mainland rate.
+
+### Fixed
+- **A locked gateway can no longer be bypassed by a stray key.** A provider key
+  left in the shared environment by another install no longer takes an
+  organisation's traffic off its gateway.
+- **The desktop's own agents start when serving is disabled by policy.**
+- **Windows:** sign-in URLs no longer get cut at `&`, and the app's agent
+  processes no longer open console windows.
+- **DashScope text-to-speech audio** is downloaded over https.
+- **`/kms ingest`** resolves relative paths at the workspace root again, in the
+  GUI as well as the CLI.
+
 ## [0.138.0] — 2026-09-25
 
 **A release about an agent being able to reach its own files.** A workspace with

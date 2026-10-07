@@ -191,11 +191,7 @@ fn gateway_key_label(session: &storage::Session) -> String {
 }
 
 async fn mint_gateway_key(id_token: &str, label: &str) -> Result<()> {
-    let base = std::env::var("THCLAWS_GATEWAY_BASE_URL")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| crate::providers::thclaws_gateway::GATEWAY_BASE_URL.to_string());
+    let base = crate::providers::thclaws_gateway::resolve_base_url();
     let url = format!("{}/v1/keys", base.trim_end_matches('/'));
     let body = serde_json::json!({
         "id_token": id_token,
@@ -512,7 +508,7 @@ pub fn resolve_client_secret(policy: &SsoPolicy) -> Option<String> {
     }
 }
 
-fn generate_state() -> String {
+pub(crate) fn generate_state() -> String {
     let mut buf = [0u8; 16];
     getrandom::getrandom(&mut buf).expect("OS RNG");
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
@@ -537,7 +533,7 @@ fn url_encode(s: &str) -> String {
     out
 }
 
-fn open_browser(url: &str) -> std::io::Result<()> {
+pub(crate) fn open_browser(url: &str) -> std::io::Result<()> {
     use std::process::Command;
 
     #[cfg(target_os = "macos")]
@@ -552,10 +548,12 @@ fn open_browser(url: &str) -> std::io::Result<()> {
         c.arg(url);
         c
     };
+    // No shell on Windows: `cmd /C start` splits the URL at every '&', so a
+    // sign-in link lost everything after its first query parameter.
     #[cfg(target_os = "windows")]
     let mut cmd = {
-        let mut c = Command::new("cmd");
-        c.args(["/C", "start", "", url]);
+        let mut c = Command::new("rundll32");
+        c.args(["url.dll,FileProtocolHandler", url]);
         c
     };
 

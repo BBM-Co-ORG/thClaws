@@ -63,7 +63,10 @@ const MODEL_DESC: &str = "Video model. Provider inferred from the model. Veo: `f
 (ltx-2-3-fast) or `ltx-pro` for 2.3, `ltx-2-5` (ltx-2-5-fast) or `ltx-2-5-pro` \
 for the newer line — native speech incl. Thai, honors `resolution` \
 (720P/1080P/4K) and `fps`. DashScope HappyHorse: `happyhorse-1.0-t2v` (text→video) / \
-`happyhorse-1.0-i2v` (image→video) — honor `resolution` (720P/1080P). Default: fast.";
+`happyhorse-1.0-i2v` (image→video) — honor `resolution` (720P/1080P). DashScope Wan: \
+`wan2.7-t2v` (alias `wan`) / `wan2.7-i2v` (`wan-i2v`), `wan2.6-t2v` / `wan2.6-i2v`, \
+`wan2.5-t2v-preview` (5 or 10s), `wan2.2-t2v-plus` / `wan2.1-t2v-turbo` (5s). \
+Default: fast (where the gateway serves only DashScope: happyhorse-1.0-t2v).";
 
 /// Submit a video job and persist it; returns the user-facing text.
 async fn submit_job(kind: &str, input: &Value, init_image: Option<InputImage>) -> Result<String> {

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { KeyRound, X, Check, Trash2, Link as LinkIcon } from "lucide-react";
 import { send, subscribe } from "../hooks/useIPC";
+import { useBranding } from "../hooks/useBranding";
 import { SecretsBackendDialog } from "./SecretsBackendDialog";
 import {
   isOpenRouterFreeOnly,
@@ -396,6 +397,43 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
             </>
           )}
         </div>
+        <AboutBuild />
+      </div>
+    </div>
+  );
+}
+
+/** Which org build this is — shown only on a customer build or when an org
+ *  policy is active, so an open-core Settings panel is unchanged. Support
+ *  matches the fingerprint against the build's release manifest. */
+function AboutBuild() {
+  const b = useBranding();
+  if (!b.customer_build && !b.policy) return null;
+  const row = (label: string, value?: string | null) =>
+    value ? (
+      <div className="flex justify-between gap-3">
+        <span style={{ color: "var(--text-secondary)" }}>{label}</span>
+        <span className="font-mono text-right break-all" style={{ color: "var(--text-primary)" }}>
+          {value}
+        </span>
+      </div>
+    ) : null;
+  return (
+    <div
+      className="mt-4 pt-3 text-xs space-y-1"
+      style={{ borderTop: "1px solid var(--border)" }}
+    >
+      <div className="font-semibold mb-1" style={{ color: "var(--text-primary)" }}>
+        About this build — {b.name}
+      </div>
+      {row("Policy issuer", b.policy?.issuer)}
+      {row("Issued", b.policy?.issued_at)}
+      {row("Expires", b.policy ? (b.policy.expires_at ?? "never") : null)}
+      {row("Verified with", b.policy?.key_source)}
+      {row("Key fingerprint", b.pubkey_fingerprint)}
+      {row("Support", b.support_email)}
+      <div className="pt-1" style={{ color: "var(--text-secondary)" }}>
+        powered by thClaws
       </div>
     </div>
   );
@@ -802,6 +840,8 @@ interface CloudConfig {
   token_length: number;
   env_var_set: boolean;
   token_writable: boolean;
+  effective_url: string;
+  policy_cloud: boolean;
 }
 
 // dev-plan/51 P3b: runs a `/cloud push|pull` slash command in the shared
@@ -834,7 +874,10 @@ function CloudSection() {
     token_length: 0,
     env_var_set: false,
     token_writable: true,
+    effective_url: "https://thclaws.cloud",
+    policy_cloud: false,
   });
+  const [signingIn, setSigningIn] = useState(false);
   const [urlDraft, setUrlDraft] = useState("");
   const [tokenDraft, setTokenDraft] = useState("");
   const [flash, setFlash] = useState<{ ok: boolean; msg: string } | undefined>(undefined);
@@ -855,7 +898,22 @@ function CloudSection() {
           token_length: typeof next.token_length === "number" ? next.token_length : 0,
           env_var_set: !!next.env_var_set,
           token_writable: !!next.token_writable,
+          effective_url: next.effective_url ?? next.url ?? next.default_url ?? "https://thclaws.cloud",
+          policy_cloud: !!next.policy_cloud,
         });
+      } else if (msg.type === "cloud_sign_out_result") {
+        const r = msg as { ok?: boolean; warning?: string | null; error?: string | null };
+        setFlash(
+          r.ok
+            ? { ok: !r.warning, msg: r.warning ?? "signed out" }
+            : { ok: false, msg: r.error ?? "sign-out failed" },
+        );
+        send({ type: "cloud_config_get" });
+      } else if (msg.type === "cloud_browser_login_result") {
+        const r = msg as { ok?: boolean; error?: string | null };
+        setSigningIn(false);
+        setFlash(r.ok ? { ok: true, msg: "signed in" } : { ok: false, msg: r.error ?? "sign-in failed" });
+        send({ type: "cloud_config_get" });
       } else if (msg.type === "phone_home_pair_ack") {
         const r = msg as { ok?: boolean; error?: string; pending?: boolean };
         if (r.ok && r.pending) setPhoneHome({ pending: true, msg: "pairing… (see chat)" });
@@ -898,6 +956,11 @@ function CloudSection() {
     const trimmed = tokenDraft.trim();
     if (!trimmed || isSentinel(trimmed)) return;
     send({ type: "cloud_config_set", token: trimmed });
+  };
+  const onBrowserLogin = () => {
+    setSigningIn(true);
+    setFlash({ ok: true, msg: "finish signing in in your browser…" });
+    send({ type: "cloud_browser_login" });
   };
   const onClearToken = () => {
     send({ type: "cloud_config_set", token: "" });
@@ -965,6 +1028,42 @@ function CloudSection() {
         />
         <SaveButton onClick={onSaveUrl} disabled={!urlDirty} />
         <ClearButton onClick={onClearUrl} disabled={!cfg.url} title="Clear configured URL" />
+      </div>
+
+      <div className="flex items-center gap-2 mb-2">
+        <button
+          onClick={onBrowserLogin}
+          disabled={signingIn || !cfg.token_writable}
+          className="px-2.5 py-1.5 rounded text-xs font-medium whitespace-nowrap"
+          style={{
+            background: "var(--accent)",
+            color: "#fff",
+            border: "1px solid var(--border)",
+            opacity: signingIn || !cfg.token_writable ? 0.6 : 1,
+          }}
+          title={`Sign in at ${cfg.effective_url} and store a token for this machine`}
+        >
+          {signingIn ? "Waiting for browser…" : "Sign in with browser"}
+        </button>
+        {cfg.policy_cloud && (
+          <button
+            onClick={() => send({ type: "cloud_sign_out" })}
+            disabled={signingIn}
+            className="px-2.5 py-1.5 rounded text-xs font-medium whitespace-nowrap"
+            style={{
+              background: "transparent",
+              color: "var(--text-primary)",
+              border: "1px solid var(--border)",
+            }}
+            title="Revoke this machine's sign-in on the server and forget it here"
+          >
+            Sign out
+          </button>
+        )}
+        <span className="text-xs font-mono" style={{ color: "var(--text-secondary)" }}>
+          {cfg.effective_url}
+          {cfg.policy_cloud ? " (set by your organisation)" : ""}
+        </span>
       </div>
 
       <FieldLabel

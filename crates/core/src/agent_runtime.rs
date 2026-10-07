@@ -109,7 +109,7 @@ pub async fn build_runtime_with_provider(
     // REPL + GUI register these; agent_runtime omitted them. HTTP
     // clients now get the same scaffolding the default system prompt
     // tells the model to use. TodoWrite is safe across surfaces (it
-    // writes per-project `.thclaws/todos.md`, which dev-plan/35's
+    // writes per-project `.thclaws/state/todos.md`, which dev-plan/35's
     // per-user state plumbing scopes correctly for multi-tenant
     // serve). Returned task_store handle is unused here (no
     // subagent factory wiring on the HTTP path) so dropped.

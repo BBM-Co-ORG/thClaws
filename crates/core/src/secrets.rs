@@ -1,7 +1,8 @@
 //! OS-keychain–backed storage for LLM API keys.
 //!
 //! Backend: macOS Keychain, Windows Credential Manager, or Linux Secret
-//! Service (via the `keyring` crate). Service name is `"thclaws"`, account
+//! Service (via the `keyring` crate). Service name comes from the build profile
+//! (`"thclaws"` for personal), account
 //! is the provider short name (`"anthropic"`, `"openai"`,
 //! `"gemini"`, `"dashscope"`).
 //!
@@ -12,10 +13,9 @@
 use crate::error::{Error, Result};
 use crate::providers::ProviderKind;
 
-const SERVICE: &str = "thclaws";
 /// Single-item account name used by the "one bundle, one ACL" layout.
 /// All provider keys live inside one JSON blob at
-/// service="thclaws", account="api-keys" so macOS only asks once for
+/// service=profile keychain service, account="api-keys" so macOS only asks once for
 /// the whole set. Legacy per-provider entries are still migrated
 /// lazily into the bundle on first read for backwards compat.
 const BUNDLE_ACCOUNT: &str = "api-keys";
@@ -45,7 +45,12 @@ struct BackendFile {
 }
 
 fn backend_path() -> Option<std::path::PathBuf> {
-    crate::util::home_dir().map(|h| h.join(".config/thclaws/secrets.json"))
+    crate::util::home_dir().map(|h| {
+        h.join(format!(
+            ".config/{}/secrets.json",
+            crate::profile::app_dir_name()
+        ))
+    })
 }
 
 /// Read the user's stored backend preference. `None` means the user
@@ -81,8 +86,27 @@ pub fn set_backend(backend: Backend) -> Result<()> {
 /// `load_into_env`) until the Settings UI prompts the user to
 /// choose. This is the whole point — a fresh launch must not cause
 /// keychain access prompts.
-fn resolved_backend() -> Backend {
+///
+/// Every writer of a secret (provider keys, the cloud and remote-agent
+/// tokens) must route by this, not by `get_backend()` with its own default:
+/// a writer that assumed Keychain while `set` refused it failed every
+/// sign-in made before the storage question was answered.
+pub fn resolved_backend() -> Backend {
     get_backend().unwrap_or(Backend::Dotenv)
+}
+
+/// One bundle entry read straight from the keychain, past this process's
+/// cache — for diagnosis: another process may have written it since.
+/// `Err` is the keychain's own error (denied, locked, unreadable).
+pub fn bundle_get_uncached(provider: &str) -> std::result::Result<Option<String>, String> {
+    let entry = bundle_entry().map_err(|e| e.to_string())?;
+    match entry.get_password() {
+        Ok(json) => serde_json::from_str::<std::collections::HashMap<String, String>>(&json)
+            .map(|m| m.get(provider).cloned())
+            .map_err(|e| format!("bundle is not valid JSON: {e}")),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// Providers whose keys thClaws manages in the keychain.
@@ -160,7 +184,7 @@ type KeychainEntry = std::sync::Arc<keyring::Entry>;
 
 #[cfg(not(test))]
 fn keychain_entry(account: &str) -> keyring::Result<KeychainEntry> {
-    keyring::Entry::new(SERVICE, account)
+    keyring::Entry::new(crate::profile::keychain_service(), account)
 }
 
 // Unit tests must never prompt for, read, or overwrite the host's credentials.
@@ -178,7 +202,11 @@ fn keychain_entry(account: &str) -> keyring::Result<KeychainEntry> {
     if let Some(entry) = entries.get(account) {
         return Ok(entry.clone());
     }
-    let credential = keyring::mock::default_credential_builder().build(None, SERVICE, account)?;
+    let credential = keyring::mock::default_credential_builder().build(
+        None,
+        crate::profile::keychain_service(),
+        account,
+    )?;
     let entry = Arc::new(keyring::Entry::new_with_credential(credential));
     entries.insert(account.to_string(), entry.clone());
     Ok(entry)

@@ -652,6 +652,11 @@ fn spawn_child(bot: &Arc<Bot>, program: &Path) -> Result<Spawned> {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    // The window runs detached, so each console-subsystem child would get a
+    // console of its own: a visible window per agent, and closing it kills
+    // the agent.
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
 
     let mut child = cmd
         .spawn()

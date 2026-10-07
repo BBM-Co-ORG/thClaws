@@ -81,8 +81,7 @@ impl VeoVideoProvider {
                 uri.to_string()
             };
         let client = Self::client(180)?;
-        let resp = client
-            .get(&url)
+        let resp = crate::multi_tenant::attach_member(client.get(&url))
             .header("x-goog-api-key", api_key)
             .send()
             .await
@@ -245,8 +244,7 @@ impl VideoProvider for VeoVideoProvider {
         )?;
         let url = format!("{}/v1beta/{}", ep.base_url.trim_end_matches('/'), job.op);
         let client = Self::client(30)?;
-        let resp = client
-            .get(&url)
+        let resp = crate::multi_tenant::attach_member(client.get(&url))
             .header("x-goog-api-key", &ep.api_key)
             .send()
             .await

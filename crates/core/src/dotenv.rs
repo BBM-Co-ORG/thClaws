@@ -30,7 +30,8 @@ pub fn load_dotenv() {
 }
 
 fn global_dotenv_path() -> Option<PathBuf> {
-    crate::util::home_dir().map(|h| h.join(".config/thclaws/.env"))
+    crate::util::home_dir()
+        .map(|h| h.join(format!(".config/{}/.env", crate::profile::app_dir_name())))
 }
 
 /// Resolve the user-scope `.env` path, exposed so higher layers can

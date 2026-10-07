@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { Plus } from "lucide-react";
 import { send, subscribe } from "../hooks/useIPC";
+import { useBranding } from "../hooks/useBranding";
 import { ModelPickerDropdown } from "./ModelPickerDropdown";
 import { KmsCreateModal, type KmsCreateMode } from "./KmsCreateModal";
 import { CtxMenuItem } from "./CtxMenuItem";
@@ -11,6 +12,17 @@ function sessionLabel(session: SessionInfo): string {
   const title = session.title?.trim();
   if (!owner || owner === "lead") return `Lead · ${title || `Session ${session.id.slice(-6)}`}`;
   return title ? `${owner} · ${title}` : owner;
+}
+
+type QuotaPeriod = { used_credits: number; limit_credits: number | null };
+type OrgQuota = { month: QuotaPeriod; day?: QuotaPeriod | null };
+
+const fmtCredits = (n: number) => Math.round(n).toLocaleString("en-US");
+
+function quotaLine(p: QuotaPeriod | null | undefined, label: string): string {
+  if (!p) return `no limit ${label}`;
+  const limit = p.limit_credits == null ? "no limit" : fmtCredits(p.limit_credits);
+  return `${fmtCredits(p.used_credits)} / ${limit} ${label}`;
 }
 
 type KmsInfo = { name: string; scope: "user" | "project"; active: boolean };
@@ -136,6 +148,27 @@ export function Sidebar({ onBrowseKms }: SidebarProps = {}) {
   const [activeProvider, setActiveProvider] = useState("");
   const [activeModel, setActiveModel] = useState("");
   const [providerReady, setProviderReady] = useState(true);
+  const branding = useBranding();
+  const [orgSignIn, setOrgSignIn] = useState<{ busy: boolean; error?: string }>({ busy: false });
+  const [orgAccount, setOrgAccount] = useState<string | null>(null);
+  const [orgNote, setOrgNote] = useState<string | null>(null);
+  // Credits left on a quota-billed install; null hides the line (not
+  // signed in, or the install doesn't bill by quota).
+  const [orgQuota, setOrgQuota] = useState<OrgQuota | null>(null);
+  const orgCloudUrlRef = useRef(branding.org_cloud_url);
+  useEffect(() => {
+    orgCloudUrlRef.current = branding.org_cloud_url;
+  }, [branding.org_cloud_url]);
+  // Who this org-gateway desktop is signed in as — asked whenever the
+  // provider turns ready (after startup or a sign-in). The account line only
+  // renders while providerReady, and sign-out clears it, so nothing resets
+  // it here.
+  useEffect(() => {
+    if (branding.org_cloud_url && providerReady) {
+      send({ type: "cloud_whoami" });
+      send({ type: "cloud_quota" });
+    }
+  }, [branding.org_cloud_url, providerReady]);
   // Inline model picker dropdown anchored to the Provider section.
   // null means closed; opens on click of the active model row. #49.
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
@@ -209,6 +242,28 @@ export function Sidebar({ onBrowseKms }: SidebarProps = {}) {
         // rename) omit it. Preserve the last-known value in that case.
         if (typeof msg.current_id === "string") {
           setCurrentSessionId(msg.current_id as string);
+        }
+      } else if (msg.type === "cloud_quota_result") {
+        setOrgQuota((msg.quota as OrgQuota | null) ?? null);
+      } else if (msg.type === "chat_done") {
+        if (orgCloudUrlRef.current) send({ type: "cloud_quota" });
+      } else if (msg.type === "cloud_whoami_result") {
+        setOrgAccount(typeof msg.email === "string" ? (msg.email as string) : null);
+      } else if (msg.type === "cloud_sign_out_result") {
+        const r = msg as { ok?: boolean; warning?: string | null; error?: string | null };
+        setOrgSignIn({ busy: false });
+        setOrgAccount(null);
+        setOrgQuota(null);
+        setOrgNote(r.ok ? (r.warning ?? null) : (r.error ?? "sign-out failed"));
+        send({ type: "config_poll" });
+      } else if (msg.type === "cloud_browser_login_result") {
+        const r = msg as { ok?: boolean; error?: string | null };
+        setOrgSignIn(r.ok ? { busy: false } : { busy: false, error: r.error ?? "sign-in failed" });
+        if (r.ok) {
+          // A new sign-in supersedes whatever the last sign-out warned about.
+          setOrgNote(null);
+          send({ type: "config_poll" });
+          send({ type: "cloud_quota" });
         }
       } else if (msg.type === "initial_state" || msg.type === "provider_update") {
         if (msg.provider) setActiveProvider(msg.provider as string);
@@ -427,7 +482,78 @@ export function Sidebar({ onBrowseKms }: SidebarProps = {}) {
               {activeModel}
             </div>
           </button>
-          {!providerReady && (
+          {!providerReady && branding.org_cloud_url && (
+            <div className="ml-3 mt-1" style={{ fontSize: "10px" }}>
+              <button
+                type="button"
+                disabled={orgSignIn.busy}
+                onClick={() => {
+                  setOrgSignIn({ busy: true });
+                  setOrgNote(null);
+                  send({ type: "cloud_browser_login" });
+                }}
+                style={{
+                  color: "var(--accent)",
+                  background: "none",
+                  border: "none",
+                  padding: 0,
+                  cursor: orgSignIn.busy ? "default" : "pointer",
+                  textDecoration: "underline",
+                  fontSize: "10px",
+                }}
+              >
+                {orgSignIn.busy ? "Waiting for your browser…" : `Sign in to ${branding.name}`}
+              </button>
+              {orgSignIn.error && (
+                <div style={{ color: "var(--danger, #e06c75)" }}>{orgSignIn.error}</div>
+              )}
+            </div>
+          )}
+          {providerReady && branding.org_cloud_url && (
+            <div
+              className="ml-3 mt-1"
+              style={{ fontSize: "10px", color: "var(--text-secondary)" }}
+            >
+              {orgAccount ?? "signed in"} ·{" "}
+              <button
+                type="button"
+                disabled={orgSignIn.busy}
+                onClick={() => {
+                  setOrgSignIn({ busy: true });
+                  setOrgNote(null);
+                  send({ type: "cloud_sign_out" });
+                }}
+                style={{
+                  color: "var(--accent)",
+                  background: "none",
+                  border: "none",
+                  padding: 0,
+                  cursor: "pointer",
+                  textDecoration: "underline",
+                  fontSize: "10px",
+                }}
+              >
+                Sign out
+              </button>
+            </div>
+          )}
+          {providerReady && branding.org_cloud_url && orgQuota && (
+            <div
+              className="ml-3 mt-1"
+              style={{ fontSize: "10px", color: "var(--text-secondary)" }}
+            >
+              Credits: {quotaLine(orgQuota.month, "this month")} · {quotaLine(orgQuota.day, "today")}
+            </div>
+          )}
+          {orgNote && branding.org_cloud_url && (
+            <div
+              className="ml-3 mt-1"
+              style={{ fontSize: "10px", color: "var(--warning, #d19a66)" }}
+            >
+              {orgNote}
+            </div>
+          )}
+          {!providerReady && !branding.org_cloud_url && (
             <div
               className="ml-3 mt-1"
               style={{ color: "var(--danger, #e06c75)", fontSize: "10px" }}

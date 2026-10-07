@@ -224,8 +224,7 @@ impl VideoProvider for LtxVideoProvider {
             format!("text-to-video/{}", job.op)
         };
         let url = format!("{}/v2/{}", ep.base_url.trim_end_matches('/'), op);
-        let resp = Self::client(30)?
-            .get(&url)
+        let resp = crate::multi_tenant::attach_member(Self::client(30)?.get(&url))
             .bearer_auth(&ep.api_key)
             .send()
             .await

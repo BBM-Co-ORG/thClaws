@@ -109,7 +109,10 @@ pub fn pubkey_search_paths() -> Vec<PathBuf> {
     let mut out = Vec::with_capacity(2);
     out.push(PathBuf::from("/etc/thclaws/policy.pub"));
     if let Some(home) = crate::util::home_dir() {
-        out.push(home.join(".config/thclaws/policy.pub"));
+        out.push(home.join(format!(
+            ".config/{}/policy.pub",
+            crate::profile::app_dir_name()
+        )));
     }
     out
 }

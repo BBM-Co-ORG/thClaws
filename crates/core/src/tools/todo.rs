@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Per-field length cap. IDs are slug-like (id="1", id="abc-3"); 64 is generous.
 const MAX_ID_LEN: usize = 64;
@@ -50,46 +50,6 @@ impl TodoItem {
 pub struct TodoWriteTool;
 
 impl TodoWriteTool {
-    fn todos_path() -> PathBuf {
-        PathBuf::from(".thclaws").join("state").join("todos.md")
-    }
-
-    /// Write todos to a specific root directory (for testing).
-    #[cfg(test)]
-    fn write_todos_to(root: &std::path::Path, todos: &[TodoItem]) -> Result<String> {
-        let path = root.join(".thclaws").join("state").join("todos.md");
-
-        // Build markdown content.
-        let mut md = String::from("# Todos\n\n");
-        if todos.is_empty() {
-            md.push_str("_No todos._\n");
-        } else {
-            for todo in todos {
-                md.push_str(&todo.to_markdown());
-                md.push('\n');
-            }
-        }
-
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| Error::Tool(format!("failed to create .thclaws dir: {e}")))?;
-        }
-        std::fs::write(&path, &md)
-            .map_err(|e| Error::Tool(format!("failed to write todos.md: {e}")))?;
-
-        let completed = todos.iter().filter(|t| t.status == "completed").count();
-        let in_progress = todos.iter().filter(|t| t.status == "in_progress").count();
-        let pending = todos.iter().filter(|t| t.status == "pending").count();
-
-        Ok(format!(
-            "Wrote {} todo(s) to .thclaws/state/todos.md ({} pending, {} in progress, {} completed)",
-            todos.len(),
-            pending,
-            in_progress,
-            completed,
-        ))
-    }
-
     fn parse_todos(input: &Value) -> Result<Vec<TodoItem>> {
         let todos_val = input
             .get("todos")
@@ -171,8 +131,8 @@ impl TodoWriteTool {
     /// repro confirmed the write lands at the symlink target. Same
     /// defense pattern as `kms::writable_page_path` and
     /// `memory::writable_entry_path`.
-    fn check_thclaws_not_symlinked() -> Result<()> {
-        let dir = PathBuf::from(".thclaws");
+    fn check_thclaws_not_symlinked(root: &Path) -> Result<()> {
+        let dir = root.join(".thclaws");
         if let Ok(md) = std::fs::symlink_metadata(&dir) {
             if md.file_type().is_symlink() {
                 return Err(Error::Tool(
@@ -215,9 +175,9 @@ impl Tool for TodoWriteTool {
     fn description(&self) -> &'static str {
         "Casual scratchpad for YOUR OWN task tracking during informal \
          multi-step work — writes to .thclaws/state/todos.md as a markdown \
-         checklist. Invisible in the chat / sidebar; the user only sees \
-         it if they open the file. No approval gate, no driver, no \
-         sequential enforcement.\n\n\
+         checklist. The user sees it live in the Todos sidebar and can \
+         clear it themselves (`/todo clear`). No driver, no sequential \
+         enforcement.\n\n\
          \
          **At session start, if `.thclaws/state/todos.md` already exists, read \
          it first.** Incomplete items (pending or in_progress) are work \
@@ -277,56 +237,97 @@ impl Tool for TodoWriteTool {
 
     async fn call(&self, input: Value) -> Result<String> {
         let todos = Self::parse_todos(&input)?;
-
-        // M6.30: validate ALL inputs before touching disk. Validation
-        // chain: per-field sanitization (TW2), status enum (TW3),
-        // unique-id check (TW4). First error wins; nothing written.
-        Self::validate_todos(&todos)?;
-
-        // Build markdown content.
-        let mut md = String::from("# Todos\n\n");
-        if todos.is_empty() {
-            md.push_str("_No todos._\n");
-        } else {
-            for todo in &todos {
-                md.push_str(&todo.to_markdown());
-                md.push('\n');
-            }
-        }
-
-        // M6.30 TW1: refuse if `.thclaws/` is a symlink. Without this
-        // check, an attacker-planted `.thclaws -> /tmp/anywhere`
-        // symlink would let TodoWrite escape the project root via
-        // `std::fs::write` (which follows symlinks). Verified
-        // empirically before fix.
-        Self::check_thclaws_not_symlinked()?;
-
-        // Write to .thclaws/state/todos.md (relative to cwd).
-        let path = Self::todos_path();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| Error::Tool(format!("failed to create .thclaws dir: {e}")))?;
-        }
-        std::fs::write(&path, &md)
-            .map_err(|e| Error::Tool(format!("failed to write todos.md: {e}")))?;
-
-        // Broadcast the new list to the GUI sidebar (no-op in CLI —
-        // the worker only registers a broadcaster when running with
-        // the GUI / serve surface).
-        super::todo_state::fire(todos.clone());
-
-        let completed = todos.iter().filter(|t| t.status == "completed").count();
-        let in_progress = todos.iter().filter(|t| t.status == "in_progress").count();
-        let pending = todos.iter().filter(|t| t.status == "pending").count();
-
-        Ok(format!(
-            "Wrote {} todo(s) to .thclaws/state/todos.md ({} pending, {} in progress, {} completed)",
-            todos.len(),
-            pending,
-            in_progress,
-            completed,
-        ))
+        write_todos(Path::new("."), &todos)
     }
+}
+
+fn todos_path(root: &Path) -> PathBuf {
+    root.join(".thclaws").join("state").join("todos.md")
+}
+
+/// The one write path for todos.md — TodoWrite, the `/todo` command and
+/// the sidebar all go through here so validation, the symlink guard and
+/// the sidebar broadcast can't drift apart.
+pub fn write_todos(root: &Path, todos: &[TodoItem]) -> Result<String> {
+    // M6.30: validate ALL inputs before touching disk. First error
+    // wins; nothing written.
+    TodoWriteTool::validate_todos(todos)?;
+
+    let mut md = String::from("# Todos\n\n");
+    if todos.is_empty() {
+        md.push_str("_No todos._\n");
+    } else {
+        for todo in todos {
+            md.push_str(&todo.to_markdown());
+            md.push('\n');
+        }
+    }
+
+    TodoWriteTool::check_thclaws_not_symlinked(root)?;
+
+    let path = todos_path(root);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| Error::Tool(format!("failed to create .thclaws dir: {e}")))?;
+    }
+    std::fs::write(&path, &md)
+        .map_err(|e| Error::Tool(format!("failed to write todos.md: {e}")))?;
+
+    super::todo_state::fire(todos.to_vec());
+
+    let completed = todos.iter().filter(|t| t.status == "completed").count();
+    let in_progress = todos.iter().filter(|t| t.status == "in_progress").count();
+    let pending = todos.iter().filter(|t| t.status == "pending").count();
+
+    Ok(format!(
+        "Wrote {} todo(s) to .thclaws/state/todos.md ({} pending, {} in progress, {} completed)",
+        todos.len(),
+        pending,
+        in_progress,
+        completed,
+    ))
+}
+
+/// Delete todos.md and broadcast the empty list. Removing (rather than
+/// writing `_No todos._`) keeps a cleared workspace identical to one
+/// that never had a list. Returns whether a file was removed.
+pub fn clear_todos(root: &Path) -> bool {
+    let removed = std::fs::remove_file(todos_path(root)).is_ok();
+    super::todo_state::fire(Vec::new());
+    removed
+}
+
+/// `chat_todo_update` frame for a (re)connecting page. The worker's boot
+/// broadcast lands before any page subscribes, so without this the
+/// sidebar stays empty until the model next calls TodoWrite.
+pub fn todo_update_frame(root: &Path) -> String {
+    json!({
+        "type": "chat_todo_update",
+        "todos": read_todos_from_disk(root),
+    })
+    .to_string()
+}
+
+/// Plain-text listing for the `/todo` command (CLI + GUI chat).
+pub fn render_todos(todos: &[TodoItem]) -> String {
+    if todos.is_empty() {
+        return "no todos (.thclaws/state/todos.md)".into();
+    }
+    let done = todos.iter().filter(|t| t.status == "completed").count();
+    let mut out = format!(
+        "todos — {done}/{} done (.thclaws/state/todos.md)\n",
+        todos.len()
+    );
+    for (i, t) in todos.iter().enumerate() {
+        let mark = match t.status.as_str() {
+            "completed" => "[x]",
+            "in_progress" => "[-]",
+            _ => "[ ]",
+        };
+        out.push_str(&format!("  {}. {mark} {}\n", i + 1, t.content));
+    }
+    out.push_str("clear with /todo clear");
+    out
 }
 
 /// Parse `.thclaws/state/todos.md` back into a `Vec<TodoItem>` so the GUI
@@ -336,8 +337,8 @@ impl Tool for TodoWriteTool {
 /// the empty-state placeholder. Returns an empty vec on any I/O or
 /// parse trouble (the sidebar simply shows nothing — better than
 /// crashing the worker).
-pub fn read_todos_from_disk(root: &std::path::Path) -> Vec<TodoItem> {
-    let path = root.join(".thclaws").join("state").join("todos.md");
+pub fn read_todos_from_disk(root: &Path) -> Vec<TodoItem> {
+    let path = todos_path(root);
     let Ok(raw) = std::fs::read_to_string(&path) else {
         return Vec::new();
     };
@@ -400,7 +401,7 @@ mod tests {
             },
         ];
 
-        let result = TodoWriteTool::write_todos_to(dir.path(), &todos).unwrap();
+        let result = write_todos(dir.path(), &todos).unwrap();
         assert!(result.contains("3 todo(s)"));
         assert!(result.contains("1 pending"));
         assert!(result.contains("1 in progress"));
@@ -417,7 +418,7 @@ mod tests {
     async fn write_empty_todos() {
         let dir = tempfile::tempdir().unwrap();
 
-        let result = TodoWriteTool::write_todos_to(dir.path(), &[]).unwrap();
+        let result = write_todos(dir.path(), &[]).unwrap();
         assert!(result.contains("0 todo(s)"));
 
         let contents = std::fs::read_to_string(dir.path().join(".thclaws/state/todos.md")).unwrap();
@@ -434,7 +435,7 @@ mod tests {
             content: "Old task".into(),
             status: "pending".into(),
         }];
-        TodoWriteTool::write_todos_to(dir.path(), &todos1).unwrap();
+        write_todos(dir.path(), &todos1).unwrap();
 
         // Second write (full replacement)
         let todos2 = vec![TodoItem {
@@ -442,7 +443,7 @@ mod tests {
             content: "New task".into(),
             status: "completed".into(),
         }];
-        TodoWriteTool::write_todos_to(dir.path(), &todos2).unwrap();
+        write_todos(dir.path(), &todos2).unwrap();
 
         let contents = std::fs::read_to_string(dir.path().join(".thclaws/state/todos.md")).unwrap();
         assert!(!contents.contains("Old task"));
@@ -547,7 +548,7 @@ mod tests {
                 status: "pending".into(),
             },
         ];
-        TodoWriteTool::write_todos_to(dir.path(), &todos).unwrap();
+        write_todos(dir.path(), &todos).unwrap();
         let parsed = read_todos_from_disk(dir.path());
         assert_eq!(parsed.len(), 3);
         assert_eq!(parsed[0].id, "1");
@@ -566,9 +567,75 @@ mod tests {
     }
 
     #[test]
+    fn clear_todos_removes_file_and_reports_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let todos = vec![TodoItem {
+            id: "1".into(),
+            content: "Stale".into(),
+            status: "in_progress".into(),
+        }];
+        write_todos(dir.path(), &todos).unwrap();
+        assert!(clear_todos(dir.path()));
+        assert!(!dir.path().join(".thclaws/state/todos.md").exists());
+        assert!(read_todos_from_disk(dir.path()).is_empty());
+        assert!(
+            !clear_todos(dir.path()),
+            "second clear has nothing to remove"
+        );
+    }
+
+    #[test]
+    fn write_todos_validates_for_every_caller() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = vec![TodoItem {
+            id: "1".into(),
+            content: "two\nlines".into(),
+            status: "pending".into(),
+        }];
+        assert!(write_todos(dir.path(), &bad).is_err());
+        assert!(!dir.path().join(".thclaws/state/todos.md").exists());
+    }
+
+    #[test]
+    fn todo_update_frame_carries_disk_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let todos = vec![TodoItem {
+            id: "a".into(),
+            content: "Resume me".into(),
+            status: "pending".into(),
+        }];
+        write_todos(dir.path(), &todos).unwrap();
+        let v: Value = serde_json::from_str(&todo_update_frame(dir.path())).unwrap();
+        assert_eq!(v["type"], "chat_todo_update");
+        assert_eq!(v["todos"][0]["content"], "Resume me");
+        assert_eq!(v["todos"][0]["status"], "pending");
+    }
+
+    #[test]
+    fn render_todos_numbers_items_and_names_clear() {
+        assert!(render_todos(&[]).contains("no todos"));
+        let out = render_todos(&[
+            TodoItem {
+                id: "1".into(),
+                content: "Done".into(),
+                status: "completed".into(),
+            },
+            TodoItem {
+                id: "2".into(),
+                content: "Next".into(),
+                status: "pending".into(),
+            },
+        ]);
+        assert!(out.contains("1/2 done"));
+        assert!(out.contains("1. [x] Done"));
+        assert!(out.contains("2. [ ] Next"));
+        assert!(out.contains("/todo clear"));
+    }
+
+    #[test]
     fn read_todos_from_disk_skips_empty_state_marker() {
         let dir = tempfile::tempdir().unwrap();
-        TodoWriteTool::write_todos_to(dir.path(), &[]).unwrap();
+        write_todos(dir.path(), &[]).unwrap();
         // The file contains "_No todos._" — the parser must not
         // treat that as a todo item.
         assert!(read_todos_from_disk(dir.path()).is_empty());

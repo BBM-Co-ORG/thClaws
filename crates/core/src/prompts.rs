@@ -56,7 +56,11 @@ fn user_path(name: &str) -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("thclaws").join(DIR).join(format!("{name}.md")))
+    Some(
+        base.join(crate::profile::app_dir_name())
+            .join(DIR)
+            .join(format!("{name}.md")),
+    )
 }
 
 /// Load a prompt template by name. Returns the override content (project →
@@ -411,7 +415,8 @@ pub(crate) fn services_prompt_section(browser_active: bool) -> String {
 
     // In hosted gateway mode the search keys live on the gateway, not
     // in the runner's env — Tavily is reachable even with no local key.
-    let gateway_mode = std::env::var("THCLAWS_USES_GATEWAY").ok().as_deref() == Some("1");
+    let gateway_mode = std::env::var("THCLAWS_USES_GATEWAY").ok().as_deref() == Some("1")
+        || crate::shared::policy_gateway_mode();
     let tavily_ok = gateway_mode
         || std::env::var("TAVILY_API_KEY")
             .ok()

@@ -715,11 +715,48 @@ fn resolve_backend(
     thai: bool,
     errors: &mut Vec<CompileError>,
 ) -> BackendId {
+    resolve_backend_with(shot, film, sid, thai, errors, BackendId::reachable)
+}
+
+/// [`resolve_backend`] against an explicit reachability test. On a
+/// gateway-locked install the default is the first reachable backend and
+/// an unreachable one is `E_BACKEND_UNAVAILABLE`.
+fn resolve_backend_with(
+    shot: Option<&str>,
+    film: Option<&str>,
+    sid: &str,
+    thai: bool,
+    errors: &mut Vec<CompileError>,
+    reach: impl Fn(BackendId) -> bool,
+) -> BackendId {
+    let default = BackendId::default_with(&reach);
     let raw = match shot.or(film) {
-        None => return BackendId::default(),
+        None => return default,
         Some(r) => r,
     };
     match BackendId::parse(raw) {
+        Some(b) if !reach(b) => {
+            let avail: Vec<&str> = BackendId::ALL
+                .into_iter()
+                .filter(|b| reach(*b))
+                .map(BackendId::as_str)
+                .collect();
+            let avail = if avail.is_empty() {
+                "-".to_string()
+            } else {
+                avail.join(" | ")
+            };
+            errors.push(CompileError::error(
+                "E_BACKEND_UNAVAILABLE",
+                Some(sid),
+                msg(
+                    thai,
+                    &format!("shot {sid}: @backend '{raw}' ใช้ไม่ได้บนระบบนี้ (ใช้ได้: {avail})"),
+                    &format!("shot {sid}: @backend '{raw}' is not available on this deployment (available: {avail})"),
+                ),
+            ));
+            default
+        }
         Some(b) => b,
         None => {
             errors.push(CompileError::error(
@@ -731,7 +768,7 @@ fn resolve_backend(
                     &format!("shot {sid}: unknown @backend '{raw}' (grok | ltx | seedance | veo | happyhorse)"),
                 ),
             ));
-            BackendId::default()
+            default
         }
     }
 }
@@ -755,6 +792,33 @@ mod tests {
         let (prog, perr) = parse(src);
         assert!(perr.is_empty(), "{perr:?}");
         resolve(&prog)
+    }
+
+    #[test]
+    fn locked_backend_default_and_unavailable_error() {
+        let only_hh = |b: BackendId| b == BackendId::HappyHorse;
+        let mut errs = Vec::new();
+        assert_eq!(
+            resolve_backend_with(None, None, "s1", false, &mut errs, only_hh),
+            BackendId::HappyHorse
+        );
+        assert_eq!(
+            resolve_backend_with(Some("grok"), None, "s1", false, &mut errs, only_hh),
+            BackendId::HappyHorse
+        );
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].code, "E_BACKEND_UNAVAILABLE");
+        assert!(
+            errs[0].message.contains("happyhorse"),
+            "{}",
+            errs[0].message
+        );
+        let mut none = Vec::new();
+        assert_eq!(
+            resolve_backend_with(None, Some("ltx"), "s1", false, &mut none, |_| true),
+            BackendId::Ltx
+        );
+        assert!(none.is_empty());
     }
 
     #[test]

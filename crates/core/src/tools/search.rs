@@ -85,6 +85,9 @@ pub struct WebSearchTool {
     // search keys and the gateway injects the credential. See
     // `crate::tools::gateway_route`.
     gateway: Option<crate::tools::GatewayRoute>,
+    // Gateway-locked install: search only through the gateway. A direct
+    // backend (DDG, BYOK You.com/Serply) would send the query outside it.
+    locked: bool,
 }
 
 impl WebSearchTool {
@@ -100,6 +103,7 @@ impl WebSearchTool {
             client,
             engine: engine.to_string(),
             gateway: crate::tools::gateway_route(),
+            locked: crate::shared::gateway_providers_locked(),
         }
     }
 
@@ -124,8 +128,8 @@ impl WebSearchTool {
         let try_tavily = matches!(engine, "auto" | "" | "tavily");
         let try_brave = matches!(engine, "auto" | "" | "brave");
         let try_serpapi = matches!(engine, "auto" | "" | "serpapi");
-        let try_youcom = matches!(engine, "auto" | "" | "youcom" | "you.com");
-        let try_serply = matches!(engine, "auto" | "" | "serply");
+        let try_youcom = !self.locked && matches!(engine, "auto" | "" | "youcom" | "you.com");
+        let try_serply = !self.locked && matches!(engine, "auto" | "" | "serply");
         // DDG is the universal fallback for everything except a DDG pin
         // (where it's already the only candidate, no need to fall back to
         // itself) and... well, only that.
@@ -181,7 +185,7 @@ impl WebSearchTool {
         }
         // The DDG pin produces a one-element chain; auto/tavily/brave
         // produce DDG-as-fallback in addition to the keyed entries.
-        if try_ddg || matches!(engine, "duckduckgo" | "ddg") {
+        if !self.locked && (try_ddg || matches!(engine, "duckduckgo" | "ddg")) {
             out.push(Backend::Ddg);
         }
         out
@@ -206,13 +210,14 @@ impl WebSearchTool {
             if let Some(f) = freshness {
                 body["time_range"] = json!(f);
             }
-            self.client
-                .post(format!("{}/tavily/search", gw.base))
-                .header("authorization", format!("Bearer {key}"))
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| Error::Tool(format!("tavily: {e}")))?
+            crate::multi_tenant::attach_member(
+                self.client.post(format!("{}/tavily/search", gw.base)),
+            )
+            .header("authorization", format!("Bearer {key}"))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| Error::Tool(format!("tavily: {e}")))?
         } else {
             let mut body = json!({
                 "api_key": key,
@@ -290,14 +295,16 @@ impl WebSearchTool {
         // the real `X-Subscription-Token`. Direct mode: `key` IS the
         // Brave token, sent in that header.
         let resp = if let Some(gw) = &self.gateway {
-            self.client
-                .get(format!("{}/brave/res/v1/web/search", gw.base))
-                .query(&params)
-                .header("authorization", format!("Bearer {key}"))
-                .header("Accept", "application/json")
-                .send()
-                .await
-                .map_err(|e| Error::Tool(format!("brave: {e}")))?
+            crate::multi_tenant::attach_member(
+                self.client
+                    .get(format!("{}/brave/res/v1/web/search", gw.base)),
+            )
+            .query(&params)
+            .header("authorization", format!("Bearer {key}"))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .map_err(|e| Error::Tool(format!("brave: {e}")))?
         } else {
             self.client
                 .get("https://api.search.brave.com/res/v1/web/search")
@@ -349,13 +356,14 @@ impl WebSearchTool {
         let num = max.to_string();
         let base_params = [("engine", "google"), ("q", query), ("num", num.as_str())];
         let resp = if let Some(gw) = &self.gateway {
-            self.client
-                .get(format!("{}/serpapi/search", gw.base))
-                .query(&base_params)
-                .header("authorization", format!("Bearer {key}"))
-                .send()
-                .await
-                .map_err(|e| Error::Tool(format!("serpapi: {e}")))?
+            crate::multi_tenant::attach_member(
+                self.client.get(format!("{}/serpapi/search", gw.base)),
+            )
+            .query(&base_params)
+            .header("authorization", format!("Bearer {key}"))
+            .send()
+            .await
+            .map_err(|e| Error::Tool(format!("serpapi: {e}")))?
         } else {
             self.client
                 .get("https://serpapi.com/search")
@@ -643,9 +651,11 @@ impl Tool for WebSearchTool {
             "resolve_candidates() should always return at least one backend"
         );
         if candidates.is_empty() {
-            return Err(Error::Tool(
-                "no search backends available — check engine config".into(),
-            ));
+            return Err(Error::Tool(if self.locked {
+                "web search is not available on this deployment".into()
+            } else {
+                "no search backends available — check engine config".into()
+            }));
         }
 
         // Try each candidate in priority order. First Ok wins; errors
@@ -693,14 +703,21 @@ impl Tool for WebSearchTool {
                     };
                     return Ok(format!("{header}\n\n{body}"));
                 }
+                // Locked: name the backend only — the raw upstream error
+                // (a gateway 403 body) means nothing to the model or user.
+                Err(_) if self.locked => errors.push(format!("{} unavailable", backend.name())),
                 Err(e) => errors.push(format!("{}: {e}", backend.name())),
             }
         }
 
-        Err(Error::Tool(format!(
-            "all WebSearch backends failed: {}",
-            errors.join("; ")
-        )))
+        Err(Error::Tool(if self.locked {
+            format!(
+                "web search is unavailable on this deployment right now ({})",
+                errors.join(", ")
+            )
+        } else {
+            format!("all WebSearch backends failed: {}", errors.join("; "))
+        }))
     }
 }
 
@@ -798,9 +815,39 @@ mod tests {
                 base: "http://gateway:8080".to_string(),
                 token: "gw_v1_test".to_string(),
             }),
+            locked: false,
         };
         let chain: Vec<&'static str> = tool.resolve_candidates().iter().map(|b| b.name()).collect();
         assert_eq!(chain, vec!["tavily", "brave", "serpapi", "duckduckgo"]);
+    }
+
+    #[test]
+    fn locked_install_never_leaves_the_gateway() {
+        // A gateway-locked install searches only through its gateway: no
+        // DuckDuckGo floor, no BYOK You.com/Serply, and a DDG pin gets nothing.
+        let _e = scoped_env();
+        std::env::set_var("YDC_API_KEY", "y");
+        std::env::set_var("SERPLY_API_KEY", "s");
+        let gw = || {
+            Some(crate::tools::GatewayRoute {
+                base: "http://gateway:8080".to_string(),
+                token: "gw_v1_test".to_string(),
+            })
+        };
+        let tool = |engine: &str| WebSearchTool {
+            client: reqwest::Client::new(),
+            engine: engine.to_string(),
+            gateway: gw(),
+            locked: true,
+        };
+        let chain = |t: WebSearchTool| -> Vec<&'static str> {
+            t.resolve_candidates().iter().map(|b| b.name()).collect()
+        };
+        assert_eq!(chain(tool("auto")), vec!["tavily", "brave", "serpapi"]);
+        assert!(chain(tool("duckduckgo")).is_empty());
+        assert!(chain(tool("youcom")).is_empty());
+        std::env::remove_var("YDC_API_KEY");
+        std::env::remove_var("SERPLY_API_KEY");
     }
 
     #[test]

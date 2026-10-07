@@ -111,6 +111,8 @@ pub struct SpeechRequest {
     pub text: String,
     pub voice: String,
     pub style: Option<String>,
+    /// Language code or name ("th", "en"…); empty = the provider decides.
+    pub language: String,
 }
 
 /// Result of a successful synthesis — a self-contained audio file's bytes
@@ -248,7 +250,12 @@ pub fn resolve_endpoint(
     native_base: &str,
     gateway_segment: &str,
 ) -> Result<ResolvedEndpoint> {
-    let native = resolve_native_key(native_key_vars);
+    // A locked install reaches media only through its gateway, like its LLMs.
+    let native = if crate::shared::gateway_providers_locked() {
+        None
+    } else {
+        resolve_native_key(native_key_vars)
+    };
     if let Some(ref key) = native {
         if key != "gateway-placeholder" {
             return Ok(ResolvedEndpoint {
@@ -277,6 +284,34 @@ pub fn resolve_endpoint(
                 "no API key — set one of {native_key_vars:?}, or enable the thClaws Gateway (sign in to thClaws.cloud, add a `gateway` key, or set THCLAWS_GATEWAY_API_KEY)"
             ))
         })
+}
+
+/// Gateway segment for DashScope-native media (Qwen-Image, Wan, HappyHorse).
+/// A locked install reaches Model Studio through whichever DashScope-backed
+/// segment its gateway serves — `sis` is its own Model Studio workspace.
+/// `None` = this install has no route to it.
+pub fn dashscope_media_segment() -> Option<&'static str> {
+    dashscope_segment_for(
+        crate::shared::gateway_providers_locked(),
+        &crate::shared::gateway_routed_providers(),
+    )
+}
+
+pub(crate) fn dashscope_segment_for(locked: bool, routed: &[String]) -> Option<&'static str> {
+    if !locked {
+        return Some("dashscope");
+    }
+    ["dashscope", "sis"]
+        .into_iter()
+        .find(|s| routed.iter().any(|r| r == s))
+}
+
+/// [`resolve_endpoint`] for a DashScope-native media call.
+pub fn resolve_dashscope_endpoint(native_base: &str) -> Result<ResolvedEndpoint> {
+    let segment = dashscope_media_segment().ok_or_else(|| {
+        Error::Tool("DashScope image/video models are not available on this deployment".into())
+    })?;
+    resolve_endpoint(&["DASHSCOPE_API_KEY"], native_base, segment)
 }
 
 /// First non-empty env var among `vars`, with wrapping-quote strip —

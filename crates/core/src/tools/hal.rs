@@ -92,8 +92,7 @@ async fn hal_post(client: &reqwest::Client, path: &str, body: &Value) -> Result<
     // bearer; the gateway injects the real X-API-Key. Direct mode: hit
     // HAL directly with the local key.
     let req = if let Some(gw) = crate::tools::gateway_route() {
-        client
-            .post(format!("{}/hal{path}", gw.base))
+        crate::multi_tenant::attach_member(client.post(format!("{}/hal{path}", gw.base)))
             .header("authorization", format!("Bearer {}", gw.token))
     } else {
         let key = std::env::var("HAL_API_KEY").map_err(|_| {

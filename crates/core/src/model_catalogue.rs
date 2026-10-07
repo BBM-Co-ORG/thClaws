@@ -899,7 +899,10 @@ pub fn load_overrides_from_settings() -> HashMap<String, ModelEntry> {
     let mut out: HashMap<String, ModelEntry> = HashMap::new();
     let mut paths: Vec<PathBuf> = Vec::new();
     if let Some(home) = crate::util::home_dir() {
-        paths.push(home.join(".config/thclaws/settings.json"));
+        paths.push(home.join(format!(
+            ".config/{}/settings.json",
+            crate::profile::app_dir_name()
+        )));
     }
     let project_root = std::env::var("THCLAWS_PROJECT_ROOT")
         .ok()
@@ -953,7 +956,10 @@ pub fn save_override(
     let path = match scope {
         OverrideScope::User => {
             let home = crate::util::home_dir().ok_or(RefreshError::NoHome)?;
-            home.join(".config/thclaws/settings.json")
+            home.join(format!(
+                ".config/{}/settings.json",
+                crate::profile::app_dir_name()
+            ))
         }
         OverrideScope::Project => {
             let root = std::env::var("THCLAWS_PROJECT_ROOT")
@@ -1110,7 +1116,10 @@ pub fn cache_path() -> Option<PathBuf> {
     } else {
         crate::util::home_dir()?.join(".config")
     };
-    Some(base.join("thclaws").join("model_catalogue.json"))
+    Some(
+        base.join(crate::profile::app_dir_name())
+            .join("model_catalogue.json"),
+    )
 }
 
 /// Age of the user cache based on its file mtime. `None` when the

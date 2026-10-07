@@ -200,13 +200,36 @@ struct MultiTenantState {
     verifier: Arc<crate::multi_tenant::IdentityVerifier>,
 }
 
+/// `allow_serve = false` forbids an HTTP surface a user opens — the web UI and
+/// the OpenAI-compatible API on a port. The desktop app runs each agent as a
+/// `--serve` child of its own window (bots/supervisor.rs): loopback only,
+/// behind a per-launch token, marked `THCLAWS_SUPERVISED`. Refusing that
+/// would refuse the app itself.
+fn desktop_internal_serve(bind: &SocketAddr) -> bool {
+    desktop_internal_serve_with(
+        bind,
+        std::env::var("THCLAWS_SUPERVISED").ok().as_deref(),
+        std::env::var("THCLAWS_SERVE_TOKEN").ok().as_deref(),
+    )
+}
+
+fn desktop_internal_serve_with(
+    bind: &SocketAddr,
+    supervised: Option<&str>,
+    token: Option<&str>,
+) -> bool {
+    bind.ip().is_loopback()
+        && supervised == Some("1")
+        && token.is_some_and(|t| !t.trim().is_empty())
+}
+
 /// Spin up the server. Spawns the worker, builds the Axum router,
 /// blocks until the listener returns (Ctrl-C / panic / shutdown).
 pub async fn run(config: ServeConfig) -> crate::error::Result<()> {
     // Phase 8: `--serve` opens an HTTP port carrying the web UI and the
     // OpenAI-compatible API. An org that forbids it needs the refusal
     // here, before the bind, not a note in the docs.
-    if !crate::policy::serve_allowed() {
+    if !crate::policy::serve_allowed() && !desktop_internal_serve(&config.bind) {
         return Err(crate::error::Error::Tool(
             "--serve is disabled by org policy (policies.runtime.allow_serve = false)".into(),
         ));
@@ -1016,6 +1039,7 @@ fn classic_router(state: ServeState) -> Router {
         .route("/", get(serve_index))
         .route("/ws", get(ws_handler))
         .route("/upload", post(serve_upload))
+        .route("/api/branding", get(serve_branding))
         .route("/gui-shell/{shell_id}", get(serve_gui_shell_index))
         .route("/gui-shell/{shell_id}/", get(serve_gui_shell_index))
         .route(
@@ -1077,7 +1101,13 @@ pub async fn run_supervisor(bind: SocketAddr) -> crate::error::Result<()> {
 /// webview's URL before the server starts — asking the OS for a port, closing
 /// it and re-binding is the race `run_on`'s own doc comment warns about.
 pub async fn run_supervisor_on(listener: tokio::net::TcpListener) -> crate::error::Result<()> {
-    if !crate::policy::serve_allowed() {
+    // The desktop window's own host, bound by the app for its webview. Only a
+    // listener off loopback would be the surface `allow_serve` forbids.
+    let loopback = listener
+        .local_addr()
+        .map(|a| a.ip().is_loopback())
+        .unwrap_or(false);
+    if !crate::policy::serve_allowed() && !loopback {
         return Err(crate::error::Error::Tool(
             "--serve is disabled by org policy (policies.runtime.allow_serve = false)".into(),
         ));
@@ -2307,6 +2337,11 @@ mod background_job_probe_tests {
     }
 }
 
+/// Branding for the web UI — the same frame the `branding_get` IPC answers.
+async fn serve_branding() -> impl IntoResponse {
+    axum::Json(crate::branding::payload())
+}
+
 async fn serve_health() -> impl IntoResponse {
     let busy = crate::agent_activity::is_agent_busy() || background_jobs_alive();
     axum::Json(serde_json::json!({
@@ -2799,6 +2834,10 @@ async fn handle_socket(socket: WebSocket, state: ServeState, shared: Arc<SharedS
             if let Some(hist) = build_gui_shell_history_payload(sessions_dir) {
                 initial_dispatch(hist);
             }
+            // Process cwd, same as TodoWrite and the per-turn reminder.
+            initial_dispatch(crate::tools::todo::todo_update_frame(
+                &std::env::current_dir().unwrap_or_default(),
+            ));
             // A newer release, when the last check found one. Same shape as
             // the desktop's: the cached answer is a file read, so nothing on
             // the path to a usable page waits on github.com, and the refresh
@@ -3105,6 +3144,20 @@ fn build_kms_initial_payload(config: &AppConfig) -> Vec<serde_json::Value> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_the_apps_own_loopback_agents_pass_a_serve_ban() {
+        use super::desktop_internal_serve_with as ok;
+        let lo: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let any: std::net::SocketAddr = "0.0.0.0:8443".parse().unwrap();
+        assert!(
+            ok(&lo, Some("1"), Some("tok")),
+            "a supervised loopback agent"
+        );
+        assert!(!ok(&any, Some("1"), Some("tok")), "never off loopback");
+        assert!(!ok(&lo, None, Some("tok")), "a user's own --serve");
+        assert!(!ok(&lo, Some("1"), None), "no per-launch token");
+        assert!(!ok(&lo, Some("1"), Some("  ")), "blank token");
+    }
 
     #[tokio::test]
     async fn team_control_assets_reach_the_selected_host_agent() {

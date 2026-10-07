@@ -556,7 +556,10 @@ pub fn cache_path() -> Option<PathBuf> {
     } else {
         crate::util::home_dir()?.join(".config")
     };
-    Some(base.join("thclaws").join("marketplace.json"))
+    Some(
+        base.join(crate::profile::app_dir_name())
+            .join("marketplace.json"),
+    )
 }
 
 /// Cache-age threshold for the daily auto-refresh. M6.11 fix H1 — the

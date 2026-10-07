@@ -36,10 +36,14 @@ pub fn open_external_url(url: &str) {
     {
         let _ = std::process::Command::new("xdg-open").arg(url).spawn();
     }
+    // Not `cmd /c start`: cmd.exe splits the URL at every '&' (and flashes a
+    // console window).
     #[cfg(target_os = "windows")]
     {
-        let _ = std::process::Command::new("cmd")
-            .args(["/c", "start", "", url])
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("rundll32")
+            .args(["url.dll,FileProtocolHandler", url])
+            .creation_flags(0x08000000)
             .spawn();
     }
 }

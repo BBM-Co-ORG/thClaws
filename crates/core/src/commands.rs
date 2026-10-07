@@ -82,8 +82,13 @@ impl CommandStore {
     fn command_dirs() -> Vec<PathBuf> {
         let mut dirs = Vec::new();
         if let Some(home) = crate::util::home_dir() {
-            dirs.push(home.join(".config/thclaws/commands"));
-            dirs.push(home.join(".claude/commands"));
+            dirs.push(home.join(format!(
+                ".config/{}/commands",
+                crate::profile::app_dir_name()
+            )));
+            if crate::profile::reads_claude_home() {
+                dirs.push(home.join(".claude/commands"));
+            }
         }
         dirs.insert(0, PathBuf::from(".claude/commands"));
         dirs.insert(0, PathBuf::from(".thclaws/commands"));

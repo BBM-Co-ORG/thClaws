@@ -321,7 +321,7 @@ fn store_provider_key(provider: &str, key: &str) -> (bool, String, &'static str)
         let env_var = crate::providers::ProviderKind::from_name(provider)
             .and_then(|k| k.api_key_env())
             .or_else(|| crate::secrets::service_env_var(provider));
-        let backend = crate::secrets::get_backend().unwrap_or(crate::secrets::Backend::Keychain);
+        let backend = crate::secrets::resolved_backend();
         match backend {
             crate::secrets::Backend::Keychain => match crate::secrets::set(provider, key) {
                 Ok(()) => {
@@ -756,6 +756,62 @@ impl IngestJob {
     }
 }
 
+/// Send the `desktop_update_status` frame, and the first time a level's
+/// banner shows this launch, mirror it as one line into the Terminal tab.
+fn push_desktop_update(dispatch: &DispatchFn, st: &crate::desktop_update::Status) {
+    let payload = crate::desktop_update::payload(st);
+    let dismissed = payload["dismissed"].as_bool().unwrap_or(false);
+    dispatch(payload.to_string());
+    if !dismissed && crate::desktop_update::first_notice_for_level(st) {
+        if let Some(line) = st.notice_line() {
+            dispatch(crate::event_render::terminal_data_envelope(&format!(
+                "\r\n\x1b[33m{line}\x1b[0m\r\n"
+            )));
+        }
+    }
+}
+
+/// The org version-policy self-check, off the UI thread. `force` = sign-in
+/// just happened; otherwise at most once a minute (BotShell fires
+/// `frontend_ready` per agent). The first call also starts the periodic
+/// re-check.
+fn spawn_desktop_update_check(force: bool) {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    static TICKER: AtomicBool = AtomicBool::new(false);
+    if crate::desktop_update::policy_cloud_url().is_none() {
+        return;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST.load(Ordering::Relaxed);
+    if !force && now.saturating_sub(last) < 60 {
+        return;
+    }
+    LAST.store(now, Ordering::Relaxed);
+    let timeout = std::time::Duration::from_secs(10);
+    tokio::spawn(async move {
+        crate::desktop_update::check_policy(timeout).await;
+    });
+    if !TICKER.swap(true, Ordering::Relaxed) {
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(crate::desktop_update::RECHECK_EVERY);
+            every.tick().await;
+            loop {
+                every.tick().await;
+                crate::desktop_update::check_policy(timeout).await;
+            }
+        });
+    }
+}
+
+fn effective_cloud_url() -> String {
+    let cfg = crate::config::ProjectConfig::load().unwrap_or_default();
+    crate::cloud::resolve_cloud_url(None, cfg.cloud.as_ref())
+}
+
 pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
     let ty = msg.get("type").and_then(|t| t.as_str()).unwrap_or("");
     let target = msg
@@ -927,6 +983,30 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                 (ctx.dispatch)(frame);
             }
             (ctx.on_send_initial_state)();
+            // Every ready, not once: BotShell remounts App per bot and a
+            // frame sent before the new App subscribes is lost.
+            (ctx.dispatch)(crate::branding::payload().to_string());
+            let dispatch = ctx.dispatch.clone();
+            crate::desktop_update::listen(
+                ctx.viewer_id,
+                Arc::new(move |st| push_desktop_update(&dispatch, st)),
+            );
+            push_desktop_update(&ctx.dispatch, &crate::desktop_update::current());
+            spawn_desktop_update_check(false);
+        }
+
+        "desktop_update_status" => {
+            push_desktop_update(&ctx.dispatch, &crate::desktop_update::current());
+        }
+
+        "desktop_update_dismiss" => {
+            if let Some(key) = msg.get("key").and_then(|v| v.as_str()) {
+                crate::desktop_update::dismiss_available(key);
+            }
+        }
+
+        "branding_get" => {
+            (ctx.dispatch)(crate::branding::payload().to_string());
         }
 
         "approval_response" => {
@@ -3846,29 +3926,16 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
             (ctx.dispatch)(payload.to_string());
         }
 
-        // Delete `.thclaws/todos.md` from disk and broadcast an empty
-        // TodoUpdate so the sidebar (and any future renders) reflect
-        // the cleared state. Triggered by TodoSidebar when the user
-        // closes a fully-completed list — the prior session's "all
-        // done" checkboxes shouldn't bleed into the next session as
-        // a stale checked list.
+        // Delete `.thclaws/state/todos.md` and broadcast the empty list.
+        // Sent by TodoSidebar's Clear button (any list) and by its close
+        // button on a fully-completed list.
         "clear_todos" => {
-            let path = std::env::current_dir()
-                .unwrap_or_else(|_| std::path::PathBuf::from("."))
-                .join(".thclaws")
-                .join("state")
-                .join("todos.md");
-            let removed = std::fs::remove_file(&path).is_ok();
-            // Broadcast through the proper channel so every subscriber
-            // (chat tab, terminal-translator, etc.) gets the update.
-            let _ = ctx
-                .shared
-                .events_tx
-                .send(crate::shared_session::ViewEvent::TodoUpdate(Vec::new()));
+            // Process cwd, same as TodoWrite and the per-turn reminder.
+            let root = std::env::current_dir().unwrap_or_default();
+            let removed = crate::tools::todo::clear_todos(&root);
             let payload = serde_json::json!({
                 "type": "todos_cleared",
                 "removed": removed,
-                "path": path.to_string_lossy(),
             });
             (ctx.dispatch)(payload.to_string());
         }
@@ -4578,8 +4645,103 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                 "token_length": token_length,
                 "env_var_set": env_var_set,
                 "token_writable": crate::cloud::token_writable(),
+                // Where "Sign in with browser" goes: an org policy's cloud
+                // wins over the persisted URL, as for every cloud call.
+                "effective_url": effective_cloud_url(),
+                "policy_cloud": crate::policy::thclaws_cloud_url().is_some(),
             });
             (ctx.dispatch)(payload.to_string());
+        }
+        "cloud_browser_login" => {
+            let url = effective_cloud_url();
+            let dispatch = ctx.dispatch.clone();
+            let shared = ctx.shared.clone();
+            tokio::spawn(async move {
+                let result = crate::cloud::browser_login::login(&url).await;
+                // The provider was built without this token (a gateway-locked
+                // desktop has no other credential); rebuild so the next turn
+                // uses it instead of asking for an API key.
+                if result.is_ok() {
+                    let sent = shared
+                        .input_tx
+                        .send(crate::shared_session::ShellInput::ReloadConfig);
+                    let cfg = crate::config::AppConfig::load().unwrap_or_default();
+                    crate::cloud::browser_login::trace(&format!(
+                        "reload {}; model {} ready: {}; telling the window",
+                        if sent.is_ok() {
+                            "requested"
+                        } else {
+                            "NOT requested (worker gone)"
+                        },
+                        cfg.model,
+                        crate::providers::provider_has_credentials(&cfg),
+                    ));
+                    spawn_desktop_update_check(true);
+                }
+                let payload = serde_json::json!({
+                    "type": "cloud_browser_login_result",
+                    "ok": result.is_ok(),
+                    "error": result.err().map(|e| e.to_string()),
+                    "url": url,
+                });
+                dispatch(payload.to_string());
+            });
+        }
+
+        "cloud_sign_out" => {
+            let url = effective_cloud_url();
+            let dispatch = ctx.dispatch.clone();
+            let shared = ctx.shared.clone();
+            tokio::spawn(async move {
+                use crate::cloud::browser_login::SignOut;
+                let result = crate::cloud::browser_login::sign_out(&url).await;
+                // Rebuild so the provider drops the token and the sidebar
+                // offers sign-in again.
+                let _ = shared
+                    .input_tx
+                    .send(crate::shared_session::ShellInput::ReloadConfig);
+                let (ok, warning, error) = match result {
+                    Ok(SignOut::Revoked | SignOut::NotSignedIn) => (true, None, None),
+                    Ok(SignOut::LocalOnly(why)) => (
+                        true,
+                        Some(format!(
+                            "Signed out on this machine, but the sign-in could not be revoked on the server ({why}). It stays valid until it expires or an admin revokes it."
+                        )),
+                        None,
+                    ),
+                    Err(e) => (false, None, Some(e.to_string())),
+                };
+                let payload = serde_json::json!({
+                    "type": "cloud_sign_out_result",
+                    "ok": ok,
+                    "warning": warning,
+                    "error": error,
+                });
+                dispatch(payload.to_string());
+            });
+        }
+
+        "cloud_whoami" => {
+            let url = effective_cloud_url();
+            let dispatch = ctx.dispatch.clone();
+            tokio::spawn(async move {
+                let email = crate::cloud::browser_login::whoami(&url).await;
+                let payload = serde_json::json!({
+                    "type": "cloud_whoami_result",
+                    "email": email,
+                    "url": url,
+                });
+                dispatch(payload.to_string());
+            });
+        }
+
+        "cloud_quota" => {
+            let url = effective_cloud_url();
+            let dispatch = ctx.dispatch.clone();
+            tokio::spawn(async move {
+                let body = crate::cloud::browser_login::quota(&url).await;
+                dispatch(crate::cloud::browser_login::quota_payload(body).to_string());
+            });
         }
 
         "cloud_config_set" => {
@@ -4615,9 +4777,20 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                 } else {
                     crate::cloud::set_token(trimmed)
                 };
-                if let Err(e) = result {
-                    token_ok = false;
-                    token_err = format!("{e}");
+                match result {
+                    Err(e) => {
+                        token_ok = false;
+                        token_err = format!("{e}");
+                    }
+                    // A gateway-locked desktop's provider was built with
+                    // whatever token it had; rebuild so a pasted (or cleared)
+                    // one takes effect now, not after a restart.
+                    Ok(()) => {
+                        let _ = ctx
+                            .shared
+                            .input_tx
+                            .send(crate::shared_session::ShellInput::ReloadConfig);
+                    }
                 }
             }
 

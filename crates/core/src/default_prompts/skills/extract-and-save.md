@@ -2,7 +2,6 @@
 name: extract-and-save
 short_description: Read a file, extract structured info, save to another file
 description: Read a source file (image, PDF, DOCX, PPTX, XLSX, markdown, plain text), extract structured information from it, and save the result to a target file in the format the user wants — Excel for tabular data, Word for prose / memos, Markdown for notes, JSON for downstream processing, PowerPoint for slide-shaped output. Use when the user has a file and wants the meaningful content captured into a different file (not just summarized in chat). Examples — namecard photo → contacts.xlsx; receipt photo → expense report .docx; contract PDF → key-terms .md; invoice → line-items .json; meeting notes screenshot → followup .docx.
-model: gpt-4.1-nano
 ---
 
 # Extract & Save
@@ -129,9 +128,3 @@ User: "Extract the line items from this invoice as JSON for our pipeline"
 - **Tables in PDFs**: when `PdfRead` returns garbled column alignment, fall back to `Read` (vision-OCR the rendered page) and reconstruct the table cell-by-cell. Slower but more accurate.
 - **Existing-file detection**: before `XlsxCreate` / `DocxCreate`, check whether the target file already exists. If it does, confirm with the user — overwriting an existing expense report by accident is the bug we want to avoid.
 - **Empty fields**: leave them blank. Don't fill with `"N/A"` / `"—"` / `null`-as-text — those clutter the output and confuse downstream filters.
-
-## Why `gpt-4.1-nano`
-
-The `model: gpt-4.1-nano` frontmatter recommends OpenAI's smallest vision-capable model — fast and cheap, sized appropriately for the typical document-extraction task this skill handles. When the user has an `OPENAI_API_KEY` set, thClaws auto-switches to gpt-4.1-nano for the duration of the skill's turn and reverts at end of turn (chat shows `[model → gpt-4.1-nano (skill recommendation, reverts at end of turn)]`). When they don't, a warning chat note explains the recommendation and the skill proceeds with whatever vision-capable model the user already has selected.
-
-For documents larger than ~50 pages (PDFs especially) you may want to manually `/model` up to a larger model before invoking the skill — nano's strength is small-task throughput, not handling massive context.

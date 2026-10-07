@@ -315,7 +315,7 @@ Sidebar จะ poll Rust backend ทุก 5 วินาทีเพื่อ�
 | ตัวเลือก backend สำหรับ secret | `~/.config/thclaws/secrets.json` |
 | API key (โหมด keychain) | OS keychain, service `thclaws`, account `api-keys` (JSON blob) |
 | API key (โหมด .env) | `~/.config/thclaws/.env` |
-| Session | `.thclaws/state/sessions/` (ผูกกับโปรเจกต์) — ดู[บทที่ 7](ch07-sessions.md) |
+| Session | `.thclaws/bots/<เอเจนต์>/.thclaws/state/sessions/` (แยกตามเอเจนต์) — ดู[บทที่ 7](ch07-sessions.md) |
 | KMS (user) | `~/.config/thclaws/kms/` — ดู[บทที่ 9](ch09-knowledge-bases-kms.md) |
 | KMS (project) | `.thclaws/state/kms/` ใน working directory |
 | MCP server (user) | `~/.config/thclaws/mcp.json` |

@@ -18,6 +18,11 @@ Sessions are **project-scoped** — they live at `./.thclaws/state/sessions/`
 inside your working directory. Start thClaws in a fresh folder and you
 get an empty session list.
 
+In the desktop app a workspace can hold several agents, and each keeps its
+own sessions in its own folder: `.thclaws/bots/<agent>/.thclaws/state/sessions/`
+(the first agent is `main`). Your files, memory and project KMSes stay at the
+workspace root and are shared.
+
 Each session is a single `.jsonl` file named by its ID — a short hex
 string derived from the nanosecond wall-clock at creation (e.g.
 `sess-181a2c7f4e3d5`). It can be inspected, moved, emailed, or

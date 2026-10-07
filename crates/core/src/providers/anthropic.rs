@@ -195,6 +195,7 @@ impl AnthropicProvider {
             .json(body)
             .send()
             .await
+            .inspect(crate::desktop_update::observe)
             .map_err(|e| Error::Provider(format!("http: {e}")))
     }
 }
