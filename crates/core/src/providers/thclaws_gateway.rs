@@ -334,6 +334,9 @@ mod tests {
         assert_eq!(base_url_for(None, None), GATEWAY_BASE_URL);
     }
 
+    // CredentialEnv also holds the crate-wide env lock while these tests
+    // mutate gateway variables, and restores the previous environment.
+
     /// SIS asked for the same usage reporting they saw on our side, which
     /// means their Qwen server has to ride the METERED path. Three of the
     /// four layers are mechanical; the fourth is the trap. `repl.rs`'s `Sis`

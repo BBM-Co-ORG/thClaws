@@ -174,20 +174,25 @@ jobs:
           SM_API_KEY: ${{ secrets.SM_API_KEY }}
           SM_CLIENT_CERT_FILE_B64: ${{ secrets.SM_CLIENT_CERT_FILE_B64 }}
           SM_CLIENT_CERT_PASSWORD: ${{ secrets.SM_CLIENT_CERT_PASSWORD }}
-          SM_HOST: https://one.digicert.com
+          SM_HOST: https://clientauth.one.digicert.com
         run: |
           curl.exe -X GET "https://one.digicert.com/signingmanager/api-ui/v1/releases/smtools-windows-x64.msi/download" `
             -H "x-api-key:$($env:SM_API_KEY)" -o smtools.msi
           msiexec /i smtools.msi /quiet /qn
           Start-Sleep -Seconds 5
           echo "C:\Program Files\DigiCert\DigiCert One Signing Manager Tools" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          # smctl drives signtool from the Windows SDK, which is not on PATH.
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+            Where-Object { $_.FullName -match '\\x64\\' } | Sort-Object FullName | Select-Object -Last 1
+          if (-not $signtool) { throw 'signtool.exe not found in the Windows SDK' }
+          echo $signtool.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           $b64 = $env:SM_CLIENT_CERT_FILE_B64 -replace '\s','' -replace '[^A-Za-z0-9+/=]',''
           $certBytes = [Convert]::FromBase64String($b64)
           [System.IO.File]::WriteAllBytes("C:\sm_client_cert.p12", $certBytes)
           echo "SM_CLIENT_CERT_FILE=C:\sm_client_cert.p12" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           echo "SM_CLIENT_CERT_PASSWORD=$env:SM_CLIENT_CERT_PASSWORD" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           echo "SM_API_KEY=$env:SM_API_KEY" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          echo "SM_HOST=https://one.digicert.com" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "SM_HOST=https://clientauth.one.digicert.com" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Verify KeyLocker connectivity
         if: matrix.os == 'windows' && env.SM_API_KEY != ''
@@ -201,7 +206,8 @@ jobs:
           SM_CERT_FINGERPRINT: ${{ secrets.SM_CERT_FINGERPRINT }}
         run: |
           smctl sign --fingerprint %SM_CERT_FINGERPRINT% --input "target\${{ matrix.target }}\release\thclaws.exe"
-          smctl sign verify --input "target\${{ matrix.target }}\release\thclaws.exe"
+          rem smctl exits 0 even when signing fails; signtool's verdict is the real one.
+          signtool verify /pa "target\${{ matrix.target }}\release\thclaws.exe" || exit /b 1
 
       - name: Install WiX 3.11 (ARM64 runner only)
         # windows-2022 image ships WiX 3.11 pre-installed; the
@@ -281,7 +287,7 @@ jobs:
         run: |
           for %%f in (dist\*.msi) do (
             smctl sign --fingerprint %SM_CERT_FINGERPRINT% --input "%%f"
-            smctl sign verify --input "%%f"
+            signtool verify /pa "%%f" || exit /b 1
           )
 
       - name: Hash Windows artifacts
